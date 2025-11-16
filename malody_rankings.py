@@ -1501,15 +1501,16 @@ def check_data_changed(mode, df):
         
     return True
 
-def run_crawler_cycle(crawl_players=False, save_excel=False):
+def run_crawler_cycle(crawl_players=False, save_excel=False, push_to_git=False):
     """运行爬取周期
     
     Args:
         crawl_players: 是否爬取玩家主页数据
         save_excel: 是否保存数据到Excel文件
+        push_to_git: 是否推送数据到Git仓库
     """
     try:
-        if git_check_updates():
+        if push_to_git and git_check_updates():
             logger.info("检测到远程仓库有更新，正在拉取数据文件...")
             if git_pull_data_files():
                 logger.info("数据文件拉取完成，重新初始化数据库...")
@@ -1576,10 +1577,14 @@ def run_crawler_cycle(crawl_players=False, save_excel=False):
         
         start_player_crawler_thread()
     
-    try:
-        git_add_commit_push(has_changes)
-    except Exception as e:
-        logger.warning("Git推送失败，但数据已保存到本地: %s", e)
+    # 只有在明确指定时才推送Git
+    if push_to_git:
+        try:
+            git_add_commit_push(has_changes)
+        except Exception as e:
+            logger.warning("Git推送失败，但数据已保存到本地: %s", e)
+    else:
+        logger.info("Git推送已禁用，数据仅保存在本地")
     
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
@@ -1603,6 +1608,8 @@ def parse_arguments():
                        help='运行一次爬取周期后退出')
     parser.add_argument('--save-excel', action='store_true',
                        help='保存数据到Excel文件（默认不保存）')
+    parser.add_argument('--push-to-git', action='store_true',
+                       help='推送数据到Git仓库（默认不推送）')
     
     return parser.parse_args()
 
@@ -1651,7 +1658,7 @@ def main():
         run_players_only()
         return
     elif args.once:
-        run_crawler_cycle(crawl_players=args.all, save_excel=args.save_excel)
+        run_crawler_cycle(crawl_players=args.all, save_excel=args.save_excel, push_to_git=args.push_to_git)
         DatabaseManager().close_connection()
         return
     else:
@@ -1663,7 +1670,7 @@ def main():
                         break
                 
                 try:
-                    run_crawler_cycle(crawl_players=args.all, save_excel=args.save_excel)
+                    run_crawler_cycle(crawl_players=args.all, save_excel=args.save_excel, push_to_git=args.push_to_git)
                 except Exception as e:
                     logger.exception("主循环发生未处理异常")
                 

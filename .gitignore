@@ -1,0 +1,17 @@
+crawler.log
+malody_rankings.db-shm
+malody_rankings.db-wal
+viz_output/*
+__pycache__/*
+sid_progress.json
+cid_progress.json
+logs/*
+malody_api/utils/__pycache__/*
+malody_api/routers/__pycache__/*
+malody_api/core/services/__pycache__/*
+malody_api/routers/__pycache__/*
+sid_backwards_progress.json
+malody_api/__pycache__/*
+malody_api/core/__pycache__/*
+*.bak
+*.pyc*.zip
