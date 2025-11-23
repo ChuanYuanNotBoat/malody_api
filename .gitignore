@@ -15,3 +15,5 @@ malody_api/__pycache__/*
 malody_api/core/__pycache__/*
 *.bak
 *.pyc*.zip
+sql_changes.md
+*.txt
