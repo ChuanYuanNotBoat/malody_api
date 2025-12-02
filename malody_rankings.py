@@ -51,8 +51,8 @@ logger.addHandler(console_handler)
 
 # Cookie配置
 COOKIES = {
-    "sessionid": "qivl2904yuggmfm7vwq5dr3113ksqabr",
-    "csrftoken": "J9d3MG0WbtewtzUWFO3b4edbBWgLyrXp"
+    "sessionid": "q45sxwftipzkwww7bmw3hnuuxzikkz76",
+    "csrftoken": "plOqdO1V5utyoy2t2wr9YE4ejAjFvFAx"
 }
 
 HEADERS = {
