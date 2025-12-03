@@ -864,6 +864,135 @@ class PlayerProfileCrawler:
         self.logger.info("按UID范围爬取: %d-%d (共 %d 个)", start_uid, end_uid, len(uid_list))
         return self.crawl_players_batch(uid_list, print_only=print_only)
     
+    def crawl_from_other_tables(self, limit=None, days_since_last_crawl=30, 
+                               exclude_existing=True, priority_order=True):
+        """
+        从数据库其他表中提取出现的UID并进行爬取
+        
+        Args:
+            limit: 最大爬取数量
+            days_since_last_crawl: 多少天未更新视为需要更新
+            exclude_existing: 是否排除已经在player_profiles表中的UID
+            priority_order: 是否按优先级排序（最后出现时间倒序）
+        """
+        cursor = self.db_manager.get_connection().cursor()
+        
+        try:
+            # 从其他表中提取UID
+            self.logger.info("从数据库其他表中提取UID...")
+            
+            # 从不同的表中提取UID
+            queries = [
+                ("player_identity", "SELECT DISTINCT uid FROM player_identity WHERE uid IS NOT NULL AND uid != ''"),
+                ("player_aliases", "SELECT DISTINCT uid FROM player_aliases WHERE uid IS NOT NULL AND uid != ''"),
+                ("player_rankings", "SELECT DISTINCT uid FROM player_rankings WHERE uid IS NOT NULL AND uid != ''"),
+                ("charts", "SELECT DISTINCT creator_uid FROM charts WHERE creator_uid IS NOT NULL AND creator_uid != ''"),
+                ("charts", "SELECT DISTINCT stabled_by_uid FROM charts WHERE stabled_by_uid IS NOT NULL AND stabled_by_uid != ''")
+            ]
+            
+            all_uids = set()
+            
+            for table_name, query in queries:
+                try:
+                    cursor.execute(query)
+                    results = cursor.fetchall()
+                    count = len(results)
+                    
+                    for row in results:
+                        if row[0]:  # 确保UID不为空
+                            all_uids.add(str(row[0]).strip())
+                    
+                    self.logger.info("从 %s 表中提取到 %d 个UID", table_name, count)
+                except Exception as e:
+                    self.logger.warning("从表 %s 提取UID失败: %s", table_name, e)
+            
+            self.logger.info("总共从数据库提取到 %d 个唯一UID", len(all_uids))
+            
+            if not all_uids:
+                self.logger.warning("没有从数据库其他表中提取到UID")
+                return []
+            
+            # 如果需要排除已经存在的UID
+            if exclude_existing:
+                try:
+                    # 查询已经在player_profiles表中的UID
+                    cursor.execute("SELECT uid FROM player_profiles")
+                    existing_uids = {str(row[0]).strip() for row in cursor.fetchall()}
+                    
+                    # 排除已经存在的UID
+                    all_uids = all_uids - existing_uids
+                    self.logger.info("排除已在player_profiles表中的UID，剩余 %d 个", len(all_uids))
+                except Exception as e:
+                    self.logger.warning("查询已有UID失败: %s，跳过排除", e)
+            
+            # 获取需要更新的UID（根据最后爬取时间）
+            if days_since_last_crawl > 0:
+                try:
+                    cutoff_date = datetime.now() - timedelta(days=days_since_last_crawl)
+                    
+                    # 查询最近爬取过的UID
+                    cursor.execute('''
+                    SELECT uid FROM player_profile_crawl_status 
+                    WHERE last_crawled >= ? AND needs_update = 0
+                    ''', (cutoff_date,))
+                    
+                    recently_crawled = {str(row[0]).strip() for row in cursor.fetchall()}
+                    
+                    # 排除最近已经爬取过的UID
+                    all_uids = all_uids - recently_crawled
+                    self.logger.info("排除最近 %d 天内已爬取的UID，剩余 %d 个", 
+                                   days_since_last_crawl, len(all_uids))
+                except Exception as e:
+                    self.logger.warning("查询最近爬取UID失败: %s，跳过过滤", e)
+            
+            if not all_uids:
+                self.logger.info("没有需要爬取的新UID")
+                return []
+            
+            # 转换为列表
+            uid_list = list(all_uids)
+            
+            # 如果需要按优先级排序（最后出现时间倒序）
+            if priority_order and len(uid_list) > 0:
+                try:
+                    # 构建一个查询来获取每个UID最后出现的时间
+                    # 这里我们简化处理：从player_rankings表中获取最后出现时间
+                    uid_placeholders = ','.join(['?'] * len(uid_list))
+                    
+                    cursor.execute(f'''
+                    SELECT uid, MAX(crawl_time) as last_seen
+                    FROM player_rankings 
+                    WHERE uid IN ({uid_placeholders})
+                    GROUP BY uid
+                    ORDER BY last_seen DESC
+                    ''', uid_list)
+                    
+                    ordered_results = cursor.fetchall()
+                    
+                    if ordered_results:
+                        # 按照查询结果的顺序重新排序UID列表
+                        ordered_uids = [str(row[0]) for row in ordered_results]
+                        
+                        # 添加那些没有在player_rankings表中出现的UID
+                        missing_uids = set(uid_list) - set(ordered_uids)
+                        uid_list = ordered_uids + list(missing_uids)
+                        
+                        self.logger.info("按最后出现时间排序完成")
+                except Exception as e:
+                    self.logger.warning("按优先级排序失败: %s，使用原始顺序", e)
+            
+            # 限制数量
+            if limit and len(uid_list) > limit:
+                self.logger.info("限制爬取数量为 %d 个", limit)
+                uid_list = uid_list[:limit]
+            
+            self.logger.info("最终确定 %d 个UID需要爬取", len(uid_list))
+            return uid_list
+            
+        except Exception as e:
+            self.logger.error("从其他表提取UID失败: %s", e, exc_info=True)
+            return []
+    
     def get_progress_status(self):
         """获取当前爬取状态"""
         with progress_lock:
@@ -910,6 +1039,8 @@ def main():
     source_group.add_argument('--uid-file', type=str, help='包含UID列表的文件，每行一个')
     source_group.add_argument('--from-db', action='store_true', help='从数据库获取需要更新的玩家')
     source_group.add_argument('--from-leaderboard', action='store_true', help='从排行榜获取玩家')
+    source_group.add_argument('--from-other-tables', action='store_true', 
+                            help='从数据库其他表（player_identity, player_aliases等）提取UID')
     source_group.add_argument('--leaderboard-mode', type=int, default=0, help='排行榜模式 (默认: 0)')
     
     # 控制选项
@@ -927,6 +1058,12 @@ def main():
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
                        default='INFO', help='日志级别 (默认: INFO)')
     parser.add_argument('--log-file', help='指定日志文件路径')
+    
+    # 从其他表提取的选项
+    parser.add_argument('--no-exclude-existing', action='store_true', 
+                       help='从其他表提取时不排除已有玩家 (默认排除)')
+    parser.add_argument('--no-priority-order', action='store_true', 
+                       help='从其他表提取时不按优先级排序 (默认按最后出现时间倒序)')
     
     args = parser.parse_args()
     
@@ -970,6 +1107,22 @@ def main():
             ''')
             status_result = cursor.fetchone()
             
+            # 查询其他表中的UID数量
+            cursor.execute("SELECT COUNT(DISTINCT uid) FROM player_identity WHERE uid IS NOT NULL AND uid != ''")
+            identity_uids = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(DISTINCT uid) FROM player_aliases WHERE uid IS NOT NULL AND uid != ''")
+            aliases_uids = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(DISTINCT uid) FROM player_rankings WHERE uid IS NOT NULL AND uid != ''")
+            rankings_uids = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(DISTINCT creator_uid) FROM charts WHERE creator_uid IS NOT NULL AND creator_uid != ''")
+            chart_creators = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(DISTINCT stabled_by_uid) FROM charts WHERE stabled_by_uid IS NOT NULL AND stabled_by_uid != ''")
+            chart_stabilizers = cursor.fetchone()[0]
+            
             print("玩家资料数据库状态:")
             print(f"  玩家资料数: {profile_count}")
             print(f"  头衔记录数: {title_count}")
@@ -977,6 +1130,12 @@ def main():
             print(f"  爬虫状态记录: {status_result[0]}")
             print(f"  需要更新: {status_result[1]}")
             print(f"  从未爬取: {status_result[2]}")
+            print("\n其他表中的UID统计:")
+            print(f"  player_identity表: {identity_uids} 个唯一UID")
+            print(f"  player_aliases表: {aliases_uids} 个唯一UID")
+            print(f"  player_rankings表: {rankings_uids} 个唯一UID")
+            print(f"  charts表创作者: {chart_creators} 个唯一UID")
+            print(f"  charts表稳定者: {chart_stabilizers} 个唯一UID")
         else:
             print("在 --print-only 模式下无法显示数据库状态")
         return
@@ -1021,6 +1180,15 @@ def main():
         except Exception as e:
             logger.error("读取UID文件失败: %s", e)
             return
+    
+    elif args.from_other_tables:
+        # 从数据库其他表中提取UID
+        uid_list = crawler.crawl_from_other_tables(
+            limit=args.limit,
+            days_since_last_crawl=args.days_since_update,
+            exclude_existing=not args.no_exclude_existing,
+            priority_order=not args.no_priority_order
+        )
     
     elif args.from_db and not args.print_only:
         # 仅当需要保存时才从数据库获取

@@ -1674,9 +1674,9 @@ def main():
                 except Exception as e:
                     logger.exception("主循环发生未处理异常")
                 
-                logger.info("等待30分钟后重启...")
+                logger.info("等待60分钟后重启...")
                 
-                for i in range(30):
+                for i in range(60):
                     with stop_lock:
                         if stop_requested:
                             logger.info("程序被终止")
