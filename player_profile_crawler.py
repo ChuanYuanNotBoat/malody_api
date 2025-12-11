@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-玩家个人主页资料爬虫
+玩家个人主页资料爬虫 - 优化版
 用于爬取玩家的详细个人信息、头衔、成就等
+采用真正的归一化存储，大幅减少数据冗余
 """
 
 import requests
@@ -78,7 +79,7 @@ def setup_detailed_logging(log_level=logging.INFO, log_file=None):
     logger.addHandler(console_handler)
     
     logger.info("=" * 80)
-    logger.info("玩家个人主页爬虫启动")
+    logger.info("玩家个人主页爬虫启动 (优化版)")
     logger.info("日志文件: %s", log_file)
     logger.info("日志级别: %s", logging.getLevelName(log_level))
     logger.info("=" * 80)
@@ -137,10 +138,10 @@ class PlayerProfileCrawler:
         self.processed_uids = set()
         
     def init_database(self):
-        """初始化玩家资料相关的数据库表"""
+        """初始化玩家资料相关的数据库表 - 优化版"""
         cursor = self.db_manager.get_connection().cursor()
         
-        # 玩家基础资料表
+        # 玩家基础资料表（简化版）
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_profiles (
             uid TEXT PRIMARY KEY,
@@ -159,60 +160,50 @@ class PlayerProfileCrawler:
             stable_charts INTEGER DEFAULT 0,
             unstable_charts INTEGER DEFAULT 0,
             chart_slots INTEGER DEFAULT 0,
-            last_crawled TIMESTAMP NOT NULL,
+            last_crawled TIMESTAMP DEFAULT NULL,
             data_hash TEXT
         )
         ''')
         
-        # 玩家头衔/称号表
+        # 成就目录表（存储所有可能的成就）
         cursor.execute('''
-        CREATE TABLE IF NOT EXISTS player_titles (
-            title_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid TEXT NOT NULL,
-            title TEXT NOT NULL,
-            acquired_date DATE,
-            FOREIGN KEY (uid) REFERENCES player_profiles(uid),
-            UNIQUE(uid, title)
+        CREATE TABLE IF NOT EXISTS achievement_catalog (
+            code INTEGER PRIMARY KEY,
+            name TEXT,
+            description TEXT,
+            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
         
-        # 玩家成就徽章表
+        # 玩家成就关联表（真正的优化版）
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_achievements (
-            achievement_id INTEGER PRIMARY KEY AUTOINCREMENT,
             uid TEXT NOT NULL,
-            achievement_code INTEGER,
-            achievement_img_url TEXT,
+            achievement_code INTEGER NOT NULL,
+            acquired_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (uid, achievement_code),
             FOREIGN KEY (uid) REFERENCES player_profiles(uid),
-            UNIQUE(uid, achievement_code)
+            FOREIGN KEY (achievement_code) REFERENCES achievement_catalog(code)
         )
         ''')
         
-        # 爬虫状态表（增强版）
+        # 玩家头衔表（简化的）
         cursor.execute('''
-        CREATE TABLE IF NOT EXISTS player_profile_crawl_status (
-            uid TEXT PRIMARY KEY,
-            last_crawled TIMESTAMP,
-            last_success TIMESTAMP,
-            crawl_count INTEGER DEFAULT 0,
-            success_count INTEGER DEFAULT 0,
-            error_count INTEGER DEFAULT 0,
-            last_error TEXT,
-            data_hash TEXT,
-            needs_update BOOLEAN DEFAULT 1,
-            next_crawl_time TIMESTAMP,
+        CREATE TABLE IF NOT EXISTS player_titles (
+            uid TEXT NOT NULL,
+            title TEXT NOT NULL,
+            PRIMARY KEY (uid, title),
             FOREIGN KEY (uid) REFERENCES player_profiles(uid)
         )
         ''')
         
         # 创建索引
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_titles_uid ON player_titles(uid)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_profiles_last_crawled ON player_profiles(last_crawled)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_achievements_uid ON player_achievements(uid)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_status_last_crawled ON player_profile_crawl_status(last_crawled)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_status_needs_update ON player_profile_crawl_status(needs_update)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_titles_uid ON player_titles(uid)')
         
         self.db_manager.get_connection().commit()
-        self.logger.info("玩家资料数据库表初始化完成")
+        self.logger.info("玩家资料数据库表初始化完成（优化版）")
         
         # 确保player_identity表中有uid列
         self._ensure_uid_column()
@@ -276,9 +267,9 @@ class PlayerProfileCrawler:
             "charts_played_time": None,
             "stable_charts": 0,
             "unstable_charts": 0,
-            "chart_slots": 0,  # 默认值为0
+            "chart_slots": 0,
             "titles": [],
-            "achievements": []
+            "achievements": []  # 只存储成就代码
         }
         
         try:
@@ -374,7 +365,7 @@ class PlayerProfileCrawler:
                     profile["titles"].append(title)
                     self.logger.debug("提取头衔: %s", title)
             
-            # 5. 提取成就徽章
+            # 5. 提取成就徽章（只提取代码）
             achievement_imgs = soup.select("div.ach img[src*='achieve']")
             for img in achievement_imgs:
                 src = img.get('src', '')
@@ -389,16 +380,11 @@ class PlayerProfileCrawler:
                 match = re.search(r'/achieve/(\d+)', src)
                 if match:
                     achievement_code = int(match.group(1))
-                    achievement_img_url = BASE_URL + src if src.startswith('/') else src
                     
-                    # 检查是否已存在
-                    existing = [a for a in profile["achievements"] if a.get("code") == achievement_code]
-                    if not existing:
-                        profile["achievements"].append({
-                            "code": achievement_code,
-                            "img_url": achievement_img_url
-                        })
-                        self.logger.debug("提取成就: %d", achievement_code)
+                    # 只存储成就代码
+                    if achievement_code not in profile["achievements"]:
+                        profile["achievements"].append(achievement_code)
+                        self.logger.debug("提取成就代码: %d", achievement_code)
             
             # 6. 提取个人简介
             wiki_div = soup.select_one("div.wiki.g_rblock.curr")
@@ -454,8 +440,61 @@ class PlayerProfileCrawler:
             self.logger.error("获取玩家 %s 数据时出错: %s", uid, e)
             return None
     
+    def needs_crawl(self, uid, days_interval=30):
+        """判断玩家是否需要重新爬取"""
+        cursor = self.db_manager.get_connection().cursor()
+        
+        cursor.execute(
+            "SELECT last_crawled FROM player_profiles WHERE uid = ?",
+            (uid,)
+        )
+        result = cursor.fetchone()
+        
+        if not result or not result[0]:
+            return True  # 从未爬取过
+        
+        last_crawled = datetime.fromisoformat(result[0]) if isinstance(result[0], str) else result[0]
+        days_passed = (datetime.now() - last_crawled).days
+        
+        return days_passed >= days_interval
+    
+    def _save_achievements_simple(self, uid, achievement_codes):
+        """简化保存成就数据"""
+        if not achievement_codes:
+            return
+        
+        cursor = self.db_manager.get_connection().cursor()
+        
+        try:
+            # 1. 确保成就在目录中存在（只插入新的）
+            for code in achievement_codes:
+                # 检查是否已存在
+                cursor.execute("SELECT 1 FROM achievement_catalog WHERE code = ?", (code,))
+                if not cursor.fetchone():
+                    # 只插入代码，其他信息可以通过爬虫补充
+                    cursor.execute(
+                        "INSERT INTO achievement_catalog (code) VALUES (?)",
+                        (code,)
+                    )
+            
+            # 2. 删除旧的关联
+            cursor.execute("DELETE FROM player_achievements WHERE uid = ?", (uid,))
+            
+            # 3. 插入新的关联
+            for code in achievement_codes:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO player_achievements (uid, achievement_code) VALUES (?, ?)",
+                    (uid, code)
+                )
+            
+            self.logger.debug("保存成就: UID=%s, 成就数=%d", uid, len(achievement_codes))
+            
+        except Exception as e:
+            self.logger.error("保存成就数据失败: %s", e)
+            raise
+    
     def save_player_profile(self, profile_data):
-        """保存玩家资料到数据库"""
+        """保存玩家资料到数据库 - 优化版"""
         if not profile_data:
             return False
         
@@ -476,30 +515,13 @@ class PlayerProfileCrawler:
             result = cursor.fetchone()
             
             if result and result[0] == data_hash:
-                self.logger.debug("玩家 %s 数据未变化，跳过保存", uid)
-                # 只更新最后爬取时间
+                # 数据未变化，只更新最后爬取时间
                 cursor.execute(
                     "UPDATE player_profiles SET last_crawled = ? WHERE uid = ?",
                     (crawl_time, uid)
                 )
-                
-                # 更新爬虫状态
-                cursor.execute('''
-                INSERT OR REPLACE INTO player_profile_crawl_status 
-                (uid, last_crawled, last_success, crawl_count, success_count, error_count, 
-                 last_error, data_hash, needs_update, next_crawl_time)
-                VALUES (?, ?, ?, 
-                       COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1, 
-                       COALESCE((SELECT success_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
-                       COALESCE((SELECT error_count FROM player_profile_crawl_status WHERE uid = ?), 0),
-                       NULL, ?, 0, ?)
-                ''', (
-                    uid, crawl_time, crawl_time, uid, uid, uid, 
-                    data_hash, crawl_time + timedelta(days=30)
-                ))
-                
                 self.db_manager.get_connection().commit()
-                self.logger.info("玩家 %s 数据未变化，仅更新时间", uid)
+                self.logger.debug("玩家 %s 数据未变化，仅更新时间", uid)
                 return True
             
             # 准备数据，确保数据类型正确
@@ -559,36 +581,13 @@ class PlayerProfileCrawler:
             if profile_data.get("titles"):
                 for title in profile_data["titles"]:
                     if title:
-                        cursor.execute('''
-                        INSERT INTO player_titles (uid, title) VALUES (?, ?)
-                        ''', (uid, title))
+                        cursor.execute(
+                            "INSERT INTO player_titles (uid, title) VALUES (?, ?)",
+                            (uid, title)
+                        )
             
-            # 删除旧的成就记录，然后重新插入
-            cursor.execute("DELETE FROM player_achievements WHERE uid = ?", (uid,))
-            
-            # 保存成就
-            if profile_data.get("achievements"):
-                for achievement in profile_data["achievements"]:
-                    if achievement.get("code"):
-                        cursor.execute('''
-                        INSERT INTO player_achievements (uid, achievement_code, achievement_img_url)
-                        VALUES (?, ?, ?)
-                        ''', (uid, achievement["code"], achievement.get("img_url", "")))
-            
-            # 更新爬虫状态
-            cursor.execute('''
-            INSERT OR REPLACE INTO player_profile_crawl_status 
-            (uid, last_crawled, last_success, crawl_count, success_count, error_count, 
-             last_error, data_hash, needs_update, next_crawl_time)
-            VALUES (?, ?, ?, 
-                   COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1, 
-                   COALESCE((SELECT success_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
-                   COALESCE((SELECT error_count FROM player_profile_crawl_status WHERE uid = ?), 0),
-                   NULL, ?, 0, ?)
-            ''', (
-                uid, crawl_time, crawl_time, uid, uid, uid, 
-                data_hash, crawl_time + timedelta(days=30)
-            ))
+            # 保存成就（使用新方法）
+            self._save_achievements_simple(uid, profile_data.get("achievements", []))
             
             self.db_manager.get_connection().commit()
             self.logger.info("✓ 玩家 %s 资料保存成功", uid)
@@ -596,27 +595,6 @@ class PlayerProfileCrawler:
             
         except Exception as e:
             self.logger.error("保存玩家 %s 资料失败: %s", profile_data.get("uid", "未知"), e, exc_info=True)
-            
-            # 记录错误状态
-            try:
-                cursor.execute('''
-                INSERT OR REPLACE INTO player_profile_crawl_status 
-                (uid, last_crawled, last_success, crawl_count, success_count, error_count, 
-                 last_error, data_hash, needs_update, next_crawl_time)
-                VALUES (?, ?, 
-                       (SELECT last_success FROM player_profile_crawl_status WHERE uid = ?),
-                       COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1, 
-                       COALESCE((SELECT success_count FROM player_profile_crawl_status WHERE uid = ?), 0),
-                       COALESCE((SELECT error_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
-                       ?, NULL, 1, ?)
-                ''', (
-                    uid, crawl_time, uid, uid, uid, uid, str(e),
-                    crawl_time + timedelta(hours=6)
-                ))
-                self.db_manager.get_connection().commit()
-            except Exception as e2:
-                self.logger.error("更新爬虫状态失败: %s", e2)
-            
             self.db_manager.get_connection().rollback()
             return False
     
@@ -702,9 +680,9 @@ class PlayerProfileCrawler:
         # 成就
         achievements = profile_data.get('achievements', [])
         if achievements:
-            print(f"\n成就徽章 ({len(achievements)} 个):")
-            for i, achievement in enumerate(achievements, 1):
-                print(f"  {i}. 代码: {achievement.get('code', 'N/A')}, 图片: {achievement.get('img_url', 'N/A')[:50]}...")
+            print(f"\n成就代码 ({len(achievements)} 个):")
+            for i, code in enumerate(achievements, 1):
+                print(f"  {i}. 代码: {code}")
         else:
             print(f"\n成就徽章: 无")
         
@@ -803,8 +781,8 @@ class PlayerProfileCrawler:
             cutoff_date = datetime.now() - timedelta(days=days_since_last_crawl)
             
             query = '''
-            SELECT uid FROM player_profile_crawl_status 
-            WHERE (needs_update = 1 OR last_crawled IS NULL OR last_crawled < ?)
+            SELECT uid FROM player_profiles 
+            WHERE last_crawled IS NULL OR last_crawled < ?
             ORDER BY last_crawled ASC NULLS FIRST
             '''
             
@@ -931,10 +909,10 @@ class PlayerProfileCrawler:
                     cutoff_date = datetime.now() - timedelta(days=days_since_last_crawl)
                     
                     # 查询最近爬取过的UID
-                    cursor.execute('''
-                    SELECT uid FROM player_profile_crawl_status 
-                    WHERE last_crawled >= ? AND needs_update = 0
-                    ''', (cutoff_date,))
+                    cursor.execute(
+                        "SELECT uid FROM player_profiles WHERE last_crawled >= ?",
+                        (cutoff_date,)
+                    )
                     
                     recently_crawled = {str(row[0]).strip() for row in cursor.fetchall()}
                     
@@ -1017,6 +995,246 @@ class PlayerProfileCrawler:
         else:
             self.logger.error("连接测试失败")
             return False
+    
+    # ========== 新增功能：数据清理和优化 ==========
+    
+    def cleanup_old_data(self):
+        """清理旧的数据结构 - 修复版"""
+        cursor = self.db_manager.get_connection().cursor()
+        
+        try:
+            # 检查是否需要清理
+            self.logger.info("检查旧数据表...")
+            
+            # 1. 检查并删除旧的爬虫状态表
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='player_profile_crawl_status'")
+            if cursor.fetchone():
+                self.logger.info("删除旧表: player_profile_crawl_status")
+                cursor.execute("DROP TABLE IF EXISTS player_profile_crawl_status")
+            
+            # 2. 检查并删除旧的优化成就表
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='player_achievements_optimized'")
+            if cursor.fetchone():
+                self.logger.info("删除旧表: player_achievements_optimized")
+                cursor.execute("DROP TABLE IF EXISTS player_achievements_optimized")
+            
+            # 3. 简化player_achievements表结构（如果存在URL列）
+            try:
+                cursor.execute("PRAGMA table_info(player_achievements)")
+                columns = [column[1] for column in cursor.fetchall()]
+                
+                if 'achievement_img_url' in columns:
+                    self.logger.info("简化player_achievements表结构...")
+                    
+                    # 创建临时表
+                    cursor.execute('''
+                    CREATE TABLE temp_player_achievements AS 
+                    SELECT uid, achievement_code FROM player_achievements 
+                    WHERE achievement_code IS NOT NULL
+                    ''')
+                    
+                    # 删除原表
+                    cursor.execute("DROP TABLE player_achievements")
+                    
+                    # 创建新表
+                    cursor.execute('''
+                    CREATE TABLE player_achievements (
+                        uid TEXT NOT NULL,
+                        achievement_code INTEGER NOT NULL,
+                        acquired_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (uid, achievement_code),
+                        FOREIGN KEY (uid) REFERENCES player_profiles(uid),
+                        FOREIGN KEY (achievement_code) REFERENCES achievement_catalog(code)
+                    )
+                    ''')
+                    
+                    # 复制数据
+                    cursor.execute('''
+                    INSERT OR IGNORE INTO player_achievements (uid, achievement_code)
+                    SELECT uid, achievement_code FROM temp_player_achievements
+                    ''')
+                    
+                    # 删除临时表
+                    cursor.execute("DROP TABLE temp_player_achievements")
+                    
+                    self.logger.info("player_achievements表结构简化完成")
+            except Exception as e:
+                self.logger.warning(f"简化成就表结构时出错: {e}")
+            
+            self.db_manager.get_connection().commit()
+            self.logger.info("数据清理完成")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"清理数据失败: {e}", exc_info=True)
+            self.db_manager.get_connection().rollback()
+            return False
+    
+    def migrate_achievements_data(self):
+        """迁移旧的成就数据到新的优化表"""
+        self.logger.info("开始迁移成就数据到优化表...")
+        
+        cursor = self.db_manager.get_connection().cursor()
+        
+        try:
+            # 1. 创建成就目录表（如果不存在）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS achievement_catalog (
+                code INTEGER PRIMARY KEY,
+                name TEXT,
+                description TEXT,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            
+            # 2. 从旧表中提取不重复的成就代码
+            cursor.execute('''
+            SELECT DISTINCT achievement_code 
+            FROM player_achievements 
+            WHERE achievement_code IS NOT NULL
+            ''')
+            
+            achievement_codes = [row[0] for row in cursor.fetchall()]
+            self.logger.info(f"发现 {len(achievement_codes)} 个不重复成就代码")
+            
+            # 3. 插入成就目录
+            for code in achievement_codes:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO achievement_catalog (code) VALUES (?)",
+                    (code,)
+                )
+            
+            self.db_manager.get_connection().commit()
+            self.logger.info("成就数据迁移完成")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"迁移成就数据失败: {e}", exc_info=True)
+            return False
+    
+    def optimize_database_storage(self):
+        """优化数据库存储"""
+        self.logger.info("开始优化数据库存储...")
+        
+        conn = self.db_manager.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # 1. 启用自动清理
+            cursor.execute("PRAGMA auto_vacuum = FULL")
+            
+            # 2. 重建索引
+            cursor.execute("ANALYZE")
+            cursor.execute("REINDEX")
+            
+            # 3. 执行VACUUM
+            self.logger.info("执行VACUUM...")
+            conn.execute("VACUUM")
+            
+            conn.commit()
+            self.logger.info("数据库优化完成")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"数据库优化失败: {e}")
+            return False
+    
+    def get_database_stats(self):
+        """获取数据库统计信息 - 修复版"""
+        cursor = self.db_manager.get_connection().cursor()
+        
+        try:
+            # 基础统计
+            cursor.execute("SELECT COUNT(*) FROM player_profiles")
+            profiles = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM player_titles")
+            titles = cursor.fetchone()[0]
+            
+            # 成就相关统计
+            cursor.execute("SELECT COUNT(*) FROM achievement_catalog")
+            catalog = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM player_achievements")
+            achievements = cursor.fetchone()[0]
+            
+            # 修复：使用子查询统计唯一成就关联数
+            cursor.execute('''
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT uid, achievement_code FROM player_achievements
+            )
+            ''')
+            unique_achievements = cursor.fetchone()[0]
+            
+            # 修复：统计唯一的成就类型
+            cursor.execute("SELECT COUNT(DISTINCT achievement_code) FROM player_achievements")
+            unique_achievement_types = cursor.fetchone()[0]
+            
+            # 平均每个玩家的成就数
+            avg_achievements = achievements / profiles if profiles > 0 else 0
+            
+            # 获取数据库文件大小
+            db_path = 'malody_rankings.db'
+            db_size = 0
+            try:
+                if os.path.exists(db_path):
+                    db_size = os.path.getsize(db_path) / 1024 / 1024  # 转换为MB
+            except:
+                pass
+            
+            # 获取更多详细统计
+            cursor.execute("SELECT COUNT(DISTINCT uid) FROM player_achievements")
+            players_with_achievements = cursor.fetchone()[0]
+            
+            # 获取最近爬取时间
+            cursor.execute("SELECT MAX(last_crawled) FROM player_profiles")
+            last_crawl_time = cursor.fetchone()[0]
+            
+            # 计算成就分布的统计
+            cursor.execute('''
+            SELECT 
+                COUNT(*) as player_count,
+                COUNT(*) * 100.0 / ? as percentage
+            FROM (
+                SELECT uid, COUNT(achievement_code) as achievement_count 
+                FROM player_achievements 
+                GROUP BY uid
+            ) WHERE achievement_count >= 10
+            ''', (profiles,))
+            stats_10plus = cursor.fetchone()
+            
+            cursor.execute('''
+            SELECT 
+                COUNT(*) as player_count,
+                COUNT(*) * 100.0 / ? as percentage
+            FROM (
+                SELECT uid, COUNT(achievement_code) as achievement_count 
+                FROM player_achievements 
+                GROUP BY uid
+            ) WHERE achievement_count >= 5
+            ''', (profiles,))
+            stats_5plus = cursor.fetchone()
+            
+            return {
+                'player_profiles': profiles,
+                'player_titles': titles,
+                'achievement_catalog': catalog,
+                'achievement_records': achievements,
+                'unique_achievement_associations': unique_achievements,
+                'unique_achievement_types': unique_achievement_types,
+                'players_with_achievements': players_with_achievements,
+                'avg_achievements_per_player': round(avg_achievements, 2),
+                'total_database_size_mb': round(db_size, 2),
+                'last_crawl_time': last_crawl_time,
+                'players_with_10plus_achievements': stats_10plus[0] if stats_10plus else 0,
+                'players_with_10plus_percentage': round(stats_10plus[1], 2) if stats_10plus else 0,
+                'players_with_5plus_achievements': stats_5plus[0] if stats_5plus else 0,
+                'players_with_5plus_percentage': round(stats_5plus[1], 2) if stats_5plus else 0,
+            }
+            
+        except Exception as e:
+            self.logger.error(f"获取数据库统计失败: {e}", exc_info=True)
+            return None
 
 def signal_handler(sig, frame):
     """处理终止信号"""
@@ -1029,7 +1247,7 @@ def signal_handler(sig, frame):
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='玩家个人主页资料爬虫')
+    parser = argparse.ArgumentParser(description='玩家个人主页资料爬虫 - 优化版')
     
     # 爬取源选项
     source_group = parser.add_mutually_exclusive_group()
@@ -1065,6 +1283,16 @@ def main():
     parser.add_argument('--no-priority-order', action='store_true', 
                        help='从其他表提取时不按优先级排序 (默认按最后出现时间倒序)')
     
+    # 新增：数据库优化选项
+    parser.add_argument('--cleanup-data', action='store_true', 
+                       help='清理旧的数据结构')
+    parser.add_argument('--migrate-achievements', action='store_true', 
+                       help='迁移旧的成就数据到优化表')
+    parser.add_argument('--optimize-db', action='store_true', 
+                       help='优化数据库存储')
+    parser.add_argument('--db-stats', action='store_true', 
+                       help='显示详细的数据库统计信息')
+    
     args = parser.parse_args()
     
     # 设置信号处理器
@@ -1076,7 +1304,7 @@ def main():
     setup_detailed_logging(log_level=log_level, log_file=args.log_file)
     
     logger = logging.getLogger(__name__)
-    logger.info("玩家个人主页爬虫启动，参数: %s", vars(args))
+    logger.info("玩家个人主页爬虫启动（优化版），参数: %s", vars(args))
     
     # 初始化数据库（如果需要保存的话）
     if not args.print_only:
@@ -1085,57 +1313,145 @@ def main():
     # 创建爬虫实例
     crawler = PlayerProfileCrawler()
     
+    # 数据库清理和优化选项
+    if args.cleanup_data:
+        logger.info("执行数据清理...")
+        if crawler.cleanup_old_data():
+            logger.info("数据清理成功")
+        else:
+            logger.error("数据清理失败")
+        return
+    
+    if args.migrate_achievements:
+        logger.info("执行成就数据迁移...")
+        if crawler.migrate_achievements_data():
+            logger.info("成就数据迁移成功")
+        else:
+            logger.error("成就数据迁移失败")
+        return
+    
+    if args.optimize_db:
+        logger.info("执行数据库优化...")
+        if crawler.optimize_database_storage():
+            logger.info("数据库优化成功")
+        else:
+            logger.error("数据库优化失败")
+        return
+    
+    if args.db_stats:
+        stats = crawler.get_database_stats()
+        if stats:
+            print("数据库详细统计 (优化版):")
+            print("="*60)
+            print(f"玩家资料数: {stats['player_profiles']:,}")
+            print(f"头衔记录数: {stats['player_titles']:,}")
+            print(f"成就目录数: {stats['achievement_catalog']:,}")
+            print(f"成就关联记录: {stats['achievement_records']:,}")
+            print(f"唯一成就关联: {stats['unique_achievement_associations']:,}")
+            print(f"唯一成就类型: {stats['unique_achievement_types']:,}")
+            print(f"有成就的玩家: {stats['players_with_achievements']:,} ({stats['players_with_achievements']/stats['player_profiles']*100:.1f}%)" if stats['player_profiles'] > 0 else "有成就的玩家: 0")
+            print(f"平均成就数/玩家: {stats['avg_achievements_per_player']:.2f}")
+            print(f"数据库总大小: {stats['total_database_size_mb']:.2f} MB")
+            print(f"最后爬取时间: {stats['last_crawl_time']}")
+            
+            # 成就分布统计
+            print("\n成就分布统计:")
+            print("="*60)
+            print(f"拥有5+个成就的玩家: {stats['players_with_5plus_achievements']:,} ({stats['players_with_5plus_percentage']}%)")
+            print(f"拥有10+个成就的玩家: {stats['players_with_10plus_achievements']:,} ({stats['players_with_10plus_percentage']}%)")
+            
+            # 存储效率分析
+            if stats['achievement_catalog'] > 0:
+                compression_ratio = stats['unique_achievement_associations'] / stats['achievement_catalog']
+                print(f"\n存储效率分析:")
+                print("="*60)
+                print(f"成就数据压缩比: {compression_ratio:.1f}:1")
+                print(f"(每个成就被 {compression_ratio:.1f} 个玩家拥有)")
+            
+            # 建议
+            if stats['avg_achievements_per_player'] == 0:
+                print(f"\n⚠ 注意: 平均成就数为0，可能需要爬取成就数据")
+            elif stats['total_database_size_mb'] > 500:
+                print(f"\n⚠ 建议: 数据库文件较大，考虑运行 --optimize-db")
+        else:
+            print("获取数据库统计失败")
+        return
+    
     # 显示状态
     if args.status:
         if not args.print_only:
             cursor = crawler.db_manager.get_connection().cursor()
+            
+            # 玩家资料统计
             cursor.execute("SELECT COUNT(*) FROM player_profiles")
             profile_count = cursor.fetchone()[0]
             
             cursor.execute("SELECT COUNT(*) FROM player_titles")
             title_count = cursor.fetchone()[0]
             
+            cursor.execute("SELECT COUNT(*) FROM achievement_catalog")
+            catalog_count = cursor.fetchone()[0]
+            
             cursor.execute("SELECT COUNT(*) FROM player_achievements")
             achievement_count = cursor.fetchone()[0]
             
+            # 修复：使用子查询统计唯一成就关联数
             cursor.execute('''
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN needs_update = 1 THEN 1 ELSE 0 END) as need_update,
-                SUM(CASE WHEN last_crawled IS NULL THEN 1 ELSE 0 END) as never_crawled
-            FROM player_profile_crawl_status
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT uid, achievement_code FROM player_achievements
+            )
             ''')
-            status_result = cursor.fetchone()
+            unique_achievement_associations = cursor.fetchone()[0]
             
-            # 查询其他表中的UID数量
-            cursor.execute("SELECT COUNT(DISTINCT uid) FROM player_identity WHERE uid IS NOT NULL AND uid != ''")
-            identity_uids = cursor.fetchone()[0]
+            # 修复：使用子查询统计活跃玩家
+            cursor.execute("SELECT COUNT(DISTINCT uid) FROM player_achievements")
+            players_with_achievements = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(DISTINCT uid) FROM player_aliases WHERE uid IS NOT NULL AND uid != ''")
-            aliases_uids = cursor.fetchone()[0]
+            # 爬取状态统计
+            cursor.execute("SELECT COUNT(*) FROM player_profiles WHERE last_crawled IS NULL")
+            never_crawled = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(DISTINCT uid) FROM player_rankings WHERE uid IS NOT NULL AND uid != ''")
-            rankings_uids = cursor.fetchone()[0]
+            cursor.execute('''
+            SELECT COUNT(*) FROM player_profiles 
+            WHERE last_crawled < datetime('now', '-30 days')
+            ''')
+            outdated = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(DISTINCT creator_uid) FROM charts WHERE creator_uid IS NOT NULL AND creator_uid != ''")
-            chart_creators = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM player_profiles WHERE last_crawled >= datetime('now', '-1 day')")
+            crawled_today = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(DISTINCT stabled_by_uid) FROM charts WHERE stabled_by_uid IS NOT NULL AND stabled_by_uid != ''")
-            chart_stabilizers = cursor.fetchone()[0]
+            # 计算平均成就数
+            avg_achievements = achievement_count / profile_count if profile_count > 0 else 0
             
-            print("玩家资料数据库状态:")
-            print(f"  玩家资料数: {profile_count}")
-            print(f"  头衔记录数: {title_count}")
-            print(f"  成就记录数: {achievement_count}")
-            print(f"  爬虫状态记录: {status_result[0]}")
-            print(f"  需要更新: {status_result[1]}")
-            print(f"  从未爬取: {status_result[2]}")
-            print("\n其他表中的UID统计:")
-            print(f"  player_identity表: {identity_uids} 个唯一UID")
-            print(f"  player_aliases表: {aliases_uids} 个唯一UID")
-            print(f"  player_rankings表: {rankings_uids} 个唯一UID")
-            print(f"  charts表创作者: {chart_creators} 个唯一UID")
-            print(f"  charts表稳定者: {chart_stabilizers} 个唯一UID")
+            print("玩家资料数据库状态 (优化版):")
+            print("="*60)
+            print(f"玩家资料数: {profile_count:,}")
+            print(f"头衔记录数: {title_count:,}")
+            print(f"成就目录数: {catalog_count:,}")
+            print(f"成就关联记录: {achievement_count:,}")
+            print(f"唯一成就关联: {unique_achievement_associations:,}")
+            print(f"有成就的玩家: {players_with_achievements:,} ({players_with_achievements/profile_count*100:.1f}%)")
+            print(f"平均成就数/玩家: {avg_achievements:.2f}")
+            print(f"\n爬取状态:")
+            print(f"从未爬取: {never_crawled:,} ({never_crawled/profile_count*100:.1f}%)")
+            print(f"已过期 (>30天): {outdated:,} ({outdated/profile_count*100:.1f}%)")
+            print(f"今日爬取: {crawled_today:,} ({crawled_today/profile_count*100:.1f}%)")
+            print(f"总计需更新: {never_crawled + outdated:,}")
+            
+            # 显示存储建议
+            if achievement_count > 0:
+                # 成就数据压缩比
+                compression_ratio = unique_achievement_associations / catalog_count if catalog_count > 0 else 0
+                print(f"\n存储效率:")
+                print(f"成就数据压缩比: {compression_ratio:.1f}:1")
+                print(f"(每个成就被 {compression_ratio:.1f} 个玩家拥有)")
+                
+                if avg_achievements > 10:
+                    print(f"✓ 成就数据丰富，平均每个玩家有 {avg_achievements:.1f} 个成就")
+                elif avg_achievements > 0:
+                    print(f"⚠ 成就数据较少，平均每个玩家只有 {avg_achievements:.1f} 个成就")
+                else:
+                    print(f"✗ 没有成就数据，可能需要运行 --migrate-achievements")
         else:
             print("在 --print-only 模式下无法显示数据库状态")
         return

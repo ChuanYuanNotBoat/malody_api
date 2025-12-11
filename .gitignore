@@ -17,3 +17,4 @@ malody_api/core/__pycache__/*
 *.pyc*.zip
 sql_changes.md
 *.txt
+malody_rankings.db
