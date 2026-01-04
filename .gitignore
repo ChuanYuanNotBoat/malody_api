@@ -18,3 +18,16 @@ malody_api/core/__pycache__/*
 sql_changes.md
 *.txt
 malody_rankings.db
+/.venv/
+.idea/*
+.idea/data_source_mapping.xml
+.idea/dataSources.xml
+.idea/malody_api.iml
+.idea/misc.xml
+.idea/modules.xml
+.idea/sqldialects.xml
+.idea/vcs.xml
+.idea/inspectionProfiles/profiles_settings.xml
+.malody_stats.py.swp
+*.db
+malody_rankings.db

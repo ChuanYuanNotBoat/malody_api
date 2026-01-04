@@ -49,15 +49,26 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 logger.addHandler(console_handler)
 
-# Cookie配置
+# Cookie配置 - 更新为新的token
 COOKIES = {
-    "sessionid": "q45sxwftipzkwww7bmw3hnuuxzikkz76",
-    "csrftoken": "plOqdO1V5utyoy2t2wr9YE4ejAjFvFAx"
+    "sessionid": "q4eslmic0sxgp93vq4kpdnwvwx03swkb",
+    "csrftoken": "bOdFmYDBMonvYH5JMfFdy9CKNo7yuigG",
+    "acw_tc": "a3b54ebb17671819302035167e66361f9cd29c2b8ba16359812f2882fa",
+    "cdn_sec_tc": "a3b54ebb17671819302035167e66361f9cd29c2b8ba16359812f2882fa",
+    "Hm_lvt_4edad2d5a88ea4e9f4d27e98ccec7300": "1766745385,1766768846,1767105207,1767119905",
+    "_ga_60FNBRY4NB": "GS2.2.s1766056711$o78$g0$t1766056711$j60$l0$h0",
+    "_ga": "GA1.2.1307964988.1749050113",
+    "_gid": "GA1.2.11894316.1767119905"
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Android 12; Mobile) Python Script",
-    "Referer": "https://m.mugzone.net/"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://m.mugzone.net/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 BASE_URL = "https://m.mugzone.net/page/all/player?from=0&mode={mode}"
@@ -1674,9 +1685,9 @@ def main():
                 except Exception as e:
                     logger.exception("主循环发生未处理异常")
                 
-                logger.info("等待60分钟后重启...")
+                logger.info("等待30分钟后重启...")
                 
-                for i in range(60):
+                for i in range(30):
                     with stop_lock:
                         if stop_requested:
                             logger.info("程序被终止")

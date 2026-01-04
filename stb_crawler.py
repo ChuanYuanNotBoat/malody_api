@@ -120,7 +120,7 @@ class STBCrawler:
             
             # 使用与主爬虫完全相同的headers
             headers = {
-                "User-Agent": "Mozilla/5.0 (Android 12; Mobile) Python Script",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Referer": "https://m.mugzone.net/",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
@@ -133,6 +133,7 @@ class STBCrawler:
             if 'csrftoken' in COOKIES:
                 headers['X-CSRFToken'] = COOKIES['csrftoken']
                 headers['X-CSRF-Token'] = COOKIES['csrftoken']
+                headers['X-CSRFTOKEN'] = COOKIES['csrftoken']
             
             self.session.headers.update(headers)
             
@@ -335,16 +336,25 @@ class STBCrawler:
             data = params.copy()
             if 'csrftoken' in COOKIES:
                 data['csrfmiddlewaretoken'] = COOKIES['csrftoken']
-                self.logger.debug("添加CSRF token")
+                self.logger.debug("添加CSRF token: %s", COOKIES['csrftoken'][:10])
             
-            # API请求headers
+            # API请求headers - 增强版
             api_headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "X-Requested-With": "XMLHttpRequest",
-                "Origin": BASE_URL
+                "Origin": BASE_URL,
+                "Referer": BASE_URL + "/",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "en-US,en;q=0.9",
             }
             
+            # 添加CSRF token到headers
+            if 'csrftoken' in COOKIES:
+                api_headers['X-CSRFToken'] = COOKIES['csrftoken']
+                api_headers['X-CSRF-Token'] = COOKIES['csrftoken']
+            
             self.logger.debug("发送API请求到: %s", SEARCH_API_URL)
+            self.logger.debug("请求头: %s", api_headers)
             response = self.session.post(SEARCH_API_URL, data=data, headers=api_headers, timeout=30)
             response.raise_for_status()
             
@@ -357,19 +367,24 @@ class STBCrawler:
             if 'application/json' in content_type:
                 result = response.json()
                 self.logger.info("API搜索成功 - 获取到 %d 个谱面", len(result.get("list", [])))
-                self.logger.debug("API响应: %s", result)
                 return result
             else:
-                self.logger.warning("API返回非JSON响应: %s", content_type)
-                self.logger.debug("响应内容前1000字符: %s", response.text[:1000])
-                return None
-                
+                # 尝试解析非JSON响应
+                try:
+                    result = response.json()
+                    self.logger.info("API搜索成功(非标准Content-Type) - 获取到 %d 个谱面", len(result.get("list", [])))
+                    return result
+                except:
+                    self.logger.warning("API返回非JSON响应: %s", content_type)
+                    self.logger.debug("响应内容前500字符: %s", response.text[:500])
+                    return None
+                    
         except requests.exceptions.RequestException as e:
             self.logger.error("搜索谱面失败: %s", e)
             if hasattr(e, 'response') and e.response is not None:
                 self.log_request_details(SEARCH_API_URL, e.response, "POST")
             return None
-
+    
     def parse_chart_page(self, html, cid):
         """增强的谱面页面解析，确保能提取SID"""
         self.logger.info("开始解析谱面页面: cid=%s", cid)
