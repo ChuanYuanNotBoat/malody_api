@@ -17,7 +17,7 @@ malody_api/core/__pycache__/*
 *.pyc*.zip
 sql_changes.md
 *.txt
-malody_rankings.db
+*.db
 /.venv/
 .idea/*
 .idea/data_source_mapping.xml
@@ -31,3 +31,5 @@ malody_rankings.db
 .malody_stats.py.swp
 *.db
 malody_rankings.db
+.vs/
+

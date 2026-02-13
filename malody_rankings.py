@@ -51,8 +51,8 @@ logger.addHandler(console_handler)
 
 # Cookie配置 - 更新为新的token
 COOKIES = {
-    "sessionid": "q4eslmic0sxgp93vq4kpdnwvwx03swkb",
-    "csrftoken": "bOdFmYDBMonvYH5JMfFdy9CKNo7yuigG",
+    "sessionid": "xxgyt15zfv3k6iao0n6xp5dn3c3on86t",
+    "csrftoken": "Su6t9OJr2YG1COJMTpw9clp0Poxbfp88",
     "acw_tc": "a3b54ebb17671819302035167e66361f9cd29c2b8ba16359812f2882fa",
     "cdn_sec_tc": "a3b54ebb17671819302035167e66361f9cd29c2b8ba16359812f2882fa",
     "Hm_lvt_4edad2d5a88ea4e9f4d27e98ccec7300": "1766745385,1766768846,1767105207,1767119905",
@@ -1195,7 +1195,7 @@ def get_players_from_leaderboard(df_list):
     return list(players)
 
 def run_player_crawler():
-    """运行玩家个人主页爬取器"""
+    """运行玩家个人主页爬取器（同步执行）"""
     global player_crawl_in_progress, last_player_crawl_time
     
     with player_crawl_lock:
@@ -1246,12 +1246,11 @@ def run_player_crawler():
                 
                 if player_data and save_player_profile_to_database(player_data, crawl_time, player_identifier):
                     successful_crawls += 1
-                    if HAS_TQDM:
-                        pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
                 else:
                     failed_crawls += 1
-                    if HAS_TQDM:
-                        pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
+                
+                if HAS_TQDM:
+                    pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
                 
                 time.sleep(3)
                 
@@ -1275,17 +1274,6 @@ def run_player_crawler():
     finally:
         with player_crawl_lock:
             player_crawl_in_progress = False
-
-def start_player_crawler_thread():
-    """启动玩家爬取器线程"""
-    if player_queue.empty():
-        logger.info("玩家队列为空，不启动爬取线程")
-        return
-    
-    thread = Thread(target=run_player_crawler, daemon=True)
-    thread.start()
-    logger.info("玩家爬取器线程已启动")
-    return thread
 
 def git_check_updates():
     """检查远程Git仓库是否有更新"""
@@ -1472,7 +1460,7 @@ def git_add_commit_push(has_changes=True):
         return False
 
 def check_data_changed(mode, df):
-    """检查数据是否发生变化"""
+    """检查Excel数据是否发生变化（仅用于Excel保存）"""
     filename = get_excel_filename(mode)
     sheet_name = f"mode_{mode}"
     
@@ -1512,14 +1500,24 @@ def check_data_changed(mode, df):
         
     return True
 
-def run_crawler_cycle(crawl_players=False, save_excel=False, push_to_git=False):
-    """运行爬取周期
-    
+def run_crawler_cycle(crawl_players=False, crawl_leaderboard_players=False, save_excel=False, push_to_git=False):
+    """
+    运行爬取周期
+
     Args:
-        crawl_players: 是否爬取玩家主页数据
+        crawl_players: 是否启动玩家爬虫（消费队列中的玩家ID，包含配置文件中的玩家）
+        crawl_leaderboard_players: 是否将当前排行榜中的玩家ID加入队列（默认False）
         save_excel: 是否保存数据到Excel文件
         push_to_git: 是否推送数据到Git仓库
     """
+    # ========== 每个周期重新加载配置文件玩家 ==========
+    if crawl_players:
+        config_players = load_player_config()
+        if config_players:
+            add_players_to_queue(config_players)
+            logger.info("周期开始：已重新加载 %d 个配置文件玩家到队列", len(config_players))
+    # =================================================
+
     try:
         if push_to_git and git_check_updates():
             logger.info("检测到远程仓库有更新，正在拉取数据文件...")
@@ -1563,16 +1561,16 @@ def run_crawler_cycle(crawl_players=False, save_excel=False, push_to_git=False):
                 continue
                 
             if save_excel and not check_data_changed(mode, df):
-                logger.info("模式 %d 数据未变化，跳过保存", mode)
-                continue
+                logger.info("模式 %d 数据未变化，跳过Excel保存", mode)
+                # 仍然保存到数据库（因为数据库保存的是每次爬取的时间戳）
                 
             crawl_time = datetime.now()
             
-            # 只有在启用Excel保存时才保存到Excel
-            if save_excel:
+            # 只有在启用Excel保存时才保存到Excel，且数据变化才保存
+            if save_excel and check_data_changed(mode, df):
                 save_data_to_excel(mode, df, crawl_time)
                 
-            # 始终保存到数据库
+            # 始终保存到数据库（每次爬取都作为新记录）
             save_to_database(mode, df, crawl_time)
             has_changes = True
             
@@ -1580,13 +1578,19 @@ def run_crawler_cycle(crawl_players=False, save_excel=False, push_to_git=False):
         except Exception as e:
             logger.exception("处理模式 %d 时发生错误", mode)
     
-    if crawl_players and all_dfs:
+    # 只有当 crawl_leaderboard_players 为 True 时，才将排行榜中的玩家加入队列
+    if crawl_players and crawl_leaderboard_players and all_dfs:
         leaderboard_players = get_players_from_leaderboard(all_dfs)
         if leaderboard_players:
             add_players_to_queue(leaderboard_players)
             logger.info("从排行榜添加了 %d 个玩家到爬取队列", len(leaderboard_players))
-        
-        start_player_crawler_thread()
+    
+    # 启动玩家爬取（同步执行）
+    if crawl_players:
+        logger.info("同步执行玩家主页爬取...")
+        run_player_crawler()
+    else:
+        logger.info("玩家爬取已禁用，跳过")
     
     # 只有在明确指定时才推送Git
     if push_to_git:
@@ -1605,17 +1609,19 @@ def run_crawler_cycle(crawl_players=False, save_excel=False, push_to_git=False):
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='Malody排行榜爬虫')
-    parser.add_argument('--all', action='store_true', 
-                       help='爬取排行榜和玩家主页数据')
-    parser.add_argument('--leaderboard-only', action='store_true', 
-                       help='只爬取排行榜数据（默认）')
-    parser.add_argument('--players-only', action='store_true', 
-                       help='只爬取玩家主页数据')
-    parser.add_argument('--migrate-db', action='store_true', 
+    parser.add_argument('--all', action='store_true',
+                       help='爬取排行榜和玩家主页数据（包括将排行榜玩家加入队列）')
+    parser.add_argument('--leaderboard-only', action='store_true',
+                       help='只爬取排行榜数据，不爬取任何玩家主页（包括配置文件中的玩家）')
+    parser.add_argument('--players-only', action='store_true',
+                       help='只爬取玩家主页数据（从players.txt读取，不爬取排行榜）')
+    parser.add_argument('--no-player-crawl', action='store_true',
+                       help='禁用默认的玩家主页爬取（默认已开启配置文件玩家爬取，使用此参数可关闭）')
+    parser.add_argument('--migrate-db', action='store_true',
                        help='执行数据库迁移（添加uid字段）')
-    parser.add_argument('--import-only', action='store_true', 
+    parser.add_argument('--import-only', action='store_true',
                        help='只导入历史数据')
-    parser.add_argument('--once', action='store_true', 
+    parser.add_argument('--once', action='store_true',
                        help='运行一次爬取周期后退出')
     parser.add_argument('--save-excel', action='store_true',
                        help='保存数据到Excel文件（默认不保存）')
@@ -1625,7 +1631,7 @@ def parse_arguments():
     return parser.parse_args()
 
 def run_players_only():
-    """只运行玩家主页爬取"""
+    """只运行玩家主页爬取（仅消费配置文件中的玩家，不涉及排行榜）"""
     init_database()
     config_players = load_player_config()
     if config_players:
@@ -1644,6 +1650,7 @@ def main():
     
     init_database()
     
+    # 预加载配置文件玩家并加入队列（仅用于首次运行前的队列填充，后续周期会重新加载）
     config_players = load_player_config()
     if config_players:
         add_players_to_queue(config_players)
@@ -1662,41 +1669,83 @@ def main():
     else:
         logger.info("数据库中已有 %d 条记录，跳过历史数据导入", count)
     
+    # ------------------------------------------------------------
+    # 根据命令行参数确定爬取模式
+    # ------------------------------------------------------------
     if args.import_only:
         DatabaseManager().close_connection()
         return
-    elif args.players_only:
+    
+    if args.players_only:
         run_players_only()
         return
-    elif args.once:
-        run_crawler_cycle(crawl_players=args.all, save_excel=args.save_excel, push_to_git=args.push_to_git)
+    
+    # 确定是否爬取玩家（默认开启，除非被 --no-player-crawl 或 --leaderboard-only 关闭）
+    crawl_players = True
+    if args.no_player_crawl or args.leaderboard_only:
+        crawl_players = False
+    
+    # 确定是否将排行榜玩家加入队列（默认不加入，只有 --all 开启）
+    crawl_leaderboard_players = args.all
+    
+    # 确定是否保存Excel和推送Git
+    save_excel = args.save_excel
+    push_to_git = args.push_to_git
+    
+    # 单次运行模式
+    if args.once:
+        # 如果同时指定了 --leaderboard-only 但未禁止玩家爬取，则强制关闭玩家爬取
+        if args.leaderboard_only:
+            crawl_players = False
+            crawl_leaderboard_players = False
+        # 如果指定了 --all，则强制开启排行榜玩家加入队列
+        if args.all:
+            crawl_players = True
+            crawl_leaderboard_players = True
+            # 注意：--no-player-crawl 会与 --all 冲突，但这里用优先级：显式 --all 覆盖 --no-player-crawl
+            if args.no_player_crawl:
+                logger.warning("同时指定了 --all 和 --no-player-crawl，以 --all 为准，将爬取玩家")
+                crawl_players = True
+                crawl_leaderboard_players = True
+        
+        run_crawler_cycle(
+            crawl_players=crawl_players,
+            crawl_leaderboard_players=crawl_leaderboard_players,
+            save_excel=save_excel,
+            push_to_git=push_to_git
+        )
         DatabaseManager().close_connection()
         return
-    else:
-        try:
-            while True:
+    
+    try:
+        while True:
+            with stop_lock:
+                if stop_requested:
+                    logger.info("程序被终止")
+                    break
+            
+            try:
+                run_crawler_cycle(
+                    crawl_players=crawl_players,
+                    crawl_leaderboard_players=crawl_leaderboard_players,
+                    save_excel=save_excel,
+                    push_to_git=push_to_git
+                )
+            except Exception as e:
+                logger.exception("主循环发生未处理异常")
+            
+            logger.info("等待30分钟后重启...")
+            
+            for i in range(30):
                 with stop_lock:
                     if stop_requested:
                         logger.info("程序被终止")
                         break
                 
-                try:
-                    run_crawler_cycle(crawl_players=args.all, save_excel=args.save_excel, push_to_git=args.push_to_git)
-                except Exception as e:
-                    logger.exception("主循环发生未处理异常")
-                
-                logger.info("等待30分钟后重启...")
-                
-                for i in range(30):
-                    with stop_lock:
-                        if stop_requested:
-                            logger.info("程序被终止")
-                            break
-                    
-                    time.sleep(60)
-                    gc.collect()
-        finally:
-            DatabaseManager().close_connection()
+                time.sleep(60)
+                gc.collect()
+    finally:
+        DatabaseManager().close_connection()
 
 if __name__ == "__main__":
     main()

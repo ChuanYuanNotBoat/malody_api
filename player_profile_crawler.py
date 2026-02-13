@@ -132,6 +132,8 @@ class PlayerProfileCrawler:
             self.session = session
             
         self.db_manager = DatabaseManager()
+        # 初始化数据库时暂时禁用外键约束，避免因achievement_catalog缺失导致失败
+        self.db_manager.get_connection().execute('PRAGMA foreign_keys=OFF')
         self.init_database()
         
         # 用于跟踪已处理的玩家
@@ -177,15 +179,14 @@ class PlayerProfileCrawler:
         )
         ''')
         
-        # 玩家成就徽章表
+        # 玩家成就徽章表 - 适配当前数据库结构（无achievement_img_url列）
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_achievements (
-            achievement_id INTEGER PRIMARY KEY AUTOINCREMENT,
             uid TEXT NOT NULL,
-            achievement_code INTEGER,
-            achievement_img_url TEXT,
-            FOREIGN KEY (uid) REFERENCES player_profiles(uid),
-            UNIQUE(uid, achievement_code)
+            achievement_code INTEGER NOT NULL,
+            acquired_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (uid, achievement_code),
+            FOREIGN KEY (uid) REFERENCES player_profiles(uid)
         )
         ''')
         
@@ -375,7 +376,7 @@ class PlayerProfileCrawler:
                     profile["titles"].append(title)
                     self.logger.debug("提取头衔: %s", title)
             
-            # 5. 提取成就徽章
+            # 5. 提取成就徽章 - 仅保存成就代码，不保存图片URL
             achievement_imgs = soup.select("div.ach img[src*='achieve']")
             for img in achievement_imgs:
                 src = img.get('src', '')
@@ -390,14 +391,11 @@ class PlayerProfileCrawler:
                 match = re.search(r'/achieve/(\d+)', src)
                 if match:
                     achievement_code = int(match.group(1))
-                    achievement_img_url = BASE_URL + src if src.startswith('/') else src
-                    
                     # 检查是否已存在
                     existing = [a for a in profile["achievements"] if a.get("code") == achievement_code]
                     if not existing:
                         profile["achievements"].append({
-                            "code": achievement_code,
-                            "img_url": achievement_img_url
+                            "code": achievement_code
                         })
                         self.logger.debug("提取成就: %d", achievement_code)
             
@@ -567,14 +565,14 @@ class PlayerProfileCrawler:
             # 删除旧的成就记录，然后重新插入
             cursor.execute("DELETE FROM player_achievements WHERE uid = ?", (uid,))
             
-            # 保存成就
+            # 保存成就 - 适配当前表结构（无achievement_img_url列）
             if profile_data.get("achievements"):
                 for achievement in profile_data["achievements"]:
                     if achievement.get("code"):
                         cursor.execute('''
-                        INSERT INTO player_achievements (uid, achievement_code, achievement_img_url)
-                        VALUES (?, ?, ?)
-                        ''', (uid, achievement["code"], achievement.get("img_url", "")))
+                        INSERT INTO player_achievements (uid, achievement_code)
+                        VALUES (?, ?)
+                        ''', (uid, achievement["code"]))
             
             # 更新爬虫状态
             cursor.execute('''
@@ -700,12 +698,12 @@ class PlayerProfileCrawler:
         else:
             print(f"\n头衔: 无")
         
-        # 成就
+        # 成就 - 只显示成就代码，无图片URL
         achievements = profile_data.get('achievements', [])
         if achievements:
             print(f"\n成就徽章 ({len(achievements)} 个):")
             for i, achievement in enumerate(achievements, 1):
-                print(f"  {i}. 代码: {achievement.get('code', 'N/A')}, 图片: {achievement.get('img_url', 'N/A')[:50]}...")
+                print(f"  {i}. 成就代码: {achievement.get('code', 'N/A')}")
         else:
             print(f"\n成就徽章: 无")
         
@@ -899,6 +897,22 @@ def signal_handler(sig, frame):
     time.sleep(1)
     sys.exit(0)
 
+def read_uid_file(file_path):
+    """读取UID文件，忽略空行和注释行（# 或 //）"""
+    uid_list = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # 忽略空行和注释行
+                if not line or line.startswith('#') or line.startswith('//'):
+                    continue
+                uid_list.append(line)
+        return uid_list
+    except Exception as e:
+        logging.getLogger().error("读取UID文件失败: %s", e)
+        return None
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='玩家个人主页资料爬虫')
@@ -928,6 +942,9 @@ def main():
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
                        default='INFO', help='日志级别 (默认: INFO)')
     parser.add_argument('--log-file', help='指定日志文件路径')
+    # 新增参数：禁用默认读取players.txt
+    parser.add_argument('--no-default-players', action='store_true',
+                       help='不自动使用默认的players.txt文件作为UID源')
     
     args = parser.parse_args()
     
@@ -990,15 +1007,26 @@ def main():
             logger.error("连接测试失败")
         return
     
-    # 如果是仅打印模式，需要处理单个或多个UID
-    if args.print_only and args.uid:
-        # 单个UID的仅打印模式
-        success = crawler.test_parse_and_print(args.uid.strip())
-        return
-    
     # 准备UID列表
     uid_list = []
     
+    # 检查是否指定了任何UID源
+    has_source = any([
+        args.uid, args.uid_list, args.uid_range, 
+        args.uid_file, args.from_db, args.from_leaderboard
+    ])
+    
+    # 如果没有指定任何源且没有禁用默认players.txt，则自动使用默认文件
+    if not has_source and not args.no_default_players:
+        default_file = "players.txt"
+        if os.path.exists(default_file):
+            logger.info("未指定UID源，自动使用默认文件: %s", default_file)
+            args.uid_file = default_file
+        else:
+            logger.error("未指定任何UID源，且默认文件 %s 不存在，请指定源或创建文件", default_file)
+            return
+    
+    # 按优先级处理各源
     if args.uid:
         uid_list = [args.uid.strip()]
     
@@ -1016,11 +1044,9 @@ def main():
             return
     
     elif args.uid_file:
-        try:
-            with open(args.uid_file, 'r', encoding='utf-8') as f:
-                uid_list = [line.strip() for line in f if line.strip()]
-        except Exception as e:
-            logger.error("读取UID文件失败: %s", e)
+        # 使用增强的文件读取函数，支持注释和空行过滤
+        uid_list = read_uid_file(args.uid_file)
+        if uid_list is None:
             return
     
     elif args.from_db and not args.print_only:
@@ -1036,18 +1062,7 @@ def main():
             limit=args.limit
         )
     
-    else:
-        # 默认行为
-        if not args.print_only:
-            logger.info("未指定UID源，从数据库获取需要更新的玩家")
-            uid_list = crawler.crawl_from_database(
-                limit=args.limit or 100,
-                days_since_last_crawl=args.days_since_update
-            )
-        else:
-            logger.error("在 --print-only 模式下必须指定UID源 (--uid, --uid-list, --uid-range, --uid-file)")
-            return
-    
+    # 如果没有获取到任何UID，给出提示
     if not uid_list:
         logger.warning("没有找到需要爬取的玩家")
         return
