@@ -1,35 +1,54 @@
+# 日志文件
 crawler.log
-malody_rankings.db-shm
-malody_rankings.db-wal
-viz_output/*
-__pycache__/*
+logs/*
+
+# 数据库文件
+*.db
+*.db-shm
+*.db-wal
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+malody_api/__pycache__/
+malody_api/core/__pycache__/
+malody_api/core/services/__pycache__/
+malody_api/routers/__pycache__/
+malody_api/utils/__pycache__/
+
+# 进度记录文件
 sid_progress.json
 cid_progress.json
-logs/*
-malody_api/utils/__pycache__/*
-malody_api/routers/__pycache__/*
-malody_api/core/services/__pycache__/*
-malody_api/routers/__pycache__/*
 sid_backwards_progress.json
-malody_api/__pycache__/*
-malody_api/core/__pycache__/*
+
+# 输出目录
+viz_output/*
+
+# 编辑器/IDE 配置
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+
+# 备份文件
 *.bak
-*.pyc*.zip
+
+# 压缩文件
+*.zip
+*.tar
+*.gz
+
+# 文档/临时文件
 sql_changes.md
 *.txt
-*.db
-/.venv/
-.idea/*
-.idea/data_source_mapping.xml
-.idea/dataSources.xml
-.idea/malody_api.iml
-.idea/misc.xml
-.idea/modules.xml
-.idea/sqldialects.xml
-.idea/vcs.xml
-.idea/inspectionProfiles/profiles_settings.xml
-.malody_stats.py.swp
-*.db
-malody_rankings.db
-.vs/
+players.txt
+mod_mapping.json   # 如果不需要跟踪可以保留，否则移除
 
+# 虚拟环境
+/.venv/
+
+# 其他
+.malody_stats.py.swp
