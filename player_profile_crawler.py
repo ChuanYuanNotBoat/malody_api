@@ -996,7 +996,7 @@ class PlayerProfileCrawler:
         
         # 用于保存已提交的 future 及其对应的 UID
         futures = []
-        
+         
         # 使用线程池
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 提交任务的循环

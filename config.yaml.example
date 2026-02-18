@@ -1,0 +1,61 @@
+# 邮件服务器配置（请替换为真实信息）
+mail:
+  # 发送邮件配置（使用QQ邮箱示例）
+  smtp_out:
+    server: "smtp.qq.com"
+    port: 587
+    use_tls: true
+    username: "your-email@qq.com"          # 你的QQ邮箱（接收命令的邮箱）
+    password: "your-authorization-code"     # 授权码（QQ邮箱设置中获取）
+    from_addr: "your-email@qq.com"          # 与username相同
+
+  # 接收邮件配置（通过IMAP读取收件箱）
+  imap:
+    enabled: true                           # 启用IMAP接收
+    server: "imap.qq.com"
+    port: 993
+    use_ssl: true
+    username: "your-email@qq.com"           # 与发送邮箱相同
+    password: "your-authorization-code"      # 授权码（与smtp_out相同）
+
+  # 内置SMTP服务器（仅用于本地测试，可以禁用）
+  smtp_in:
+    enabled: false                           # 禁用内置SMTP
+    host: "127.0.0.1"
+    port: 2525
+    hostname: "localhost"
+
+# 允许发送命令的邮件地址（白名单）
+# 只有白名单内的发件人发出的命令才会被处理
+allowed_senders:
+  - "your-command-sender@example.com"        # 你的私人邮箱（命令邮件的发件人）
+
+# 报告接收邮箱（运行/停止爬虫时结果发送到此地址）
+report_to: "your-notification-email@example.com"
+
+# 爬虫定义（保持不变）
+crawlers:
+  player_profile:
+    script: "./player_profile_crawler.py"
+    description: "玩家个人资料爬虫"
+    default_args: []
+    presets:
+      quick: ["--uid", "123456"]
+      range_1000_2000: ["--uid-range", "1000-2000", "--max-workers", "2"]
+
+  rankings:
+    script: "./malody_rankings.py"
+    description: "排行榜爬虫"
+    default_args: []
+    presets:
+      once: ["--once"]
+      all: ["--all", "--once"]
+      players_only: ["--players-only"]
+
+  stb:
+    script: "./stb_crawler.py"
+    description: "STB谱面爬虫"
+    default_args: []
+    presets:
+      latest: ["--source", "latest", "--max-charts", "20"]
+      cid_range: ["--cid-crawl", "--start-cid", "1", "--end-cid", "100"]

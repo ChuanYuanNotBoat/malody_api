@@ -53,3 +53,5 @@ mod_mapping.json   # 如果不需要跟踪可以保留，否则移除
 # 其他
 .malody_stats.py.swp
 crawler_resume.bin
+config.yaml
+controller.log
