@@ -2,6 +2,9 @@
 """
 玩家个人主页资料爬虫
 用于爬取玩家的详细个人信息、头衔、成就等
+同时复用主爬虫的排名解析逻辑，自动更新玩家的排名数据（mode 0-9）
+支持中断恢复：通过进度文件记录已爬取位置，避免重复劳动。
+按下 Ctrl+C 会等待当前任务完成后输出统计报告再退出。
 """
 
 import requests
@@ -17,16 +20,24 @@ from datetime import datetime, timedelta
 import re
 import json
 import argparse
-from threading import Lock
+from threading import Lock, Thread
 import hashlib
 from logging.handlers import RotatingFileHandler
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 import pprint
+import pickle
+import struct
 
 # 复用现有的数据库管理器和配置
 from malody_rankings import DatabaseManager, init_database, stop_requested, stop_lock, COOKIES, HEADERS
+# 复用主爬虫中的排名解析与存储函数
+from malody_rankings import (
+    parse_player_profile as parse_rankings,      # 解析个人页中的排名数据
+    resolve_player_identity,                      # 处理玩家身份（改名合并）
+    save_player_ranking_record                     # 智能保存单条排名记录
+)
 
 # 配置日志
 def setup_detailed_logging(log_level=logging.INFO, log_file=None):
@@ -85,6 +96,14 @@ def setup_detailed_logging(log_level=logging.INFO, log_file=None):
     
     return logger
 
+# 颜色支持（仅在终端可用时启用）
+USE_COLOR = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+def colorize(text, color_code):
+    """为终端文本添加颜色"""
+    if USE_COLOR:
+        return f"\033[{color_code}m{text}\033[0m"
+    return text
+
 # Malody API配置
 BASE_URL = "https://m.mugzone.net"
 PLAYER_PROFILE_URL = BASE_URL + "/accounts/user/{uid}"
@@ -93,6 +112,143 @@ PLAYER_PROFILE_URL = BASE_URL + "/accounts/user/{uid}"
 player_queue = queue.Queue()
 crawl_progress = {}
 progress_lock = Lock()
+
+class ProgressTracker:
+    """
+    通用进度跟踪器，支持两种模式：
+    - range: 连续区间，使用位图存储，占用空间极小。
+    - list: 任意列表，使用集合存储，适合小规模数据。
+    线程安全。
+    """
+    def __init__(self, mode, start=None, end=None, uid_set=None):
+        self.mode = mode
+        self.lock = Lock()
+        if mode == 'range':
+            self.start = start
+            self.end = end
+            self.total = end - start + 1
+            self.bitmap = bytearray((self.total + 7) // 8)  # 每个比特代表一个UID，0=未完成，1=已完成
+            self.next_cursor = 0  # 用于顺序遍历的游标
+        elif mode == 'list':
+            if uid_set is None:
+                uid_set = set()
+            self.remaining = set(uid_set)  # 剩余未爬取的UID集合
+            self.total = len(uid_set)
+        else:
+            raise ValueError("mode must be 'range' or 'list'")
+
+    def _set_bit(self, idx):
+        """设置位图中指定索引的比特为1"""
+        byte_idx = idx // 8
+        bit_idx = idx % 8
+        self.bitmap[byte_idx] |= (1 << bit_idx)
+
+    def _test_bit(self, idx):
+        """测试位图中指定索引的比特是否为1"""
+        byte_idx = idx // 8
+        bit_idx = idx % 8
+        return (self.bitmap[byte_idx] >> bit_idx) & 1
+
+    def get_next(self):
+        """
+        返回下一个待爬取的UID。
+        对于range模式，按升序返回；对于list模式，顺序任意（从集合中弹出一个）。
+        如果没有剩余，返回None。
+        """
+        with self.lock:
+            if self.mode == 'range':
+                # 从游标开始向后找第一个未完成的
+                while self.next_cursor < self.total:
+                    if not self._test_bit(self.next_cursor):
+                        uid = self.start + self.next_cursor
+                        self.next_cursor += 1
+                        return str(uid)
+                    self.next_cursor += 1
+                return None
+            else:  # list
+                if not self.remaining:
+                    return None
+                # pop任意一个
+                return str(self.remaining.pop())
+
+    def mark_done(self, uid):
+        """标记指定UID为已完成"""
+        with self.lock:
+            if self.mode == 'range':
+                idx = int(uid) - self.start
+                if 0 <= idx < self.total:
+                    self._set_bit(idx)
+                else:
+                    raise ValueError(f"UID {uid} out of range [{self.start}, {self.end}]")
+            else:  # list
+                # 集合中可能已不存在，忽略
+                self.remaining.discard(int(uid))
+
+    def save(self, filepath):
+        """将当前进度保存到文件"""
+        with self.lock:
+            tmp_file = filepath + '.tmp'
+            if self.mode == 'range':
+                # 文件格式：版本(1字节) + start(4字节) + end(4字节) + 位图数据
+                with open(tmp_file, 'wb') as f:
+                    f.write(b'R')  # 版本标识
+                    f.write(struct.pack('<II', self.start, self.end))
+                    f.write(self.bitmap)
+            else:  # list
+                # 使用pickle序列化剩余集合
+                with open(tmp_file, 'wb') as f:
+                    f.write(b'L')
+                    pickle.dump(self.remaining, f)
+            os.replace(tmp_file, filepath)
+
+    @classmethod
+    def load(cls, filepath, mode, start=None, end=None, uid_set=None):
+        """
+        从文件加载进度。
+        如果文件不存在或不匹配，则根据参数创建新的跟踪器。
+        """
+        if not os.path.exists(filepath):
+            return cls(mode, start=start, end=end, uid_set=uid_set)
+
+        try:
+            with open(filepath, 'rb') as f:
+                magic = f.read(1)
+                if magic == b'R' and mode == 'range':
+                    # 读取范围
+                    data = f.read(8)
+                    if len(data) == 8:
+                        saved_start, saved_end = struct.unpack('<II', data)
+                        if saved_start == start and saved_end == end:
+                            # 范围匹配，加载位图
+                            tracker = cls('range', start=start, end=end)
+                            bitmap_data = f.read()
+                            if len(bitmap_data) == len(tracker.bitmap):
+                                tracker.bitmap = bytearray(bitmap_data)
+                                # 计算已完成的个数，用于初始化游标（可选）
+                                # 游标从0开始，get_next会跳过已完成
+                                return tracker
+                elif magic == b'L' and mode == 'list':
+                    remaining = pickle.load(f)
+                    tracker = cls('list', uid_set=remaining)
+                    return tracker
+        except Exception as e:
+            logging.getLogger().warning("加载进度文件失败: %s，将从头开始", e)
+
+        # 任何不匹配或错误，重新开始
+        return cls(mode, start=start, end=end, uid_set=uid_set)
+
+    def get_remaining_count(self):
+        """返回剩余待爬取数量"""
+        with self.lock:
+            if self.mode == 'range':
+                # 计算位图中0的个数
+                remaining = self.total - sum(bin(byte).count('1') for byte in self.bitmap)
+                return remaining
+            else:
+                return len(self.remaining)
+
+    def get_total(self):
+        return self.total
 
 class PlayerProfileCrawler:
     def __init__(self, session=None):
@@ -136,7 +292,7 @@ class PlayerProfileCrawler:
         self.db_manager.get_connection().execute('PRAGMA foreign_keys=OFF')
         self.init_database()
         
-        # 用于跟踪已处理的玩家
+        # 用于跟踪已处理的玩家（仅用于去重，与恢复逻辑分开）
         self.processed_uids = set()
             
     def init_database(self):
@@ -454,9 +610,12 @@ class PlayerProfileCrawler:
             return None
     
     def save_player_profile(self, profile_data):
-        """保存玩家资料到数据库"""
+        """
+        保存玩家资料到数据库
+        返回操作类型：'new'（首次插入）、'unchanged'（数据未变）、'updated'（数据变化更新）或 None（失败）
+        """
         if not profile_data:
-            return False
+            return None
         
         cursor = self.db_manager.get_connection().cursor()
         crawl_time = datetime.now()
@@ -499,7 +658,7 @@ class PlayerProfileCrawler:
                 
                 self.db_manager.get_connection().commit()
                 self.logger.info("玩家 %s 数据未变化，仅更新时间", uid)
-                return True
+                return 'unchanged'
             
             # 准备数据，确保数据类型正确
             stable_charts = profile_data.get("stable_charts", 0)
@@ -591,7 +750,12 @@ class PlayerProfileCrawler:
             
             self.db_manager.get_connection().commit()
             self.logger.info("✓ 玩家 %s 资料保存成功", uid)
-            return True
+            
+            # 判断是新增还是更新
+            if result is None:
+                return 'new'
+            else:
+                return 'updated'
             
         except Exception as e:
             self.logger.error("保存玩家 %s 资料失败: %s", profile_data.get("uid", "未知"), e, exc_info=True)
@@ -617,10 +781,13 @@ class PlayerProfileCrawler:
                 self.logger.error("更新爬虫状态失败: %s", e2)
             
             self.db_manager.get_connection().rollback()
-            return False
+            return None
     
-    def crawl_player_profile(self, uid, print_only=False):
-        """爬取单个玩家的个人主页"""
+    def crawl_player_profile(self, uid, print_only=False, stats=None, stats_lock=None):
+        """
+        爬取单个玩家的个人主页（资料 + 排名数据）
+        如果提供了 stats 和 stats_lock，则会累加统计信息
+        """
         self.logger.info("开始爬取玩家: %s", uid)
         
         # 检查是否已处理过
@@ -635,23 +802,73 @@ class PlayerProfileCrawler:
                 self.logger.info("玩家 %s 页面获取失败或无数据，跳过", uid)
                 return False
             
-            # 解析HTML
+            # 1. 解析并保存玩家资料
             profile_data = self.parse_player_profile_full(html, uid)
             if not profile_data:
-                self.logger.info("玩家 %s 数据解析失败，跳过", uid)
+                self.logger.info("玩家 %s 资料解析失败，跳过", uid)
                 return False
             
             # 如果是仅打印模式
             if print_only:
-                return self.print_profile_data(profile_data)
-            
-            # 保存到数据库
-            success = self.save_player_profile(profile_data)
-            if success:
-                self.processed_uids.add(uid)
+                self.print_profile_data(profile_data)
                 return True
+            
+            # 保存资料到数据库，获取操作类型
+            profile_op = self.save_player_profile(profile_data)
+            
+            # 2. 解析并保存排名数据（复用主爬虫逻辑）
+            crawl_time = datetime.now()
+            rank_data_list = parse_rankings(html, uid)  # 返回列表，每个元素包含 mode, rank, name, lv, exp, acc, combo, pc
+            
+            rank_stats = {'new':0, 'diff_insert':0, 'same_insert':0, 'update':0}
+            if rank_data_list:
+                for rd in rank_data_list:
+                    # 获取或创建 player_id（处理改名）
+                    player_id = resolve_player_identity(
+                        name=rd['name'],
+                        crawl_time=crawl_time,
+                        uid=uid
+                    )
+                    if player_id:
+                        op = save_player_ranking_record(
+                            player_id=player_id,
+                            uid=uid,
+                            mode=rd['mode'],
+                            rank=rd['rank'],
+                            name=rd['name'],
+                            lv=rd.get('lv', 0),
+                            exp=rd.get('exp', 0),
+                            acc=rd.get('acc', 0.0),
+                            combo=rd.get('combo', 0),
+                            pc=rd.get('pc', 0),
+                            crawl_time=crawl_time
+                        )
+                        if op in rank_stats:
+                            rank_stats[op] += 1
+                    else:
+                        self.logger.warning("玩家 %s 模式 %d 无法解析 player_id，跳过", uid, rd['mode'])
+                self.logger.info("已保存玩家 %s 的 %d 条排名记录", uid, len(rank_data_list))
             else:
-                return False
+                self.logger.info("玩家 %s 没有排名数据", uid)
+            
+            # 累加统计信息（如果提供了stats字典）
+            if stats is not None and stats_lock is not None:
+                with stats_lock:
+                    # 资料统计
+                    if profile_op == 'new':
+                        stats['profile_new'] += 1
+                    elif profile_op == 'updated':
+                        stats['profile_updated'] += 1
+                    elif profile_op == 'unchanged':
+                        stats['profile_unchanged'] += 1
+                    # 排名统计
+                    stats['rank_new'] += rank_stats['new']
+                    stats['rank_diff_insert'] += rank_stats['diff_insert']
+                    stats['rank_same_insert'] += rank_stats['same_insert']
+                    stats['rank_update'] += rank_stats['update']
+            
+            self.processed_uids.add(uid)
+            return True
                 
         except Exception as e:
             self.logger.error("爬取玩家 %s 时出错: %s", uid, e, exc_info=True)
@@ -748,19 +965,41 @@ class PlayerProfileCrawler:
         return True
     
     def crawl_players_batch(self, uid_list, max_workers=3, requests_per_minute=15, print_only=False):
-        """批量爬取玩家资料"""
+        """
+        批量爬取玩家资料（列表形式），支持中断恢复（使用集合进度文件）。
+        注意：此方法适用于小规模列表，大规模范围请使用 crawl_uid_range。
+        """
         self.logger.info("开始批量爬取，共 %d 个玩家，模式: %s", 
                        len(uid_list), "仅打印" if print_only else "保存到数据库")
+        
+        # 初始化统计字典（线程安全）
+        stats = {
+            'profile_new': 0,
+            'profile_updated': 0,
+            'profile_unchanged': 0,
+            'profile_failed': 0,
+            'rank_new': 0,
+            'rank_diff_insert': 0,
+            'rank_same_insert': 0,
+            'rank_update': 0,
+        }
+        stats_lock = Lock()
         
         success_count = 0
         fail_count = 0
         
         # 使用线程池并发爬取
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_uid = {
-                executor.submit(self.crawl_player_profile, uid, print_only): uid 
-                for uid in uid_list
-            }
+            future_to_uid = {}
+            for uid in uid_list:
+                future = executor.submit(
+                    self.crawl_player_profile, 
+                    uid, 
+                    print_only,
+                    stats,
+                    stats_lock
+                )
+                future_to_uid[future] = uid
             
             for future in as_completed(future_to_uid):
                 uid = future_to_uid[future]
@@ -771,14 +1010,19 @@ class PlayerProfileCrawler:
                         success_count += 1
                         if not print_only:
                             self.logger.info("✓ 玩家 %s 爬取成功 (进度: %d/%d)", 
-                                           uid, success_count, len(uid_list))
+                                           uid, success_count + fail_count, len(uid_list))
                     else:
                         fail_count += 1
                         if not print_only:
+                            # 失败时，资料统计中增加失败计数
+                            with stats_lock:
+                                stats['profile_failed'] += 1
                             self.logger.info("✗ 玩家 %s 爬取失败或无数据 (进度: %d/%d)", 
                                            uid, success_count + fail_count, len(uid_list))
                 except Exception as e:
                     fail_count += 1
+                    with stats_lock:
+                        stats['profile_failed'] += 1
                     if not print_only:
                         self.logger.error("处理玩家 %s 时出错: %s", uid, e)
                 
@@ -791,7 +1035,164 @@ class PlayerProfileCrawler:
         
         if not print_only:
             self.logger.info("批量爬取完成: 成功 %d, 失败 %d", success_count, fail_count)
+            self._print_stats(stats, len(uid_list), success_count, fail_count)
         return success_count, fail_count
+    
+    def crawl_uid_range(self, start_uid, end_uid, resume_file='crawler_resume.bin', save_interval=10,
+                        max_workers=3, requests_per_minute=15, print_only=False):
+        """
+        按UID范围爬取，支持中断恢复（使用位图进度文件）。
+        :param start_uid: 起始UID（包含）
+        :param end_uid: 结束UID（包含）
+        :param resume_file: 进度文件路径（二进制）
+        :param save_interval: 进度保存间隔（秒）
+        :param max_workers: 并发线程数
+        :param requests_per_minute: 请求速率限制（粗略控制）
+        :param print_only: 是否仅打印
+        :return: (成功数, 失败数)
+        """
+        self.logger.info("按UID范围爬取: %d - %d (共 %d 个)", start_uid, end_uid, end_uid - start_uid + 1)
+        
+        # 加载进度跟踪器
+        tracker = ProgressTracker.load(
+            resume_file,
+            mode='range',
+            start=start_uid,
+            end=end_uid
+        )
+        
+        total = tracker.get_total()
+        remaining = tracker.get_remaining_count()
+        self.logger.info("剩余待爬取: %d / %d", remaining, total)
+        
+        if remaining == 0:
+            self.logger.info("范围已完成，无需继续。如需重新爬取，请删除恢复文件 %s", resume_file)
+            return 0, 0
+        
+        # 初始化统计
+        stats = {
+            'profile_new': 0, 'profile_updated': 0, 'profile_unchanged': 0, 'profile_failed': 0,
+            'rank_new': 0, 'rank_diff_insert': 0, 'rank_same_insert': 0, 'rank_update': 0,
+        }
+        stats_lock = Lock()
+        success_count = 0
+        fail_count = 0
+        
+        # 定期保存进度的后台线程
+        stop_saver = threading.Event()
+        def saver_thread():
+            while not stop_saver.is_set():
+                time.sleep(save_interval)
+                try:
+                    tracker.save(resume_file)
+                    self.logger.debug("进度已保存至 %s (剩余 %d)", resume_file, tracker.get_remaining_count())
+                except Exception as e:
+                    self.logger.error("保存进度文件失败: %s", e)
+        
+        if not print_only:
+            saver = Thread(target=saver_thread, daemon=True)
+            saver.start()
+        else:
+            saver = None
+        
+        # 使用线程池并发爬取
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            # 动态提交任务
+            while True:
+                # 检查是否停止
+                with stop_lock:
+                    if stop_requested:
+                        self.logger.info("收到停止信号，停止提交新任务")
+                        break
+                
+                # 获取下一个待爬取UID
+                uid = tracker.get_next()
+                if uid is None:
+                    break
+                
+                # 提交任务
+                future = executor.submit(
+                    self.crawl_player_profile,
+                    uid,
+                    print_only,
+                    stats,
+                    stats_lock
+                )
+                futures.append((future, uid))
+                
+                # 粗略的速率限制
+                if requests_per_minute > 0:
+                    time.sleep(60 / requests_per_minute / max_workers)
+            
+            # 等待所有已提交的任务完成
+            for future, uid in futures:
+                try:
+                    result = future.result()
+                    if result:
+                        success_count += 1
+                        tracker.mark_done(uid)
+                    else:
+                        fail_count += 1
+                        with stats_lock:
+                            stats['profile_failed'] += 1
+                        # 失败的不标记已完成，下次重试
+                except Exception as e:
+                    fail_count += 1
+                    with stats_lock:
+                        stats['profile_failed'] += 1
+                    self.logger.error("处理玩家 %s 时出错: %s", uid, e)
+                    # 出错的不标记已完成，下次重试
+        
+        # 停止保存线程
+        if saver:
+            stop_saver.set()
+            saver.join(timeout=2)
+        
+        # 最终保存一次进度
+        if not print_only:
+            try:
+                tracker.save(resume_file)
+                self.logger.info("最终进度已保存至 %s (剩余 %d)", resume_file, tracker.get_remaining_count())
+            except Exception as e:
+                self.logger.error("保存最终进度失败: %s", e)
+        
+        # 输出统计
+        if not print_only:
+            self.logger.info("范围爬取完成: 成功 %d, 失败 %d", success_count, fail_count)
+            self._print_stats(stats, total, success_count, fail_count)
+        
+        return success_count, fail_count
+    
+    def _print_stats(self, stats, total_players, success, failed):
+        """输出详细的统计报告（彩色）"""
+        print("\n" + "="*70)
+        print(colorize("                    爬取统计报告", "1;36"))
+        print("="*70)
+        
+        # 玩家处理概况
+        print(f"总计玩家: {total_players}")
+        print(f"成功: {colorize(str(success), '92')} | 失败: {colorize(str(failed), '91')}")
+        print("-"*70)
+        
+        # 资料统计
+        print(colorize("玩家资料变动详情:", "1;33"))
+        total_profile = stats['profile_new'] + stats['profile_updated'] + stats['profile_unchanged']
+        print(f"  首次插入: {colorize(str(stats['profile_new']), '92')} (新增资料)")
+        print(f"  数据更新: {colorize(str(stats['profile_updated']), '93')} (已有资料变化)")
+        print(f"  未变化:   {colorize(str(stats['profile_unchanged']), '94')} (仅更新时间)")
+        print(f"  失败:     {colorize(str(stats['profile_failed']), '91')}")
+        print()
+        
+        # 排名记录统计
+        total_rank_ops = stats['rank_new'] + stats['rank_diff_insert'] + stats['rank_same_insert'] + stats['rank_update']
+        print(colorize("玩家排名记录变动详情:", "1;33"))
+        print(f"  首次插入:   {colorize(str(stats['rank_new']), '92')} (新模式首次记录)")
+        print(f"  变化插入:   {colorize(str(stats['rank_diff_insert']), '93')} (数据变化)")
+        print(f"  相同插入:   {colorize(str(stats['rank_same_insert']), '94')} (相同数据第二行)")
+        print(f"  时间更新:   {colorize(str(stats['rank_update']), '95')} (连续相同数据更新时间)")
+        print(f"  总计操作:   {total_rank_ops} 条")
+        print("="*70)
     
     def crawl_from_database(self, limit=None, days_since_last_crawl=30):
         """从数据库中获取需要更新的玩家UID"""
@@ -858,7 +1259,7 @@ class PlayerProfileCrawler:
             return []
     
     def crawl_by_uid_range(self, start_uid, end_uid, step=1, print_only=False):
-        """按UID范围爬取"""
+        """按UID范围爬取（旧方法，保留兼容性，但推荐使用 crawl_uid_range）"""
         uid_list = list(range(start_uid, end_uid + 1, step))
         self.logger.info("按UID范围爬取: %d-%d (共 %d 个)", start_uid, end_uid, len(uid_list))
         return self.crawl_players_batch(uid_list, print_only=print_only)
@@ -888,14 +1289,17 @@ class PlayerProfileCrawler:
             self.logger.error("连接测试失败")
             return False
 
+# 修改后的信号处理器：设置标志，打印彩色消息，不直接退出
 def signal_handler(sig, frame):
     """处理终止信号"""
     global stop_requested
     with stop_lock:
         stop_requested = True
-    logging.getLogger().info("收到终止信号，正在安全退出...")
-    time.sleep(1)
-    sys.exit(0)
+    # 彩色输出
+    msg = "收到终止信号，正在等待当前任务完成并安全退出..."
+    print(colorize(msg, "1;33"))  # 黄色加粗
+    logging.getLogger().info(msg)
+    # 不调用 sys.exit，让主循环检查 stop_requested 并自然退出
 
 def read_uid_file(file_path):
     """读取UID文件，忽略空行和注释行（# 或 //）"""
@@ -945,6 +1349,12 @@ def main():
     # 新增参数：禁用默认读取players.txt
     parser.add_argument('--no-default-players', action='store_true',
                        help='不自动使用默认的players.txt文件作为UID源')
+    
+    # 中断恢复相关参数
+    parser.add_argument('--resume-file', type=str, default='crawler_resume.bin',
+                       help='恢复进度文件 (默认: crawler_resume.bin)')
+    parser.add_argument('--save-interval', type=int, default=10,
+                       help='进度保存间隔(秒) (默认: 10)')
     
     args = parser.parse_args()
     
@@ -1029,16 +1439,36 @@ def main():
     # 按优先级处理各源
     if args.uid:
         uid_list = [args.uid.strip()]
+        success, fail = crawler.crawl_players_batch(
+            uid_list, 
+            max_workers=args.max_workers,
+            requests_per_minute=args.rpm,
+            print_only=args.print_only
+        )
     
     elif args.uid_list:
         uid_list = [uid.strip() for uid in args.uid_list.split(',') if uid.strip()]
+        success, fail = crawler.crawl_players_batch(
+            uid_list, 
+            max_workers=args.max_workers,
+            requests_per_minute=args.rpm,
+            print_only=args.print_only
+        )
     
     elif args.uid_range:
         try:
             start_str, end_str = args.uid_range.split('-')
             start_uid = int(start_str.strip())
             end_uid = int(end_str.strip())
-            uid_list = list(range(start_uid, end_uid + 1))
+            # 使用范围爬取（支持中断恢复，位图进度文件）
+            success, fail = crawler.crawl_uid_range(
+                start_uid, end_uid,
+                resume_file=args.resume_file,
+                save_interval=args.save_interval,
+                max_workers=args.max_workers,
+                requests_per_minute=args.rpm,
+                print_only=args.print_only
+            )
         except ValueError:
             logger.error("UID范围格式错误，应为: start-end (如: 1000-2000)")
             return
@@ -1048,6 +1478,12 @@ def main():
         uid_list = read_uid_file(args.uid_file)
         if uid_list is None:
             return
+        success, fail = crawler.crawl_players_batch(
+            uid_list, 
+            max_workers=args.max_workers,
+            requests_per_minute=args.rpm,
+            print_only=args.print_only
+        )
     
     elif args.from_db and not args.print_only:
         # 仅当需要保存时才从数据库获取
@@ -1055,41 +1491,40 @@ def main():
             limit=args.limit, 
             days_since_last_crawl=args.days_since_update
         )
+        if uid_list:
+            success, fail = crawler.crawl_players_batch(
+                uid_list, 
+                max_workers=args.max_workers,
+                requests_per_minute=args.rpm,
+                print_only=args.print_only
+            )
+        else:
+            logger.info("没有需要更新的玩家")
+            return
     
     elif args.from_leaderboard:
         uid_list = crawler.crawl_from_leaderboard(
             mode=args.leaderboard_mode,
             limit=args.limit
         )
+        if uid_list:
+            success, fail = crawler.crawl_players_batch(
+                uid_list, 
+                max_workers=args.max_workers,
+                requests_per_minute=args.rpm,
+                print_only=args.print_only
+            )
+        else:
+            logger.info("从排行榜未获取到有效玩家")
+            return
     
     # 如果没有获取到任何UID，给出提示
-    if not uid_list:
+    if not uid_list and args.uid is None and args.uid_range is None and args.uid_file is None and args.uid_list is None:
         logger.warning("没有找到需要爬取的玩家")
         return
     
-    # 限制爬取数量
-    if args.limit and len(uid_list) > args.limit:
-        uid_list = uid_list[:args.limit]
-    
-    logger.info("开始爬取 %d 个玩家资料，模式: %s", 
-               len(uid_list), "仅打印" if args.print_only else "保存到数据库")
-    
-    # 初始化进度
-    with progress_lock:
-        crawl_progress['current'] = 0
-        crawl_progress['success'] = 0
-        crawl_progress['fail'] = 0
-        crawl_progress['total'] = len(uid_list)
-    
-    # 批量爬取
-    success, fail = crawler.crawl_players_batch(
-        uid_list, 
-        max_workers=args.max_workers,
-        requests_per_minute=args.rpm,
-        print_only=args.print_only
-    )
-    
-    if not args.print_only:
+    # 非范围源的处理已经在各分支中完成，这里只记录完成信息
+    if not args.print_only and args.uid_range is None:  # 范围源已经在方法内部输出统计
         logger.info("爬取完成: 成功 %d, 失败 %d", success, fail)
         
         # 显示最终状态
