@@ -224,7 +224,6 @@ class ProgressTracker:
                             bitmap_data = f.read()
                             if len(bitmap_data) == len(tracker.bitmap):
                                 tracker.bitmap = bytearray(bitmap_data)
-                                # 计算已完成的个数，用于初始化游标（可选）
                                 # 游标从0开始，get_next会跳过已完成
                                 return tracker
                 elif magic == b'L' and mode == 'list':
@@ -820,7 +819,8 @@ class PlayerProfileCrawler:
             crawl_time = datetime.now()
             rank_data_list = parse_rankings(html, uid)  # 返回列表，每个元素包含 mode, rank, name, lv, exp, acc, combo, pc
             
-            rank_stats = {'new':0, 'diff_insert':0, 'same_insert':0, 'update':0}
+            # MODIFIED: 增加 update_fill 统计
+            rank_stats = {'new':0, 'diff_insert':0, 'same_insert':0, 'update':0, 'update_fill':0}
             if rank_data_list:
                 for rd in rank_data_list:
                     # 获取或创建 player_id（处理改名）
@@ -841,7 +841,8 @@ class PlayerProfileCrawler:
                             acc=rd.get('acc', 0.0),
                             combo=rd.get('combo', 0),
                             pc=rd.get('pc', 0),
-                            crawl_time=crawl_time
+                            crawl_time=crawl_time,
+                            source='profile'
                         )
                         if op in rank_stats:
                             rank_stats[op] += 1
@@ -866,6 +867,7 @@ class PlayerProfileCrawler:
                     stats['rank_diff_insert'] += rank_stats['diff_insert']
                     stats['rank_same_insert'] += rank_stats['same_insert']
                     stats['rank_update'] += rank_stats['update']
+                    stats['rank_update_fill'] += rank_stats['update_fill']   # MODIFIED: 累加 update_fill
             
             self.processed_uids.add(uid)
             return True
@@ -973,6 +975,7 @@ class PlayerProfileCrawler:
                        len(uid_list), "仅打印" if print_only else "保存到数据库")
         
         # 初始化统计字典（线程安全）
+        # MODIFIED: 增加 rank_update_fill
         stats = {
             'profile_new': 0,
             'profile_updated': 0,
@@ -982,6 +985,7 @@ class PlayerProfileCrawler:
             'rank_diff_insert': 0,
             'rank_same_insert': 0,
             'rank_update': 0,
+            'rank_update_fill': 0,
         }
         stats_lock = Lock()
         
@@ -1070,9 +1074,10 @@ class PlayerProfileCrawler:
             return 0, 0
         
         # 初始化统计
+        # MODIFIED: 增加 rank_update_fill
         stats = {
             'profile_new': 0, 'profile_updated': 0, 'profile_unchanged': 0, 'profile_failed': 0,
-            'rank_new': 0, 'rank_diff_insert': 0, 'rank_same_insert': 0, 'rank_update': 0,
+            'rank_new': 0, 'rank_diff_insert': 0, 'rank_same_insert': 0, 'rank_update': 0, 'rank_update_fill': 0,
         }
         stats_lock = Lock()
         success_count = 0
@@ -1100,7 +1105,7 @@ class PlayerProfileCrawler:
             futures = []
             # 动态提交任务
             while True:
-                # 检查是否停止
+                # 第一次检查停止标志
                 with stop_lock:
                     if stop_requested:
                         self.logger.info("收到停止信号，停止提交新任务")
@@ -1110,6 +1115,13 @@ class PlayerProfileCrawler:
                 uid = tracker.get_next()
                 if uid is None:
                     break
+                
+                # 第二次检查（防止获取UID后信号才到达）
+                with stop_lock:
+                    if stop_requested:
+                        self.logger.info("收到停止信号，放弃已获取的UID %s", uid)
+                        # 注意：这里放弃了该UID，不会提交任务，下次运行时会重新获取
+                        break
                 
                 # 提交任务
                 future = executor.submit(
@@ -1185,13 +1197,15 @@ class PlayerProfileCrawler:
         print()
         
         # 排名记录统计
-        total_rank_ops = stats['rank_new'] + stats['rank_diff_insert'] + stats['rank_same_insert'] + stats['rank_update']
+        # MODIFIED: 增加 LV填充 显示
         print(colorize("玩家排名记录变动详情:", "1;33"))
         print(f"  首次插入:   {colorize(str(stats['rank_new']), '92')} (新模式首次记录)")
         print(f"  变化插入:   {colorize(str(stats['rank_diff_insert']), '93')} (数据变化)")
         print(f"  相同插入:   {colorize(str(stats['rank_same_insert']), '94')} (相同数据第二行)")
         print(f"  时间更新:   {colorize(str(stats['rank_update']), '95')} (连续相同数据更新时间)")
-        print(f"  总计操作:   {total_rank_ops} 条")
+        print(f"  LV填充:     {colorize(str(stats['rank_update_fill']), '96')} (填充缺失等级)")
+        total_rank = stats['rank_new'] + stats['rank_diff_insert'] + stats['rank_same_insert'] + stats['rank_update'] + stats['rank_update_fill']
+        print(f"  总计操作:   {total_rank} 条")
         print("="*70)
     
     def crawl_from_database(self, limit=None, days_since_last_crawl=30):

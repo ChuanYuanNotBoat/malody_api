@@ -795,7 +795,7 @@ def save_data_to_excel(mode, df, timestamp):
             with pd.ExcelWriter(filename, engine='openpyxl', mode='a') as writer:
                 pd.DataFrame().to_excel(writer, sheet_name=sheet_name)
 
-        sub_sheets = [s for s in wb.sheetnames if s.startswith(f"{sheet_name}_")]
+        sub_sheets = [s for s in wb.sheetnames if s.startswith(f"{sheet_name}_")] if wb.sheetnames else []
         latest_sheet = None
         latest_time = None
         for s in sub_sheets:
@@ -822,17 +822,23 @@ def save_data_to_excel(mode, df, timestamp):
         logger.exception("保存模式 %d 数据到Excel失败", mode)
 
 
-def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time):
+def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time, source):
     """
-    智能保存单条玩家排名记录。
-    返回操作类型: 'new' (首次插入), 'diff_insert' (数据不同插入),
-                'same_insert' (数据相同但只有一条,插入第二行), 'update' (更新时间戳)
+    区间模型排行榜保存（统一处理所有来源）。
+    返回值：
+        'new'          : 首次插入
+        'diff_insert'  : 状态变化，插入新 start
+        'update'       : 延长 end
+        'same_insert'  : 插入 end
+        'update_fill'  : 填充 lv
     """
     db_manager = DatabaseManager()
     conn = db_manager.get_connection()
     cursor = conn.cursor()
 
-    # 查询该玩家该模式的最新两条记录
+    current_core = (rank, name, exp, acc, combo, pc)
+
+    # 只取最新两条
     cursor.execute('''
         SELECT id, rank, name, lv, exp, acc, combo, pc, crawl_time
         FROM player_rankings
@@ -840,11 +846,10 @@ def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, c
         ORDER BY crawl_time DESC
         LIMIT 2
     ''', (player_id, mode))
+
     rows = cursor.fetchall()
 
-    current_data = (rank, name, lv, exp, acc, combo, pc)
-
-    # 无记录 → 直接插入
+    # 没有记录 → start
     if not rows:
         cursor.execute('''
             INSERT INTO player_rankings
@@ -852,48 +857,54 @@ def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, c
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time))
         conn.commit()
-        logger.debug("首次插入玩家 %d 模式 %d", player_id, mode)
         return 'new'
 
     # 最新记录
-    latest = rows[0]
-    latest_id, l_rank, l_name, l_lv, l_exp, l_acc, l_combo, l_pc, l_time = latest
-    latest_data = (l_rank, l_name, l_lv, l_exp, l_acc, l_combo, l_pc)
+    last = rows[0]
+    last_id, last_rank, last_name, last_lv, last_exp, last_acc, last_combo, last_pc, last_time = last
+    last_core = (last_rank, last_name, last_exp, last_acc, last_combo, last_pc)
 
-    if current_data == latest_data:
-        # 数据相同
-        if len(rows) >= 2:
-            # 有次新记录
-            second = rows[1]
-            s_rank, s_name, s_lv, s_exp, s_acc, s_combo, s_pc = second[1:8]
-            second_data = (s_rank, s_name, s_lv, s_exp, s_acc, s_combo, s_pc)
-            if second_data == latest_data:
-                # 次新与最新相同 → 更新时间戳
-                cursor.execute('''
-                    UPDATE player_rankings SET crawl_time = ? WHERE id = ?
-                ''', (crawl_time, latest_id))
-                conn.commit()
-                logger.debug("更新玩家 %d 模式 %d 记录时间到 %s", player_id, mode, crawl_time)
-                return 'update'
-        # 只有一条最新记录或次新不同 → 插入新行（形成两条相同数据）
-        cursor.execute('''
-            INSERT INTO player_rankings
-            (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time))
-        conn.commit()
-        logger.debug("插入玩家 %d 模式 %d 相同数据新行", player_id, mode)
-        return 'same_insert'
-    else:
-        # 数据不同 → 插入新行
-        cursor.execute('''
-            INSERT INTO player_rankings
-            (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time))
-        conn.commit()
-        logger.debug("插入玩家 %d 模式 %d 不同数据新行", player_id, mode)
-        return 'diff_insert'
+    # 判断是否已有 end（两条相同）
+    has_two_same = False
+    if len(rows) == 2:
+        second = rows[1]
+        second_core = (second[1], second[2], second[4], second[5], second[6], second[7])
+        if second_core == last_core:
+            has_two_same = True
+
+    # 状态相同
+    if last_core == current_core:
+
+        # lv 补全
+        if last_lv == 0 and lv != 0:
+            cursor.execute('UPDATE player_rankings SET lv = ?, crawl_time = ? WHERE id = ?', (lv, crawl_time, last_id))
+            conn.commit()
+            return 'update_fill'
+
+        if not has_two_same:
+            # 插入 end
+            cursor.execute('''
+                INSERT INTO player_rankings
+                (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time))
+            conn.commit()
+            return 'same_insert'
+        else:
+            # 延长 end
+            cursor.execute('UPDATE player_rankings SET crawl_time = ? WHERE id = ?', (crawl_time, last_id))
+            conn.commit()
+            return 'update'
+
+    # 状态变化 → 新 start
+    cursor.execute('''
+        INSERT INTO player_rankings
+        (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time))
+
+    conn.commit()
+    return 'diff_insert'
 
 
 def save_to_database(mode, df, crawl_time):
@@ -901,7 +912,7 @@ def save_to_database(mode, df, crawl_time):
     if df.empty:
         return
 
-    stats = {'new': 0, 'diff_insert': 0, 'same_insert': 0, 'update': 0}
+    stats = {'new': 0, 'diff_insert': 0, 'same_insert': 0, 'update': 0, 'update_fill': 0}
 
     for _, row in df.iterrows():
         player_id = resolve_player_identity(row['name'], crawl_time, row.get('player_id'))
@@ -917,7 +928,8 @@ def save_to_database(mode, df, crawl_time):
                 acc=row['acc'],
                 combo=row['combo'],
                 pc=row['pc'],
-                crawl_time=crawl_time
+                crawl_time=crawl_time,
+                source='leaderboard'  # 排行榜数据
             )
             stats[op] += 1
 
@@ -926,10 +938,11 @@ def save_to_database(mode, df, crawl_time):
            f"{colorize('首次', '92')}: {stats['new']} | "
            f"{colorize('变化插入', '93')}: {stats['diff_insert']} | "
            f"{colorize('相同插入', '94')}: {stats['same_insert']} | "
-           f"{colorize('时间更新', '95')}: {stats['update']}")
+           f"{colorize('时间更新', '95')}: {stats['update']} | "
+           f"{colorize('LV填充', '96')}: {stats['update_fill']}")
     print(msg)
-    logger.info("模式 %d 数据统计: new=%d, diff=%d, same=%d, update=%d",
-                mode, stats['new'], stats['diff_insert'], stats['same_insert'], stats['update'])
+    logger.info("模式 %d 数据统计: new=%d, diff=%d, same=%d, update=%d, fill=%d",
+                mode, stats['new'], stats['diff_insert'], stats['same_insert'], stats['update'], stats['update_fill'])
 
 
 def save_player_profile_to_database(player_data, crawl_time, player_identifier):
@@ -941,7 +954,7 @@ def save_player_profile_to_database(player_data, crawl_time, player_identifier):
     conn = db_manager.get_connection()
     cursor = conn.cursor()
     success = False
-    stats = {'new': 0, 'diff_insert': 0, 'same_insert': 0, 'update': 0}
+    stats = {'new': 0, 'diff_insert': 0, 'same_insert': 0, 'update': 0, 'update_fill': 0}
 
     try:
         for data in player_data:
@@ -958,7 +971,8 @@ def save_player_profile_to_database(player_data, crawl_time, player_identifier):
                     acc=data['acc'],
                     combo=data['combo'],
                     pc=data['pc'],
-                    crawl_time=crawl_time
+                    crawl_time=crawl_time,
+                    source='profile'  # 个人页数据
                 )
                 stats[op] += 1
                 success = True
@@ -979,10 +993,11 @@ def save_player_profile_to_database(player_data, crawl_time, player_identifier):
                f"{colorize('首次', '92')}: {stats['new']} | "
                f"{colorize('变化插入', '93')}: {stats['diff_insert']} | "
                f"{colorize('相同插入', '94')}: {stats['same_insert']} | "
-               f"{colorize('时间更新', '95')}: {stats['update']}")
+               f"{colorize('时间更新', '95')}: {stats['update']} | "
+               f"{colorize('LV填充', '96')}: {stats['update_fill']}")
         print(msg)
-        logger.info("玩家 %s 数据统计: new=%d, diff=%d, same=%d, update=%d",
-                    player_identifier, stats['new'], stats['diff_insert'], stats['same_insert'], stats['update'])
+        logger.info("玩家 %s 数据统计: new=%d, diff=%d, same=%d, update=%d, fill=%d",
+                    player_identifier, stats['new'], stats['diff_insert'], stats['same_insert'], stats['update'], stats['update_fill'])
         return success
 
     except Exception as e:
