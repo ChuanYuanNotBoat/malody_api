@@ -966,16 +966,17 @@ class PlayerProfileCrawler:
         self.print_profile_data(profile_data)
         return True
     
+    # ========== 修改后的 crawl_players_batch 方法 ==========
     def crawl_players_batch(self, uid_list, max_workers=3, requests_per_minute=15, print_only=False):
         """
         批量爬取玩家资料（列表形式），支持中断恢复（使用集合进度文件）。
         注意：此方法适用于小规模列表，大规模范围请使用 crawl_uid_range。
+        改进：支持 Ctrl+C 后停止提交新任务，等待当前任务完成后退出。
         """
         self.logger.info("开始批量爬取，共 %d 个玩家，模式: %s", 
                        len(uid_list), "仅打印" if print_only else "保存到数据库")
         
         # 初始化统计字典（线程安全）
-        # MODIFIED: 增加 rank_update_fill
         stats = {
             'profile_new': 0,
             'profile_updated': 0,
@@ -989,57 +990,91 @@ class PlayerProfileCrawler:
         }
         stats_lock = Lock()
         
-        success_count = 0
-        fail_count = 0
+        # 将 UID 列表转换为迭代器，以便逐个获取
+        uid_iter = iter(uid_list)
+        total = len(uid_list)
         
-        # 使用线程池并发爬取
+        # 用于保存已提交的 future 及其对应的 UID
+        futures = []
+        
+        # 使用线程池
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_uid = {}
-            for uid in uid_list:
+            # 提交任务的循环
+            while True:
+                # 检查停止信号
+                with stop_lock:
+                    if stop_requested:
+                        self.logger.info("收到停止信号，停止提交新任务")
+                        break
+                
+                # 获取下一个 UID
+                try:
+                    uid = next(uid_iter)
+                except StopIteration:
+                    # 没有更多 UID 了
+                    break
+                
+                # 提交任务
                 future = executor.submit(
-                    self.crawl_player_profile, 
-                    uid, 
+                    self.crawl_player_profile,
+                    uid,
                     print_only,
                     stats,
                     stats_lock
                 )
-                future_to_uid[future] = uid
-            
-            for future in as_completed(future_to_uid):
-                uid = future_to_uid[future]
+                futures.append((future, uid))
                 
+                # 粗略速率限制
+                if requests_per_minute > 0:
+                    time.sleep(60 / requests_per_minute / max_workers)
+            
+            self.logger.info("任务提交完成，共提交 %d 个任务，等待剩余任务完成...", len(futures))
+            
+            # 等待所有已提交的任务完成，并处理结果
+            success_count = 0
+            fail_count = 0
+            
+            for future, uid in futures:
+                # 先尝试取消尚未开始的任务（仍在队列中）
+                if future.cancel():
+                    self.logger.debug("已取消未开始的玩家 %s 任务", uid)
+                    # 取消的任务视为失败（或忽略），更新统计
+                    with stats_lock:
+                        stats['profile_failed'] += 1
+                    fail_count += 1
+                    # 更新进度
+                    with progress_lock:
+                        crawl_progress['current'] = success_count + fail_count
+                        crawl_progress['success'] = success_count
+                        crawl_progress['fail'] = fail_count
+                        crawl_progress['total'] = total
+                    continue
+                
+                # 任务无法取消（已在运行或已完成），等待结果
                 try:
                     result = future.result()
                     if result:
                         success_count += 1
-                        if not print_only:
-                            self.logger.info("✓ 玩家 %s 爬取成功 (进度: %d/%d)", 
-                                           uid, success_count + fail_count, len(uid_list))
                     else:
                         fail_count += 1
-                        if not print_only:
-                            # 失败时，资料统计中增加失败计数
-                            with stats_lock:
-                                stats['profile_failed'] += 1
-                            self.logger.info("✗ 玩家 %s 爬取失败或无数据 (进度: %d/%d)", 
-                                           uid, success_count + fail_count, len(uid_list))
+                        with stats_lock:
+                            stats['profile_failed'] += 1
                 except Exception as e:
                     fail_count += 1
                     with stats_lock:
                         stats['profile_failed'] += 1
-                    if not print_only:
-                        self.logger.error("处理玩家 %s 时出错: %s", uid, e)
+                    self.logger.error("处理玩家 %s 时出错: %s", uid, e)
                 
                 # 更新进度
                 with progress_lock:
                     crawl_progress['current'] = success_count + fail_count
                     crawl_progress['success'] = success_count
                     crawl_progress['fail'] = fail_count
-                    crawl_progress['total'] = len(uid_list)
+                    crawl_progress['total'] = total
         
         if not print_only:
             self.logger.info("批量爬取完成: 成功 %d, 失败 %d", success_count, fail_count)
-            self._print_stats(stats, len(uid_list), success_count, fail_count)
+            self._print_stats(stats, total, success_count, fail_count)
         return success_count, fail_count
     
     def crawl_uid_range(self, start_uid, end_uid, resume_file='crawler_resume.bin', save_interval=10,
@@ -1074,7 +1109,6 @@ class PlayerProfileCrawler:
             return 0, 0
         
         # 初始化统计
-        # MODIFIED: 增加 rank_update_fill
         stats = {
             'profile_new': 0, 'profile_updated': 0, 'profile_unchanged': 0, 'profile_failed': 0,
             'rank_new': 0, 'rank_diff_insert': 0, 'rank_same_insert': 0, 'rank_update': 0, 'rank_update_fill': 0,
@@ -1197,7 +1231,6 @@ class PlayerProfileCrawler:
         print()
         
         # 排名记录统计
-        # MODIFIED: 增加 LV填充 显示
         print(colorize("玩家排名记录变动详情:", "1;33"))
         print(f"  首次插入:   {colorize(str(stats['rank_new']), '92')} (新模式首次记录)")
         print(f"  变化插入:   {colorize(str(stats['rank_diff_insert']), '93')} (数据变化)")
