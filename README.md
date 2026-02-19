@@ -9,11 +9,12 @@ Malody API 是一个基于 FastAPI 构建的 Web 服务，提供对 Malody 游�
 ## 功能特性
 
 ### 核心功能
-- **玩家数据查询** - 获取玩家排名、详细信息、历史记录
-- **谱面数据查询** - 谱面统计、热门谱面、创作者信息
+- **玩家数据查询** - 获取玩家排名、详细信息、个人资料（头衔、成就）、历史记录
+- **谱面数据查询** - 谱面统计、热门谱面、创作者信息、稳定者分析、谱面详情
 - **实时页面解析** - 解析 Malody 谱面页面，获取最新排行榜数据
 - **高级查询系统** - 支持灵活的数据库查询和统计分析
 - **数据可视化** - 趋势分析、模式比较、数据统计
+- **爬虫控制** - 远程触发爬虫更新、查看爬虫进度
 
 ### 技术特性
 - RESTful API 设计，标准化 JSON 响应格式
@@ -57,7 +58,8 @@ python run.py
 
 #### 玩家数据
 - `GET /players/top` - 获取顶级玩家排名
-- `GET /players/{player_identifier}` - 获取玩家详细信息
+- `GET /players/{player_identifier}` - 获取玩家基本信息
+- `GET /players/{identifier}/profile` - 获取玩家详细资料（头像、头衔、成就、个人信息）
 - `GET /players/{player_name}/history` - 获取玩家历史排名
 - `GET /players/search/{keyword}` - 搜索玩家
 
@@ -66,12 +68,18 @@ python run.py
 - `GET /charts/hot` - 获取热门谱面
 - `GET /charts/recent` - 获取最近更新的谱面
 - `GET /charts/stable-creators` - 获取 Stable 谱面创作者排行榜
+- `GET /charts/{cid}` - 获取单个谱面的详细信息（包含歌曲数据）
+- `GET /charts/stabilizers/{player_name}/stats` - 获取稳定者的统计信息
+- `GET /charts/stabilizers/{player_name}/charts` - 获取稳定者审核的谱面列表
+- `GET /charts/search/{keyword}` - 搜索谱面
+- `GET /charts/creators/search/{keyword}` - 搜索创作者
+- `GET /charts/export/charts` - 导出谱面数据为 CSV 文件（支持筛选）
 
 #### 页面解析
-- `GET /page-parser/chart/{cid}` - 解析谱面页面
+- `GET /page-parser/chart/{cid}` - 解析谱面页面（包含谱面信息和排行榜）
 - `GET /page-parser/chart/{cid}/ranking` - 仅获取谱面排行榜数据
-- `GET /page-parser/song/search` - 搜索歌曲
-- `GET /page-parser/song/{sid}` - 获取歌曲详细信息
+- `GET /page-parser/song/search` - 搜索歌曲（从数据库）
+- `GET /page-parser/song/{sid}` - 获取歌曲详细信息（待实现）
 
 #### 数据分析
 - `GET /analytics/player-trends` - 分析玩家数据变化趋势
@@ -82,6 +90,10 @@ python run.py
 - `POST /query/execute` - 执行高级数据库查询
 - `GET /query/tables/{table_name}/schema` - 获取表结构信息
 - `GET /query/database/stats` - 获取数据库统计信息
+
+#### 爬虫控制
+- `POST /crawler/run` - 启动爬虫（后台运行，支持类型：leaderboard, player, stb）
+- `GET /crawler/status` - 获取各爬虫的进度状态
 
 #### 系统管理
 - `GET /system/health` - 健康检查
@@ -120,9 +132,13 @@ python run.py
 - `player_rankings` - 玩家排名数据
 - `player_identity` - 玩家身份信息
 - `player_aliases` - 玩家别名历史
+- `player_profiles` - 玩家详细资料（头像、个人信息、游戏数据）
+- `player_titles` - 玩家头衔
+- `player_achievements` - 玩家成就
 - `charts` - 谱面信息
 - `songs` - 歌曲信息
 - `import_metadata` - 导入元数据
+- `stb_crawler_state` - 谱面爬虫状态
 
 ## 相关项目
 
@@ -137,6 +153,8 @@ python run.py
 malody_api/
 ├── run.py                 # 主启动文件
 ├── stb_crawler.py         # STB 谱面爬虫
+├── player_profile_crawler.py # 玩家资料爬虫
+├── malody_rankings.py     # 主爬虫
 ├── requirements.txt       # Python 依赖
 ├── malody_rankings.db    # SQLite 数据库
 ├── core/                  # 核心模块
@@ -149,7 +167,8 @@ malody_api/
 │   ├── analytics.py      # 数据分析
 │   ├── system.py         # 系统管理
 │   ├── query.py          # 高级查询
-│   └── page_parser.py    # 页面解析
+│   ├── page_parser.py    # 页面解析
+│   └── crawler.py        # 爬虫控制
 └── utils/                # 工具类
     ├── query_builder.py  # 查询构建器
     ├── selector.py       # 数据选择器
