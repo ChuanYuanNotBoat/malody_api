@@ -23,44 +23,52 @@ from selector import global_selector, MCSelector
 
 # 修复matplotlib中文字体问题
 def setup_chinese_font():
-    """设置中文字体支持"""
-    try:
-        import matplotlib.font_manager as fm
-        import platform
-        
-        # 获取系统中所有字体
-        fonts = fm.findSystemFonts()
-        chinese_fonts = []
-        
-        # 常见中文字体列表
-        common_chinese_fonts = [
-            'SimHei', 'Microsoft YaHei', 'SimSun', 'KaiTi', 'FangSong',
-            'STSong', 'STKaiti', 'STFangsong', 'STHeiti', 'PingFang SC',
-            'Hiragino Sans GB', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC'
-        ]
-        
-        # 查找可用的中文字体
-        for font_path in fonts:
-            try:
-                font = fm.FontProperties(fname=font_path)
-                font_name = font.get_name()
-                if any(ch_font in font_name for ch_font in common_chinese_fonts):
-                    chinese_fonts.append(font_path)
-            except:
-                continue
-        
-        if chinese_fonts:
-            # 使用找到的第一个中文字体
-            plt.rcParams['font.sans-serif'] = [fm.FontProperties(fname=chinese_fonts[0]).get_name()] + plt.rcParams['font.sans-serif']
-            plt.rcParams['axes.unicode_minus'] = False
-            print(f"已设置中文字体: {fm.FontProperties(fname=chinese_fonts[0]).get_name()}")
-            return True
-        else:
-            print("警告: 未找到中文字体，图表中的中文可能显示为方块")
-            return False
-            
-    except Exception as e:
-        print(f"字体设置错误: {e}")
+    """设置中文字体支持（增强版）"""
+    import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+    import platform
+    import os
+
+    # 常见中文字体名称（按优先级排序）
+    chinese_font_names = [
+        'Microsoft YaHei',        # Windows
+        'SimHei',                  # Windows
+        'PingFang SC',             # macOS
+        'STHeiti',                 # macOS
+        'WenQuanYi Micro Hei',     # Linux
+        'Noto Sans CJK SC',        # Linux
+        'Droid Sans Fallback',     # Android
+    ]
+
+    # 如果系统是 Windows，可以指定完整路径（备选）
+    if platform.system() == 'Windows':
+        # 尝试从系统字体目录加载
+        win_font_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts')
+        win_fonts = {
+            'Microsoft YaHei': os.path.join(win_font_dir, 'msyh.ttc'),
+            'SimHei': os.path.join(win_font_dir, 'simhei.ttf'),
+        }
+        for name, path in win_fonts.items():
+            if os.path.exists(path):
+                fm.fontManager.addfont(path)
+                chinese_font_names.insert(0, name)  # 优先使用已找到的字体
+
+    # 查找系统中可用的中文字体
+    available_fonts = set(f.name for f in fm.fontManager.ttflist)
+    found_font = None
+    for font_name in chinese_font_names:
+        if font_name in available_fonts:
+            found_font = font_name
+            break
+
+    if found_font:
+        plt.rcParams['font.sans-serif'] = [found_font] + plt.rcParams['font.sans-serif']
+        plt.rcParams['axes.unicode_minus'] = False
+        print(f"已设置中文字体: {found_font}")
+        return True
+    else:
+        print("警告: 未找到支持中文的字体，图表中的中文可能显示为方块")
+        print("可尝试手动安装以下字体之一: " + ", ".join(chinese_font_names))
         return False
 
 # 在程序初始化时调用字体设置
@@ -4040,38 +4048,83 @@ class MalodyViz(cmd.Cmd):
         """
         分析特定创作者的谱面更新趋势
 
-        用法: stb_creator_trends <创作者名> [周期]
+        用法: stb_creator_trends <创作者名> [周期] [--since YYYY-MM-DD] [--last N(d|w|m|y)]
         周期: days(日), months(月), 默认months
+        --since: 指定起始日期，格式 YYYY-MM-DD
+        --last: 指定最近一段时间，如 30d (天), 8w (周), 6m (月), 1y (年)
 
         示例:
         stb_creator_trends chuanyuan
-        stb_creator_trends chuanyuan days
+        stb_creator_trends chuanyuan days --last 90d
+        stb_creator_trends chuanyuan months --since 2025-01-01
         """
         args = arg.split()
         if not args:
             print(colorize("错误: 请输入创作者名", Colors.RED))
             return
+
         creator = args[0]
-        period = "months" if len(args) < 2 else args[1].lower()
+        period = "months"
+        time_range = None  # None 表示全部时间
+
+        i = 1
+        while i < len(args):
+            if args[i] in ["days", "months"]:
+                period = args[i]
+                i += 1
+            elif args[i] == "--since":
+                if i+1 >= len(args):
+                    print(colorize("错误: --since 需要指定日期 (YYYY-MM-DD)", Colors.RED))
+                    return
+                try:
+                    start_date = datetime.strptime(args[i+1], "%Y-%m-%d")
+                    time_range = {"start": start_date, "end": datetime.now()}
+                    i += 2
+                except ValueError:
+                    print(colorize("错误: 日期格式应为 YYYY-MM-DD", Colors.RED))
+                    return
+            elif args[i] == "--last":
+                if i+1 >= len(args):
+                    print(colorize("错误: --last 需要指定时间范围 (如 30d, 6m)", Colors.RED))
+                    return
+                time_str = args[i+1]
+                parsed = self._parse_time_range_string(time_str)
+                if parsed:
+                    time_range = parsed
+                    i += 2
+                else:
+                    print(colorize(f"错误: 无法解析时间范围 '{time_str}'", Colors.RED))
+                    return
+            else:
+                # 忽略未知参数
+                i += 1
 
         selector = copy.deepcopy(self.selector)
         selector.set_filters(players=[creator])
         where_clause, params = selector.build_chart_sql_where("c")
 
-        # 按时间分组
+        # 根据时间范围构建条件
+        if time_range:
+            # 使用用户指定的时间范围
+            start = time_range['start']
+            end = time_range['end']
+            time_condition = "c.last_updated BETWEEN ? AND ?"
+            params.extend([start, end])
+            if where_clause != "1=1":
+                where_clause += f" AND {time_condition}"
+            else:
+                where_clause = time_condition
+        # 否则不添加时间条件（查询全部）
+
+        # 根据周期设置分组
         if period == "days":
-            time_condition = "c.last_updated >= date('now', '-30 days')"
             group_by = "DATE(c.last_updated)"
             order_by = "DATE(c.last_updated)"
+            x_label = "日期"
         else:
-            time_condition = "c.last_updated >= date('now', '-1 year')"
             group_by = "strftime('%Y-%m', c.last_updated)"
             order_by = "strftime('%Y-%m', c.last_updated)"
-
-        if where_clause != "1=1":
-            where_clause += f" AND {time_condition}"
-        else:
-            where_clause = time_condition
+            x_label = "月份"
 
         query = f"""
         SELECT {group_by}, COUNT(*)
@@ -4092,9 +4145,13 @@ class MalodyViz(cmd.Cmd):
         counts = [row[1] for row in trend_data]
 
         # 显示统计
-        print(colorize(f"\n创作者 {creator} 的谱面更新趋势 ({period})", Colors.CYAN))
         total = sum(counts)
         avg = total/len(counts)
+        print(colorize(f"\n创作者 {creator} 的谱面更新趋势 ({period})", Colors.CYAN))
+        if time_range:
+            print(colorize(f"时间范围: {time_range['start'].strftime('%Y-%m-%d')} 至 {time_range['end'].strftime('%Y-%m-%d')}", Colors.YELLOW))
+        else:
+            print(colorize("时间范围: 全部时间", Colors.YELLOW))
         print(f"总更新谱面: {total}, 平均{period}更新: {avg:.1f}")
 
         # 生成图表
@@ -4103,7 +4160,7 @@ class MalodyViz(cmd.Cmd):
         ax.fill_between(dates, counts, alpha=0.3, color='#2196F3')
         ax.axhline(y=avg, color='red', linestyle='--', alpha=0.7, label=f'平均 {avg:.1f}')
         ax.set_title(f'创作者 {creator} 谱面更新趋势')
-        ax.set_xlabel('日期' if period=='days' else '月份')
+        ax.set_xlabel(x_label)
         ax.set_ylabel('更新谱面数量')
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -4116,6 +4173,29 @@ class MalodyViz(cmd.Cmd):
         plt.savefig(filepath, dpi=150, facecolor='white')
         plt.close()
         print(colorize(f"已生成趋势图表: {filepath}", Colors.GREEN))
+
+    def _parse_time_range_string(self, time_str):
+        """解析时间范围字符串，支持格式：N(d|w|m|y) 或 YYYY-MM-DD"""
+        now = datetime.now()
+        try:
+            if time_str.endswith('d'):
+                days = int(time_str[:-1])
+                return {'start': now - timedelta(days=days), 'end': now}
+            elif time_str.endswith('w'):
+                weeks = int(time_str[:-1])
+                return {'start': now - timedelta(weeks=weeks), 'end': now}
+            elif time_str.endswith('m'):
+                months = int(time_str[:-1])
+                return {'start': now - timedelta(days=months*30), 'end': now}
+            elif time_str.endswith('y'):
+                years = int(time_str[:-1])
+                return {'start': now - timedelta(days=years*365), 'end': now}
+            else:
+                # 尝试解析为具体日期
+                start = datetime.strptime(time_str, "%Y-%m-%d")
+                return {'start': start, 'end': now}
+        except:
+            return None
 
     # 增强 do_update 命令
     def do_update(self, arg):

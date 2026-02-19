@@ -2,8 +2,11 @@
 from fastapi import APIRouter, Query, HTTPException
 from typing import List, Optional
 from datetime import datetime
+import pandas as pd
+import io
+from fastapi.responses import StreamingResponse
 
-# 修复导入路径 - 改为绝对导入
+# 改为绝对导入
 from malody_api.core.services import ChartService
 from malody_api.utils.selector import MCSelector
 from malody_api.core.models import APIResponse, ChartStats, HotChart, CreatorStats
@@ -21,11 +24,9 @@ def create_chart_selector_from_query(
     """从查询参数创建谱面选择器"""
     selector = MCSelector()
     
-    # 创作者筛选
     if creators:
         selector.set_filters(players=creators.split(','))
     
-    # 模式筛选
     if modes:
         try:
             mode_list = [int(m.strip()) for m in modes.split(',')]
@@ -33,7 +34,6 @@ def create_chart_selector_from_query(
         except ValueError:
             pass
     
-    # 难度筛选
     if difficulties:
         try:
             if '-' in difficulties:
@@ -44,7 +44,6 @@ def create_chart_selector_from_query(
         except ValueError:
             pass
     
-    # 状态筛选
     if statuses:
         try:
             status_list = [int(s.strip()) for s in statuses.split(',')]
@@ -52,7 +51,6 @@ def create_chart_selector_from_query(
         except ValueError:
             pass
     
-    # 时间范围筛选（从players路由复制parse_time_range函数）
     if time_range:
         selector.set_filters(time_range=parse_time_range(time_range))
     
@@ -64,20 +62,19 @@ def parse_time_range(time_range: str) -> dict:
     now = datetime.now()
     
     try:
-        if time_range.endswith('d'):  # 天数
+        if time_range.endswith('d'):
             days = int(time_range[:-1])
             return {'start': now - timedelta(days=days), 'end': now}
-        elif time_range.endswith('h'):  # 小时
+        elif time_range.endswith('h'):
             hours = int(time_range[:-1])
             return {'start': now - timedelta(hours=hours), 'end': now}
-        elif time_range.endswith('w'):  # 周数
+        elif time_range.endswith('w'):
             weeks = int(time_range[:-1])
             return {'start': now - timedelta(weeks=weeks), 'end': now}
-        elif time_range.endswith('m'):  # 月数
+        elif time_range.endswith('m'):
             months = int(time_range[:-1])
             return {'start': now - timedelta(days=months*30), 'end': now}
         else:
-            # 尝试解析为具体日期
             target_date = datetime.strptime(time_range, '%Y-%m-%d')
             return {'start': target_date, 'end': now}
     except (ValueError, TypeError):
@@ -227,6 +224,45 @@ async def get_stable_creators(
             timestamp=datetime.now()
         )
 
+@router.get("/{cid}", response_model=APIResponse)
+async def get_chart_detail(cid: int):
+    """获取单个谱面的详细信息"""
+    try:
+        data = chart_service.get_chart_detail(cid)
+        if "error" in data:
+            raise HTTPException(status_code=404, detail=data["error"])
+        return APIResponse(success=True, data=data, timestamp=datetime.now())
+    except HTTPException:
+        raise
+    except Exception as e:
+        return APIResponse(success=False, error=str(e), timestamp=datetime.now())
+
+@router.get("/stabilizers/{player_name}/stats", response_model=APIResponse)
+async def get_stabilizer_stats(player_name: str):
+    """获取稳定者的统计信息"""
+    try:
+        data = chart_service.get_stabilizer_stats(player_name)
+        return APIResponse(success=True, data=data, timestamp=datetime.now())
+    except Exception as e:
+        return APIResponse(success=False, error=str(e), timestamp=datetime.now())
+
+@router.get("/stabilizers/{player_name}/charts", response_model=APIResponse)
+async def get_stabilizer_charts(
+    player_name: str,
+    limit: int = Query(50, description="返回数量", ge=1, le=200)
+):
+    """获取稳定者审核的谱面列表"""
+    try:
+        data = chart_service.get_stabilizer_charts(player_name, limit)
+        return APIResponse(
+            success=True,
+            data=data,
+            message=f"找到 {len(data)} 个谱面",
+            timestamp=datetime.now()
+        )
+    except Exception as e:
+        return APIResponse(success=False, error=str(e), timestamp=datetime.now())
+
 @router.get("/search/{keyword}", response_model=APIResponse)
 async def search_charts(
     keyword: str,
@@ -284,3 +320,42 @@ async def search_creators(
             error=str(e),
             timestamp=datetime.now()
         )
+
+@router.get("/export/charts")
+async def export_charts(
+    mode: Optional[int] = Query(None, description="游戏模式"),
+    creators: Optional[str] = Query(None, description="创作者筛选，逗号分隔"),
+    statuses: Optional[str] = Query(None, description="状态筛选，逗号分隔"),
+    format: str = Query("csv", description="导出格式，目前仅支持csv")
+):
+    """导出谱面数据为CSV文件"""
+    try:
+        selector = create_chart_selector_from_query(
+            creators=creators,
+            modes=str(mode) if mode is not None else None,
+            statuses=statuses
+        )
+        where_clause, params = selector.build_chart_sql_where("c")
+        query = f"""
+            SELECT c.cid, s.title, s.artist, c.version, c.level, c.status,
+                   c.creator_name, c.stabled_by_name, c.heat, c.donate_count, c.play_count, c.last_updated
+            FROM charts c
+            JOIN songs s ON c.sid = s.sid
+            WHERE {where_clause}
+        """
+        # 获取数据库连接
+        from malody_api.core.database import get_db_connection
+        conn = get_db_connection()
+        df = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+
+        output = io.StringIO()
+        df.to_csv(output, index=False, encoding='utf-8')
+        output.seek(0)
+        return StreamingResponse(
+            output,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=charts.csv"}
+        )
+    except Exception as e:
+        return APIResponse(success=False, error=str(e), timestamp=datetime.now())

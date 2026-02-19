@@ -4,7 +4,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 import re
 
-# 修复导入路径 - 改为绝对导入
+# 改为绝对导入
 from malody_api.core.services import PlayerService
 from malody_api.utils.selector import MCSelector
 from malody_api.core.models import APIResponse, Player, PlayerDetail, PlayerHistoryPoint
@@ -20,11 +20,9 @@ def create_selector_from_query(
     """从查询参数创建选择器"""
     selector = MCSelector()
     
-    # 玩家筛选
     if players:
         selector.set_filters(players=players.split(','))
     
-    # 模式筛选
     if modes:
         try:
             mode_list = [int(m.strip()) for m in modes.split(',')]
@@ -32,7 +30,6 @@ def create_selector_from_query(
         except ValueError:
             pass
     
-    # 时间范围筛选
     if time_range:
         selector.set_filters(time_range=parse_time_range(time_range))
     
@@ -43,20 +40,19 @@ def parse_time_range(time_range: str) -> dict:
     now = datetime.now()
     
     try:
-        if time_range.endswith('d'):  # 天数
+        if time_range.endswith('d'):
             days = int(time_range[:-1])
             return {'start': now - timedelta(days=days), 'end': now}
-        elif time_range.endswith('h'):  # 小时
+        elif time_range.endswith('h'):
             hours = int(time_range[:-1])
             return {'start': now - timedelta(hours=hours), 'end': now}
-        elif time_range.endswith('w'):  # 周数
+        elif time_range.endswith('w'):
             weeks = int(time_range[:-1])
             return {'start': now - timedelta(weeks=weeks), 'end': now}
-        elif time_range.endswith('m'):  # 月数
+        elif time_range.endswith('m'):
             months = int(time_range[:-1])
             return {'start': now - timedelta(days=months*30), 'end': now}
         else:
-            # 尝试解析为具体日期
             target_date = datetime.strptime(time_range, '%Y-%m-%d')
             return {'start': target_date, 'end': now}
     except (ValueError, TypeError):
@@ -73,7 +69,6 @@ async def get_top_players(
     try:
         selector = create_selector_from_query(players=players, time_range=time_range)
         
-        # 设置模式
         if mode is not None:
             selector.set_filters(modes=[mode])
             selector.current_mode = mode
@@ -99,7 +94,7 @@ async def get_player_info(
     player_identifier: str,
     mode: Optional[int] = Query(None, description="游戏模式")
 ):
-    """获取玩家详细信息"""
+    """获取玩家基本信息"""
     try:
         selector = MCSelector()
         if mode is not None:
@@ -125,6 +120,19 @@ async def get_player_info(
             error=str(e),
             timestamp=datetime.now()
         )
+
+@router.get("/{identifier}/profile", response_model=APIResponse)
+async def get_player_profile(identifier: str):
+    """获取玩家详细资料（头像、头衔、成就、个人信息）"""
+    try:
+        data = player_service.get_player_profile(identifier)
+        if "error" in data:
+            raise HTTPException(status_code=404, detail=data["error"])
+        return APIResponse(success=True, data=data, timestamp=datetime.now())
+    except HTTPException:
+        raise
+    except Exception as e:
+        return APIResponse(success=False, error=str(e), timestamp=datetime.now())
 
 @router.get("/{player_name}/history", response_model=APIResponse)
 async def get_player_history(

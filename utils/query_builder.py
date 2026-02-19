@@ -6,11 +6,12 @@ import re
 class SafeQueryBuilder:
     """安全的SQL查询构建器，防止SQL注入"""
     
-    # 允许的表名白名单
+    # 允许的表名白名单（已包含新表）
     ALLOWED_TABLES = {
         'player_rankings', 'player_identity', 'player_aliases', 
         'charts', 'songs', 'player_config', 'player_crawl_status',
-        'import_metadata', 'stb_crawler_state'
+        'import_metadata', 'stb_crawler_state',
+        'player_profiles', 'player_titles', 'player_achievements'
     }
     
     # 允许的聚合函数
@@ -74,7 +75,6 @@ class SafeQueryBuilder:
         # GROUP BY 部分
         group_by_clause = ""
         if group_by:
-            # 验证分组列
             for col in group_by:
                 if not SafeQueryBuilder.validate_column_name(col):
                     raise ValueError(f"无效的分组列: {col}")
@@ -88,7 +88,6 @@ class SafeQueryBuilder:
         # ORDER BY 部分
         order_by_clause = ""
         if order_by:
-            # 验证排序列
             for col in order_by:
                 base_col = col.replace(' DESC', '').replace(' ASC', '').strip()
                 if not SafeQueryBuilder.validate_column_name(base_col):
@@ -261,15 +260,12 @@ class AdvancedQueryService:
             conn = self.get_connection()
             cursor = conn.cursor()
             
-            # 获取列信息
             cursor.execute(f"PRAGMA table_info({table_name})")
             columns = cursor.fetchall()
             
-            # 获取索引信息
             cursor.execute(f"PRAGMA index_list({table_name})")
             indexes = cursor.fetchall()
             
-            # 获取外键信息
             cursor.execute(f"PRAGMA foreign_key_list({table_name})")
             foreign_keys = cursor.fetchall()
             
@@ -302,7 +298,6 @@ class AdvancedQueryService:
             conn = self.get_connection()
             cursor = conn.cursor()
             
-            # 获取所有表的信息
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = [row[0] for row in cursor.fetchall()]
             
@@ -316,7 +311,6 @@ class AdvancedQueryService:
                     table_stats[table] = count
                     total_records += count
             
-            # 获取数据库大小
             cursor.execute("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
             db_size = cursor.fetchone()[0]
             

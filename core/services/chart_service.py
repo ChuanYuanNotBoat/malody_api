@@ -30,10 +30,10 @@ class ChartService:
             cursor.execute(f"SELECT COUNT(DISTINCT c.creator_name) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL", params)
             unique_creators = cursor.fetchone()[0] or 0
             
-            # 状态分布 - 确保所有状态都统计
+            # 状态分布
             cursor.execute(f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status", params)
             status_results = cursor.fetchall()
-            status_dist = {0: 0, 1: 0, 2: 0}  # 初始化所有状态
+            status_dist = {0: 0, 1: 0, 2: 0}
             for status, count in status_results:
                 if status in [0, 1, 2]:
                     status_dist[status] = count
@@ -55,7 +55,7 @@ class ChartService:
                 total_charts=total_charts,
                 unique_songs=unique_songs,
                 unique_creators=unique_creators,
-                status_distribution={str(k): v for k, v in status_dist.items()},  # 转换为字符串键
+                status_distribution={str(k): v for k, v in status_dist.items()},
                 level_distribution=level_dist,
                 heat_stats={
                     "average": float(heat_avg or 0),
@@ -76,7 +76,6 @@ class ChartService:
         try:
             where_clause, params = selector.build_chart_sql_where("c")
             
-            # 验证排序字段
             valid_sort_fields = ["heat", "donate_count", "play_count", "love_count"]
             if sort_field not in valid_sort_fields:
                 sort_field = "heat"
@@ -119,7 +118,6 @@ class ChartService:
         cursor = conn.cursor()
         
         try:
-            # 添加时间筛选
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
             
@@ -168,7 +166,6 @@ class ChartService:
         cursor = conn.cursor()
         
         try:
-            # 创建临时选择器，强制设置状态为Stable(2)
             temp_selector = MCSelector()
             temp_selector.current_mode = selector.current_mode
             temp_selector.set_filters(
@@ -176,12 +173,11 @@ class ChartService:
                 difficulties=selector.filters['difficulties'],
                 time_range=selector.filters['time_range'],
                 modes=selector.filters['modes'],
-                statuses=[2]  # 只统计Stable谱面
+                statuses=[2]
             )
             
             where_clause, params = temp_selector.build_chart_sql_where("c")
             
-            # 添加creator_name不为空的条件
             if where_clause != "1=1":
                 where_clause += " AND c.creator_name IS NOT NULL"
             else:
@@ -215,6 +211,68 @@ class ChartService:
             
         finally:
             conn.close()
+    
+    @db_safe_operation
+    def get_chart_detail(self, cid: int) -> Dict[str, Any]:
+        """获取单个谱面的详细信息"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.*, s.title, s.artist, s.bpm, s.length, s.cover_url
+            FROM charts c
+            JOIN songs s ON c.sid = s.sid
+            WHERE c.cid = ?
+        """, (cid,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return {"error": f"谱面不存在: {cid}"}
+        cols = [desc[0] for desc in cursor.description]
+        data = dict(zip(cols, row))
+        conn.close()
+        return data
+    
+    @db_safe_operation
+    def get_stabilizer_stats(self, player_name: str) -> Dict[str, Any]:
+        """获取稳定者的统计信息"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) as total,
+                   COUNT(DISTINCT mode) as modes,
+                   AVG(heat) as avg_heat,
+                   AVG(CAST(level AS REAL)) as avg_level
+            FROM charts
+            WHERE stabled_by_name LIKE ? AND status = 2
+        """, (f"%{player_name}%",))
+        stats = cursor.fetchone()
+        conn.close()
+        return {
+            "total": stats[0],
+            "modes": stats[1],
+            "avg_heat": float(stats[2]) if stats[2] else 0,
+            "avg_level": float(stats[3]) if stats[3] else 0
+        }
+    
+    @db_safe_operation
+    def get_stabilizer_charts(self, player_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取稳定者审核的谱面列表"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.cid, s.title, s.artist, c.version, c.level, c.mode, c.status,
+                   c.heat, c.donate_count, c.play_count, c.last_updated
+            FROM charts c
+            JOIN songs s ON c.sid = s.sid
+            WHERE c.stabled_by_name LIKE ? AND c.status = 2
+            ORDER BY c.last_updated DESC
+            LIMIT ?
+        """, (f"%{player_name}%", limit))
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        result = [dict(zip(cols, row)) for row in rows]
+        conn.close()
+        return result
     
     @db_safe_operation
     def search_charts(self, keyword: str, selector: MCSelector, limit: int = 10) -> List[Dict[str, Any]]:

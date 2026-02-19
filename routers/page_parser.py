@@ -204,14 +204,28 @@ class PageParserService:
             return None
     
     def _parse_rank(self, item) -> Optional[int]:
-        """解析排名"""
-        rank_label = item.find('i', class_=re.compile('label top-'))
-        if not rank_label:
-            return None
+        """解析排名 - 支持前3名和后续排名"""
+        # 先尝试从 i.label 类中提取前3名
+        rank_label = item.find('i', class_=re.compile(r'label top-\d+'))
+        if rank_label:
+            class_name = ' '.join(rank_label.get('class', []))
+            rank_match = re.search(r'top-(\d+)', class_name)
+            if rank_match:
+                return int(rank_match.group(1))
         
-        class_name = ' '.join(rank_label.get('class', []))
-        rank_match = re.search(r'top-(\d+)', class_name)
-        return int(rank_match.group(1)) if rank_match else None
+        # 否则尝试从 span.rank 中提取
+        rank_span = item.find('span', class_='rank')
+        if rank_span:
+            rank_text = rank_span.get_text(strip=True)
+            # 可能包含 # 号，如 "#4"
+            if rank_text.startswith('#'):
+                rank_text = rank_text[1:]
+            try:
+                return int(rank_text)
+            except ValueError:
+                pass
+        
+        return None
     
     def _parse_player_info(self, item) -> Dict[str, Any]:
         """解析玩家信息"""

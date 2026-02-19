@@ -81,7 +81,7 @@ class PlayerService:
     
     @db_safe_operation
     def get_player_info(self, player_identifier: str, selector: MCSelector) -> Dict[str, Any]:
-        """获取玩家详细信息"""
+        """获取玩家基本信息"""
         conn = get_db_connection()
         cursor = conn.cursor()
         
@@ -148,6 +148,61 @@ class PlayerService:
             
         finally:
             conn.close()
+    
+    @db_safe_operation
+    def get_player_profile(self, identifier: str) -> Dict[str, Any]:
+        """获取玩家详细资料（头像、头衔、成就、个人信息）"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        player_id = None
+        uid = None
+
+        # 获取 player_id 和 uid
+        if identifier.isdigit():
+            uid = identifier
+            cursor.execute("SELECT player_id FROM player_identity WHERE uid = ?", (uid,))
+            row = cursor.fetchone()
+            if row:
+                player_id = row[0]
+        else:
+            cursor.execute("SELECT player_id FROM player_aliases WHERE alias = ?", (identifier,))
+            row = cursor.fetchone()
+            if row:
+                player_id = row[0]
+                cursor.execute("SELECT uid FROM player_identity WHERE player_id = ?", (player_id,))
+                uid_row = cursor.fetchone()
+                if uid_row:
+                    uid = uid_row[0]
+
+        if not player_id and not uid:
+            conn.close()
+            return {"error": f"未找到玩家: {identifier}"}
+
+        profile = {}
+        if uid:
+            cursor.execute("SELECT * FROM player_profiles WHERE uid = ?", (uid,))
+            row = cursor.fetchone()
+            if row:
+                cols = [desc[0] for desc in cursor.description]
+                profile = dict(zip(cols, row))
+
+        titles = []
+        if uid:
+            cursor.execute("SELECT title FROM player_titles WHERE uid = ?", (uid,))
+            titles = [r[0] for r in cursor.fetchall()]
+
+        achievements = []
+        if uid:
+            cursor.execute("SELECT achievement_code FROM player_achievements WHERE uid = ?", (uid,))
+            achievements = [r[0] for r in cursor.fetchall()]
+
+        conn.close()
+        return {
+            "profile": profile,
+            "titles": titles,
+            "achievements": achievements
+        }
     
     def _get_player_id(self, cursor: sqlite3.Cursor, identifier: str) -> Optional[int]:
         """获取玩家ID"""

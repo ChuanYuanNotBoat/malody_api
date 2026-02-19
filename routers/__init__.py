@@ -5,6 +5,7 @@ from .analytics import router as analytics_router
 from .system import router as system_router
 from .query import router as query_router
 from .page_parser import router as page_parser_router
+from .crawler import router as crawler_router   # 新增
 
 __all__ = [
     "players_router", 
@@ -12,5 +13,6 @@ __all__ = [
     "analytics_router", 
     "system_router",
     "query_router",
-    "page_parser_router"
+    "page_parser_router",
+    "crawler_router"      # 新增
 ]

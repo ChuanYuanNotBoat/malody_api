@@ -27,20 +27,21 @@ def create_app():
         
         ## 功能特性
         
-        - **玩家数据**: 查询玩家排名、详细信息、历史记录
-        - **谱面数据**: 获取谱面统计、热门谱面、创作者信息  
+        - **玩家数据**: 查询玩家排名、详细信息、历史记录、个人资料
+        - **谱面数据**: 获取谱面统计、热门谱面、创作者信息、稳定者分析  
         - **页面解析**: 实时解析Malody页面，获取最新排行榜数据
         - **数据分析**: 趋势分析、模式比较、数据统计
         - **高级查询**: 灵活的自定义查询功能
+        - **爬虫控制**: 触发爬虫更新、查看爬虫进度
         - **灵活筛选**: 支持模式、难度、时间范围、状态等多种筛选条件
         
         ## 数据来源
         
         数据来自Malody游戏服务器，通过爬虫定期更新。
         """,
-        version="1.2.0",
-        docs_url=None,  # 禁用默认docs，使用自定义
-        redoc_url=None, # 禁用默认redoc，使用自定义
+        version="1.3.0",  # 版本号升级以体现新增功能
+        docs_url=None,     # 禁用默认docs，使用自定义
+        redoc_url=None,    # 禁用默认redoc，使用自定义
         openapi_url="/openapi.json"
     )
     
@@ -78,6 +79,7 @@ def register_routers(app):
         from routers.system import router as system_router
         from routers.query import router as query_router
         from routers.page_parser import router as page_parser_router
+        from routers.crawler import router as crawler_router   # 新增爬虫控制路由
         
         # 注册路由
         app.include_router(players_router)
@@ -86,6 +88,7 @@ def register_routers(app):
         app.include_router(system_router)
         app.include_router(query_router)
         app.include_router(page_parser_router)
+        app.include_router(crawler_router)                     # 新增
         
         print("✅ 所有路由注册成功")
         
@@ -143,7 +146,7 @@ def setup_routes(app):
     async def root():
         return {
             "message": "Malody数据API服务运行中",
-            "version": "1.2.0",
+            "version": "1.3.0",
             "documentation": "/docs",
             "endpoints": {
                 "players": "/players/",
@@ -151,7 +154,8 @@ def setup_routes(app):
                 "analytics": "/analytics/",
                 "system": "/system/",
                 "query": "/query/",
-                "page_parser": "/page-parser/"
+                "page_parser": "/page-parser/",
+                "crawler": "/crawler/"
             }
         }
     
@@ -172,17 +176,20 @@ def setup_routes(app):
         
         openapi_schema = get_openapi(
             title="Malody数据API",
-            version="1.2.0",
+            version="1.3.0",
             description="""
             ## Malody数据API
             
             提供完整的Malody游戏数据查询和分析功能。
             
-            ### 新增页面解析功能
+            ### 主要功能
             
-            - `GET /page-parser/chart/{cid}` - 解析单个谱面页面
-            - `GET /page-parser/song/search?query=...` - 搜索歌曲
-            - `GET /page-parser/song/{sid}` - 获取歌曲所有谱面
+            - **玩家数据**: 查询玩家排名、详细信息、历史记录、个人资料（头衔、成就）
+            - **谱面数据**: 获取谱面统计、热门谱面、创作者信息、稳定者分析
+            - **页面解析**: 实时解析谱面页面，获取排行榜数据
+            - **数据分析**: 趋势分析、模式比较、数据统计
+            - **高级查询**: 灵活的自定义查询功能
+            - **爬虫控制**: 触发爬虫更新、查看爬虫进度
             
             ### 使用说明
             
