@@ -58,14 +58,8 @@ logger.addHandler(console_handler)
 
 # Cookie 配置（请根据实际情况更新）
 COOKIES = {
-    "sessionid": "xxgyt15zfv3k6iao0n6xp5dn3c3on86t",
-    "csrftoken": "Su6t9OJr2YG1COJMTpw9clp0Poxbfp88",
-    "acw_tc": "a3b54ebb17671819302035167e66361f9cd29c2b8ba16359812f2882fa",
-    "cdn_sec_tc": "a3b54ebb17671819302035167e66361f9cd29c2b8ba16359812f2882fa",
-    "Hm_lvt_4edad2d5a88ea4e9f4d27e98ccec7300": "1766745385,1766768846,1767105207,1767119905",
-    "_ga_60FNBRY4NB": "GS2.2.s1766056711$o78$g0$t1766056711$j60$l0$h0",
-    "_ga": "GA1.2.1307964988.1749050113",
-    "_gid": "GA1.2.11894316.1767119905"
+    "sessionid": "--",
+    "csrftoken": "--",
 }
 
 HEADERS = {

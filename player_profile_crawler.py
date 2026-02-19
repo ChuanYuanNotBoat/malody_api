@@ -249,6 +249,90 @@ class ProgressTracker:
     def get_total(self):
         return self.total
 
+# ==================== 新增：全局位图进度跟踪器（支持动态扩展）====================
+class GlobalBitmapProgress:
+    """
+    全局位图进度跟踪器，支持动态扩展。
+    使用字节数组存储已成功爬取的 UID，位图中 1 表示已完成。
+    """
+    def __init__(self, filename):
+        self.filename = filename
+        self.lock = Lock()
+        self.max_uid = 0          # 当前位图支持的最大 UID
+        self.bitmap = bytearray()  # 位图数据
+        self.load()
+
+    def _ensure_capacity(self, uid):
+        """确保位图能容纳 uid，若不能则扩展"""
+        if uid <= self.max_uid:
+            return
+        new_max = max(uid, self.max_uid * 2)  # 简单倍增
+        new_size = (new_max + 7) // 8
+        if len(self.bitmap) < new_size:
+            # 扩展字节数组
+            self.bitmap.extend(b'\x00' * (new_size - len(self.bitmap)))
+            self.max_uid = new_max
+
+    def _set_bit(self, uid):
+        """设置 uid 对应的位为 1"""
+        idx = uid - 1  # UID 从 1 开始，bitmap 索引从 0 对应 UID=1
+        byte_idx = idx // 8
+        bit_idx = idx % 8
+        self.bitmap[byte_idx] |= (1 << bit_idx)
+
+    def _test_bit(self, uid):
+        """测试 uid 对应的位是否为 1"""
+        idx = uid - 1
+        byte_idx = idx // 8
+        bit_idx = idx % 8
+        if byte_idx >= len(self.bitmap):
+            return False
+        return (self.bitmap[byte_idx] >> bit_idx) & 1
+
+    def load(self):
+        """从文件加载位图"""
+        try:
+            with open(self.filename, 'rb') as f:
+                magic = f.read(2)
+                if magic != b'GB':
+                    raise ValueError("无效的全局位图文件")
+                self.max_uid = struct.unpack('<I', f.read(4))[0]
+                bitmap_len = struct.unpack('<I', f.read(4))[0]
+                self.bitmap = bytearray(f.read(bitmap_len))
+        except (FileNotFoundError, ValueError, struct.error):
+            # 文件不存在或损坏，初始化为空
+            self.max_uid = 0
+            self.bitmap = bytearray()
+
+    def save(self):
+        """保存位图到文件（原子替换）"""
+        with self.lock:
+            tmp_file = self.filename + '.tmp'
+            with open(tmp_file, 'wb') as f:
+                f.write(b'GB')  # 魔数
+                f.write(struct.pack('<I', self.max_uid))
+                f.write(struct.pack('<I', len(self.bitmap)))
+                f.write(self.bitmap)
+            os.replace(tmp_file, self.filename)
+
+    def mark_done(self, uid):
+        """标记指定 UID 为已完成"""
+        uid = int(uid)
+        with self.lock:
+            self._ensure_capacity(uid)
+            self._set_bit(uid)
+
+    def is_done(self, uid):
+        """检查指定 UID 是否已完成"""
+        uid = int(uid)
+        with self.lock:
+            return self._test_bit(uid)
+
+    def get_done_count(self):
+        """返回已完成的 UID 数量（遍历位图计算，较慢，仅供统计）"""
+        with self.lock:
+            return sum(bin(byte).count('1') for byte in self.bitmap)
+
 class PlayerProfileCrawler:
     def __init__(self, session=None):
         self.logger = logging.getLogger('PlayerProfileCrawler')
@@ -965,150 +1049,32 @@ class PlayerProfileCrawler:
         # 打印数据
         self.print_profile_data(profile_data)
         return True
-    
-    # ========== 修改后的 crawl_players_batch 方法 ==========
-    def crawl_players_batch(self, uid_list, max_workers=3, requests_per_minute=15, print_only=False):
+
+
+
+    # ========== 新增：全局位图范围爬取方法 ==========
+    def crawl_uid_range(self, start_uid, end_uid, resume_file='global_progress.bin',
+                        save_interval=10, max_workers=3, requests_per_minute=15,
+                        print_only=False):
         """
-        批量爬取玩家资料（列表形式），支持中断恢复（使用集合进度文件）。
-        注意：此方法适用于小规模列表，大规模范围请使用 crawl_uid_range。
-        改进：支持 Ctrl+C 后停止提交新任务，等待当前任务完成后退出。
-        """
-        self.logger.info("开始批量爬取，共 %d 个玩家，模式: %s", 
-                       len(uid_list), "仅打印" if print_only else "保存到数据库")
-        
-        # 初始化统计字典（线程安全）
-        stats = {
-            'profile_new': 0,
-            'profile_updated': 0,
-            'profile_unchanged': 0,
-            'profile_failed': 0,
-            'rank_new': 0,
-            'rank_diff_insert': 0,
-            'rank_same_insert': 0,
-            'rank_update': 0,
-            'rank_update_fill': 0,
-        }
-        stats_lock = Lock()
-        
-        # 将 UID 列表转换为迭代器，以便逐个获取
-        uid_iter = iter(uid_list)
-        total = len(uid_list)
-        
-        # 用于保存已提交的 future 及其对应的 UID
-        futures = []
-         
-        # 使用线程池
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 提交任务的循环
-            while True:
-                # 检查停止信号
-                with stop_lock:
-                    if stop_requested:
-                        self.logger.info("收到停止信号，停止提交新任务")
-                        break
-                
-                # 获取下一个 UID
-                try:
-                    uid = next(uid_iter)
-                except StopIteration:
-                    # 没有更多 UID 了
-                    break
-                
-                # 提交任务
-                future = executor.submit(
-                    self.crawl_player_profile,
-                    uid,
-                    print_only,
-                    stats,
-                    stats_lock
-                )
-                futures.append((future, uid))
-                
-                # 粗略速率限制
-                if requests_per_minute > 0:
-                    time.sleep(60 / requests_per_minute / max_workers)
-            
-            self.logger.info("任务提交完成，共提交 %d 个任务，等待剩余任务完成...", len(futures))
-            
-            # 等待所有已提交的任务完成，并处理结果
-            success_count = 0
-            fail_count = 0
-            
-            for future, uid in futures:
-                # 先尝试取消尚未开始的任务（仍在队列中）
-                if future.cancel():
-                    self.logger.debug("已取消未开始的玩家 %s 任务", uid)
-                    # 取消的任务视为失败（或忽略），更新统计
-                    with stats_lock:
-                        stats['profile_failed'] += 1
-                    fail_count += 1
-                    # 更新进度
-                    with progress_lock:
-                        crawl_progress['current'] = success_count + fail_count
-                        crawl_progress['success'] = success_count
-                        crawl_progress['fail'] = fail_count
-                        crawl_progress['total'] = total
-                    continue
-                
-                # 任务无法取消（已在运行或已完成），等待结果
-                try:
-                    result = future.result()
-                    if result:
-                        success_count += 1
-                    else:
-                        fail_count += 1
-                        with stats_lock:
-                            stats['profile_failed'] += 1
-                except Exception as e:
-                    fail_count += 1
-                    with stats_lock:
-                        stats['profile_failed'] += 1
-                    self.logger.error("处理玩家 %s 时出错: %s", uid, e)
-                
-                # 更新进度
-                with progress_lock:
-                    crawl_progress['current'] = success_count + fail_count
-                    crawl_progress['success'] = success_count
-                    crawl_progress['fail'] = fail_count
-                    crawl_progress['total'] = total
-        
-        if not print_only:
-            self.logger.info("批量爬取完成: 成功 %d, 失败 %d", success_count, fail_count)
-            self._print_stats(stats, total, success_count, fail_count)
-        return success_count, fail_count
-    
-    def crawl_uid_range(self, start_uid, end_uid, resume_file='crawler_resume.bin', save_interval=10,
-                        max_workers=3, requests_per_minute=15, print_only=False):
-        """
-        按UID范围爬取，支持中断恢复（使用位图进度文件）。
+        按UID范围爬取，使用全局位图进度文件，支持动态扩展。
+        该方法不会重复爬取已完成的UID，即使范围扩大。
         :param start_uid: 起始UID（包含）
         :param end_uid: 结束UID（包含）
-        :param resume_file: 进度文件路径（二进制）
+        :param resume_file: 全局进度文件路径（二进制，包含位图）
         :param save_interval: 进度保存间隔（秒）
         :param max_workers: 并发线程数
-        :param requests_per_minute: 请求速率限制（粗略控制）
+        :param requests_per_minute: 请求速率限制
         :param print_only: 是否仅打印
         :return: (成功数, 失败数)
         """
-        self.logger.info("按UID范围爬取: %d - %d (共 %d 个)", start_uid, end_uid, end_uid - start_uid + 1)
-        
-        # 加载进度跟踪器
-        tracker = ProgressTracker.load(
-            resume_file,
-            mode='range',
-            start=start_uid,
-            end=end_uid
-        )
-        
-        total = tracker.get_total()
-        remaining = tracker.get_remaining_count()
-        self.logger.info("剩余待爬取: %d / %d", remaining, total)
-        
-        if remaining == 0:
-            self.logger.info("范围已完成，无需继续。如需重新爬取，请删除恢复文件 %s", resume_file)
-            return 0, 0
-        
-        # 初始化统计
+        self.logger.info("全局范围爬取: %d - %d (共 %d 个)", start_uid, end_uid, end_uid - start_uid + 1)
+
+        # 加载全局进度
+        progress = GlobalBitmapProgress(resume_file)
+        total = end_uid - start_uid + 1
+
+        # 统计字典（线程安全）
         stats = {
             'profile_new': 0, 'profile_updated': 0, 'profile_unchanged': 0, 'profile_failed': 0,
             'rank_new': 0, 'rank_diff_insert': 0, 'rank_same_insert': 0, 'rank_update': 0, 'rank_update_fill': 0,
@@ -1116,100 +1082,117 @@ class PlayerProfileCrawler:
         stats_lock = Lock()
         success_count = 0
         fail_count = 0
-        
-        # 定期保存进度的后台线程
-        stop_saver = threading.Event()
-        def saver_thread():
-            while not stop_saver.is_set():
-                time.sleep(save_interval)
-                try:
-                    tracker.save(resume_file)
-                    self.logger.debug("进度已保存至 %s (剩余 %d)", resume_file, tracker.get_remaining_count())
-                except Exception as e:
-                    self.logger.error("保存进度文件失败: %s", e)
-        
-        if not print_only:
-            saver = Thread(target=saver_thread, daemon=True)
-            saver.start()
-        else:
-            saver = None
-        
-        # 使用线程池并发爬取
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            # 动态提交任务
-            while True:
-                # 第一次检查停止标志
-                with stop_lock:
-                    if stop_requested:
-                        self.logger.info("收到停止信号，停止提交新任务")
+
+        # 任务队列，大小设为 max_workers 的 2 倍
+        task_queue = queue.Queue(maxsize=max_workers * 2)
+        stop_event = threading.Event()  # 用于通知所有线程停止
+
+        # 生产者：扫描范围，将未爬取的 UID 放入队列
+        def producer():
+            try:
+                for uid in range(start_uid, end_uid + 1):
+                    if stop_event.is_set() or (stop_lock and stop_requested):
+                        self.logger.info("生产者收到停止信号，停止生产")
                         break
-                
-                # 获取下一个待爬取UID
-                uid = tracker.get_next()
-                if uid is None:
-                    break
-                
-                # 第二次检查（防止获取UID后信号才到达）
-                with stop_lock:
-                    if stop_requested:
-                        self.logger.info("收到停止信号，放弃已获取的UID %s", uid)
-                        # 注意：这里放弃了该UID，不会提交任务，下次运行时会重新获取
-                        break
-                
-                # 提交任务
-                future = executor.submit(
-                    self.crawl_player_profile,
-                    uid,
-                    print_only,
-                    stats,
-                    stats_lock
-                )
-                futures.append((future, uid))
-                
-                # 粗略的速率限制
-                if requests_per_minute > 0:
-                    time.sleep(60 / requests_per_minute / max_workers)
-            
-            # 等待所有已提交的任务完成
-            for future, uid in futures:
+                    if progress.is_done(uid):
+                        continue
+                    # 阻塞放入队列（若队列满则等待）
+                    task_queue.put(str(uid))
+                self.logger.info("生产者完成，放入哨兵")
+                # 放入 None 作为结束标志（每个消费者一个）
+                for _ in range(max_workers):
+                    task_queue.put(None)
+            except Exception as e:
+                self.logger.error("生产者异常: %s", e)
+                # 仍要放入哨兵，避免消费者永久等待
+                for _ in range(max_workers):
+                    try:
+                        task_queue.put(None, timeout=1)
+                    except:
+                        pass
+
+        # 消费者：从队列获取 UID 并爬取
+        def consumer():
+            nonlocal success_count, fail_count
+            while not stop_event.is_set():
                 try:
-                    result = future.result()
+                    uid = task_queue.get(timeout=1)
+                    if uid is None:  # 结束标志
+                        break
+                except queue.Empty:
+                    continue
+
+                try:
+                    result = self.crawl_player_profile(uid, print_only, stats, stats_lock)
                     if result:
                         success_count += 1
-                        tracker.mark_done(uid)
+                        progress.mark_done(uid)
                     else:
                         fail_count += 1
                         with stats_lock:
                             stats['profile_failed'] += 1
-                        # 失败的不标记已完成，下次重试
                 except Exception as e:
+                    self.logger.error("消费者处理 %s 异常: %s", uid, e)
                     fail_count += 1
-                    with stats_lock:
-                        stats['profile_failed'] += 1
-                    self.logger.error("处理玩家 %s 时出错: %s", uid, e)
-                    # 出错的不标记已完成，下次重试
-        
-        # 停止保存线程
-        if saver:
-            stop_saver.set()
-            saver.join(timeout=2)
-        
+                finally:
+                    task_queue.task_done()
+
+                # 速率限制
+                if requests_per_minute > 0:
+                    time.sleep(60 / requests_per_minute / max_workers)
+
+        # 启动生产者线程
+        producer_thread = Thread(target=producer, daemon=True)
+        producer_thread.start()
+
+        # 启动消费者线程池
+        consumer_threads = []
+        for _ in range(max_workers):
+            t = Thread(target=consumer, daemon=True)
+            t.start()
+            consumer_threads.append(t)
+
+        # 定期保存进度（仅当不是 print_only 时）
+        saver_thread = None
+        if not print_only:
+            def saver():
+                while not stop_event.is_set():
+                    time.sleep(save_interval)
+                    try:
+                        progress.save()
+                        self.logger.debug("全局进度已保存至 %s", resume_file)
+                    except Exception as e:
+                        self.logger.error("保存进度失败: %s", e)
+            saver_thread = Thread(target=saver, daemon=True)
+            saver_thread.start()
+
+        # 等待生产者完成（生产完成或因信号停止）
+        producer_thread.join(timeout=1)
+
+        # 等待队列被消费完（可选，但可以确保所有已提交的任务完成）
+        task_queue.join()
+
+        # 设置停止标志，通知消费者和保存线程退出
+        stop_event.set()
+
+        # 等待消费者结束
+        for t in consumer_threads:
+            t.join(timeout=2)
+
+        if saver_thread and saver_thread.is_alive():
+            saver_thread.join(timeout=2)
+
         # 最终保存一次进度
         if not print_only:
-            try:
-                tracker.save(resume_file)
-                self.logger.info("最终进度已保存至 %s (剩余 %d)", resume_file, tracker.get_remaining_count())
-            except Exception as e:
-                self.logger.error("保存最终进度失败: %s", e)
-        
+            progress.save()
+            self.logger.info("最终进度已保存至 %s", resume_file)
+
         # 输出统计
         if not print_only:
-            self.logger.info("范围爬取完成: 成功 %d, 失败 %d", success_count, fail_count)
             self._print_stats(stats, total, success_count, fail_count)
-        
+
         return success_count, fail_count
-    
+
     def _print_stats(self, stats, total_players, success, failed):
         """输出详细的统计报告（彩色）"""
         print("\n" + "="*70)
@@ -1398,8 +1381,8 @@ def main():
                        help='不自动使用默认的players.txt文件作为UID源')
     
     # 中断恢复相关参数
-    parser.add_argument('--resume-file', type=str, default='crawler_resume.bin',
-                       help='恢复进度文件 (默认: crawler_resume.bin)')
+    parser.add_argument('--resume-file', type=str, default='global_progress.bin',
+                       help='全局进度文件 (默认: global_progress.bin)')
     parser.add_argument('--save-interval', type=int, default=10,
                        help='进度保存间隔(秒) (默认: 10)')
     
@@ -1507,7 +1490,7 @@ def main():
             start_str, end_str = args.uid_range.split('-')
             start_uid = int(start_str.strip())
             end_uid = int(end_str.strip())
-            # 使用范围爬取（支持中断恢复，位图进度文件）
+            # 使用范围爬取（支持中断恢复，全局位图进度文件）
             success, fail = crawler.crawl_uid_range(
                 start_uid, end_uid,
                 resume_file=args.resume_file,

@@ -299,7 +299,6 @@ def handle_command(cmd: dict, manager: CrawlerManager, mailer: Mailer = None, re
         if not crawler:
             return "错误：未指定爬虫名称"
         try:
-            # 注意：manager.run_once 内部会展开预设，这里直接传递原始args
             result = manager.run_once(crawler, args)
             output = result['full_output']
             if mailer and reply_to:
@@ -309,7 +308,12 @@ def handle_command(cmd: dict, manager: CrawlerManager, mailer: Mailer = None, re
             else:
                 return output
         except Exception as e:
-            return f"运行失败: {e}"
+            error_msg = f"运行失败: {e}"
+            if mailer and reply_to:
+                mailer.send(f"[爬虫] {crawler} 运行失败", error_msg, reply_to)
+                return f"运行失败，错误已发送至 {reply_to}"
+            else:
+                return error_msg
 
     elif action == 'start':
         crawler = cmd.get('crawler')
@@ -318,11 +322,26 @@ def handle_command(cmd: dict, manager: CrawlerManager, mailer: Mailer = None, re
             return "错误：未指定爬虫名称"
         try:
             if manager.start_daemon(crawler, args):
-                return f"已启动后台爬虫 {crawler}"
+                msg = f"已启动后台爬虫 {crawler}"
+                if mailer and reply_to:
+                    mailer.send(f"[爬虫] {crawler} 已启动", msg, reply_to)
+                    return f"{msg}，通知已发送至 {reply_to}"
+                else:
+                    return msg
             else:
-                return f"爬虫 {crawler} 可能已经在运行"
+                msg = f"爬虫 {crawler} 可能已经在运行"
+                if mailer and reply_to:
+                    mailer.send(f"[爬虫] {crawler} 启动失败", msg, reply_to)
+                    return f"{msg}，通知已发送至 {reply_to}"
+                else:
+                    return msg
         except Exception as e:
-            return f"启动失败: {e}"
+            error_msg = f"启动失败: {e}"
+            if mailer and reply_to:
+                mailer.send(f"[爬虫] {crawler} 启动异常", error_msg, reply_to)
+                return f"启动异常，错误已发送至 {reply_to}"
+            else:
+                return error_msg
 
     elif action == 'stop':
         crawler = cmd.get('crawler')
@@ -333,23 +352,39 @@ def handle_command(cmd: dict, manager: CrawlerManager, mailer: Mailer = None, re
             if mailer and reply_to:
                 subject = f"[爬虫] {crawler} 已停止（最近输出）"
                 mailer.send(subject, output, reply_to)
-                return f"已停止 {crawler}，最近输出已发送"
+                return f"已停止 {crawler}，最近输出已发送至 {reply_to}"
             else:
                 return f"已停止 {crawler}，最近输出如下：\n{output}"
         else:
-            return f"爬虫 {crawler} 未运行"
+            msg = f"爬虫 {crawler} 未运行"
+            if mailer and reply_to:
+                mailer.send(f"[爬虫] {crawler} 停止操作", msg, reply_to)
+                return f"{msg}，通知已发送至 {reply_to}"
+            else:
+                return msg
 
     elif action == 'status':
         running = manager.list_running()
         if not running:
-            return "当前没有正在运行的爬虫"
-        lines = ["正在运行的爬虫："]
-        for name, info in running.items():
-            lines.append(f"  {name}: PID {info['pid']}, 启动于 {info['start_time']}")
-        return "\n".join(lines)
+            msg = "当前没有正在运行的爬虫"
+        else:
+            lines = ["正在运行的爬虫："]
+            for name, info in running.items():
+                lines.append(f"  {name}: PID {info['pid']}, 启动于 {info['start_time']}")
+            msg = "\n".join(lines)
+        if mailer and reply_to:
+            mailer.send("[爬虫] 当前状态", msg, reply_to)
+            return f"状态信息已发送至 {reply_to}"
+        else:
+            return msg
 
     else:
-        return f"未知命令: {cmd.get('raw', '')}"
+        msg = f"未知命令: {cmd.get('raw', '')}"
+        if mailer and reply_to:
+            mailer.send("[爬虫] 未知命令", msg, reply_to)
+            return f"未知命令，通知已发送至 {reply_to}"
+        else:
+            return msg
 
 
 class IMAPListener:
@@ -422,6 +457,9 @@ class IMAPListener:
             logger.info(f"命令处理结果: {response}")
         except Exception as e:
             logger.error(f"处理命令异常: {e}")
+            # 异常时也尝试发送错误邮件
+            error_msg = f"处理命令时发生未预期异常: {e}"
+            self.mailer.send("[爬虫] 命令处理异常", error_msg, reply_to)
 
     def start_loop(self, interval=60):
         """启动循环，每隔interval秒检查一次"""
