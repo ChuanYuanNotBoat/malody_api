@@ -17,6 +17,8 @@ from functools import wraps
 import shutil
 import re
 import math
+import json
+import copy                     # 新增导入，用于深拷贝选择器
 from selector import global_selector, MCSelector
 
 # 修复matplotlib中文字体问题
@@ -357,10 +359,12 @@ class MalodyViz(cmd.Cmd):
                 ("mode [模式|*]", "设置或查看当前模式（*表示所有模式）"),
                 ("select <选择器>", "设置筛选条件（类似MC选择器）"),
                 ("repair [force]", "修复数据库问题（force强制修复）"),
+                ("optimize", "优化数据库：清理冗余记录并压缩数据库"),
                 
                 # 玩家相关命令（支持玩家、时间、模式筛选）
                 ("top [数量]", "显示顶级玩家排名"),
-                ("player <玩家名> [模式]", "查看玩家信息"),
+                ("player <玩家名> [模式]", "查看玩家基本信息"),
+                ("profile <玩家名> [模式]", "查看玩家详细资料（头衔、成就、个人信息）"),
                 ("history <玩家名> [模式] [天数]", "查看玩家历史排名并生成图表"),
                 ("compare <玩家1> <玩家2> [...] [模式] [天数]", "比较多个玩家的排名变化"),
                 ("trend <起始日期> [模式] [显示项]", "统计玩家数据变化趋势"),
@@ -377,17 +381,22 @@ class MalodyViz(cmd.Cmd):
                 ("stb_compare [模式列表]", "比较不同模式的谱面数据"),
                 ("stb_stabled_by <玩家名> [模式] [数量]", "查询玩家作为稳定者的谱面统计"),
                 ("stb_top_stabilizers [模式] [数量]", "显示顶级稳定者排行榜"),
+                ("stb_creator_details <创作者名> [模式] [状态]", "查看指定创作者的所有谱面统计"),
+                ("stb_creator_trends <创作者名> [周期]", "分析特定创作者的谱面更新趋势"),
+
+                # 爬虫状态与控制
+                ("update [--leaderboard] [--player] [--stb] [--once] [--limit N] [--rpm N]", "更新数据（调用外部爬虫）"),
+                ("crawl_status", "查看各爬虫的进度状态"),
 
                 # 其他命令
                 ("alias <原名> <新名>", "设置玩家别名"),
-                ("export <类型> [模式] [天数]", "导出数据为CSV文件"),
-                ("update", "更新数据（调用爬虫脚本）"),
+                ("export <类型> [选项]", "导出数据为CSV文件（支持类型：top, history, chart, song, profile）"),
                 ("help [命令]", "显示帮助信息"),
                 ("exit/quit", "退出程序")
             ]
             
             for cmd, desc in commands:
-                print(f"  {colorize(cmd, Colors.GREEN):<35} {desc}")
+                print(f"  {colorize(cmd, Colors.GREEN):<45} {desc}")
             print(colorize("\n选择器格式说明:", Colors.CYAN))
             print(get_subseparator())
             print("  @p[玩家1,玩家2]    - 选择玩家（支持名称或UID）")
@@ -400,7 +409,7 @@ class MalodyViz(cmd.Cmd):
             print(colorize("\n命令筛选支持:", Colors.CYAN))
             print(get_subseparator())
             print("  玩家命令: 支持玩家、时间、模式筛选")
-            print("  谱面命令: 支持难度、时间、模式筛选")
+            print("  谱面命令: 支持难度、时间、模式、状态筛选")
             
             print(colorize("\n模式编号对应表:", Colors.CYAN))
             print(get_subseparator())
@@ -457,7 +466,6 @@ class MalodyViz(cmd.Cmd):
             # 如果选择了具体模式，更新当前模式为第一个模式
             if filters['modes']:
                 self.current_mode = filters['modes'][0]
-        # 添加状态筛选的更新
         if 'statuses' in filters:
             self.selector.set_filters(statuses=filters['statuses'])
         
@@ -538,7 +546,6 @@ class MalodyViz(cmd.Cmd):
                 
         except Exception as e:
             print(colorize(f"自动修复过程中发生错误: {e}", Colors.RED))
-            # 不要因为修复失败而阻止程序启动
 
     @db_safe_operation
     def do_repair(self, arg):
@@ -740,22 +747,24 @@ class MalodyViz(cmd.Cmd):
             print(colorize("错误: 请输入有效的数字", Colors.RED))
             return
         
+        # 排行榜应忽略玩家筛选，复制选择器并清除玩家条件
+        temp_selector = copy.deepcopy(self.selector)
+        temp_selector.filters['players'] = []
+        where_clause, params = temp_selector.build_player_sql_where("pr")
+        
         cursor = self.conn.cursor()
         
-        # 使用选择器构建玩家查询条件（忽略难度筛选）
-        where_clause, params = self.selector.build_player_sql_where("pr")
-        
         # 获取最新爬取时间
-        if self.selector.filters['modes']:
-            mode_condition = "pr.mode IN ({})".format(','.join(['?']*len(self.selector.filters['modes'])))
+        if temp_selector.filters['modes']:
+            mode_condition = "pr.mode IN ({})".format(','.join(['?']*len(temp_selector.filters['modes'])))
             cursor.execute(
                 f"SELECT MAX(crawl_time) FROM player_rankings pr WHERE {mode_condition}",
-                self.selector.filters['modes']
+                temp_selector.filters['modes']
             )
-        elif self.selector.current_mode != -1:
+        elif temp_selector.current_mode != -1:
             cursor.execute(
                 "SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?",
-                (self.selector.current_mode,)
+                (temp_selector.current_mode,)
             )
         else:
             cursor.execute("SELECT MAX(crawl_time) FROM player_rankings")
@@ -767,7 +776,7 @@ class MalodyViz(cmd.Cmd):
             return
         
         # 添加时间条件（如果没有设置时间筛选）
-        if not self.selector.filters['time_range']:
+        if not temp_selector.filters['time_range']:
             if "crawl_time" not in where_clause:
                 where_clause += " AND pr.crawl_time = ?"
                 params.append(latest_time)
@@ -802,7 +811,7 @@ class MalodyViz(cmd.Cmd):
         
         print(colorize(f"\n顶级玩家排名", Colors.CYAN))
         print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-        if not self.selector.filters['time_range']:
+        if not temp_selector.filters['time_range']:
             print(colorize(f"数据时间: {latest_time}", Colors.YELLOW))
         print(get_separator())
         
@@ -845,531 +854,6 @@ class MalodyViz(cmd.Cmd):
                     rank_str, name, lv, exp, acc, combo, pc
                 ))
     
-    @db_safe_operation
-    def do_stb_stabled(self, arg):
-        """
-        统计stable谱面的创作者排行榜（支持选择器筛选）
-        
-        用法: stb_stabled [模式] [数量]
-        参数:
-        模式 - 可选，模式编号，默认为当前模式
-        数量 - 可选，要显示的创作者数量，默认为20
-        
-        示例:
-        stb_stabled        # 当前模式stable谱面创作者排行榜
-        stb_stabled 0 10   # 模式0前10名stable谱面创作者
-        """
-        args = arg.split()
-        mode = self.current_mode
-        limit = 20
-        
-        if args:
-            try:
-                if int(args[0]) in self.mode_names:
-                    mode = int(args[0])
-                    if len(args) > 1:
-                        limit = int(args[1])
-                else:
-                    limit = int(args[0])
-                    if len(args) > 1 and int(args[1]) in self.mode_names:
-                        mode = int(args[1])
-            except ValueError:
-                print(colorize("错误: 请输入有效的数字", Colors.RED))
-                return
-        
-        if limit <= 0:
-            print(colorize("错误: 数量必须大于0", Colors.RED))
-            return
-        
-        cursor = self.conn.cursor()
-        
-        try:
-            # 使用选择器构建谱面查询条件
-            where_clause, params = self.selector.build_chart_sql_where("c")
-            
-            # 确保只统计stable谱面
-            if "c.status IN" in where_clause or "c.status =" in where_clause:
-                # 如果已有状态筛选，确保包含stable状态
-                where_clause = re.sub(r'c\.status IN \(.*?\)|c\.status = \?', 'c.status = 2', where_clause)
-            else:
-                where_clause += " AND c.status = 2" if where_clause != "1=1" else "c.status = 2"
-            
-            # 如果选择器中没有指定模式，使用当前模式
-            if not self.selector.filters['modes'] and self.selector.current_mode != -1:
-                where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
-                params.append(mode)
-            
-            # 添加creator_name不为空的条件
-            if where_clause != "1=1":
-                where_clause += " AND c.creator_name IS NOT NULL"
-            else:
-                where_clause = "c.creator_name IS NOT NULL"
-            
-            query = f"""
-            SELECT c.creator_name, COUNT(*) as stable_count,
-                AVG(CAST(c.level AS REAL)) as avg_level,
-                AVG(c.heat) as avg_heat,
-                MAX(c.heat) as max_heat
-            FROM charts c
-            WHERE {where_clause}
-            GROUP BY c.creator_name
-            ORDER BY stable_count DESC, avg_heat DESC
-            LIMIT ?
-            """
-            params.append(limit)
-            
-            # 调试信息
-            print(colorize(f"调试信息:", Colors.YELLOW))
-            print(f"SQL: {query}")
-            print(f"参数: {params}")
-            
-            cursor.execute(query, params)
-            results = cursor.fetchall()
-            
-            if not results:
-                print(colorize(f"\n没有找到符合条件的stable谱面", Colors.YELLOW))
-                return
-            
-            # 显示模式信息
-            if self.selector.filters['modes']:
-                mode_str = ", ".join([f"{m}({self.mode_names.get(m, '未知')})" for m in self.selector.filters['modes']])
-            elif self.selector.current_mode != -1:
-                mode_str = f"{self.selector.current_mode}({self.mode_names.get(self.selector.current_mode, '未知')})"
-            else:
-                mode_str = "所有模式"
-            
-            print(colorize(f"\nStable谱面创作者排行榜", Colors.CYAN))
-            print(colorize(f"模式: {mode_str}", Colors.YELLOW))
-            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-            print(get_separator())
-            
-            # 显示表头
-            header_format = "{:<4} {:<20} {:<8} {:<10} {:<10} {:<10}"
-            print(colorize(header_format.format(
-                "排名", "创作者", "Stable数", "平均难度", "平均热度", "最高热度"
-            ), Colors.BOLD))
-            print(get_separator())
-            
-            # 显示数据
-            for i, (creator, count, avg_level, avg_heat, max_heat) in enumerate(results, 1):
-                # 处理过长的创作者名
-                display_creator = creator if len(creator) <= 20 else creator[:17] + "..."
-                
-                print(header_format.format(
-                    f"#{i}",
-                    display_creator,
-                    count,
-                    f"{avg_level:.1f}" if avg_level else "N/A",
-                    f"{avg_heat:.1f}" if avg_heat else "N/A",
-                    f"{max_heat:.0f}" if max_heat else "N/A"
-                ))
-            
-            print(get_separator())
-            
-            # 生成图表的选项
-            chart_choice = input(colorize("\n是否生成图表? (y/N): ", Colors.CYAN)).lower()
-            if chart_choice == 'y':
-                self._generate_stabled_chart(results, mode_str)
-                
-        except sqlite3.Error as e:
-            print(colorize(f"数据库错误: {e}", Colors.RED))
-            # 打印详细的调试信息
-            print(colorize(f"有问题的SQL: {query}", Colors.YELLOW))
-            print(colorize(f"参数: {params}", Colors.YELLOW))
-        except Exception as e:
-            print(colorize(f"操作错误: {e}", Colors.RED))
-
-    def _generate_stabled_chart(self, results, mode_str):
-        """生成stable创作者统计图表"""
-        if not results:
-            return
-        
-        creators = [row[0] for row in results]
-        counts = [row[1] for row in results]
-        avg_levels = [row[2] if row[2] else 0 for row in results]
-        avg_heats = [row[3] if row[3] else 0 for row in results]
-        
-        # 截断过长的创作者名
-        display_creators = []
-        for creator in creators:
-            if len(creator) > 15:
-                display_creators.append(creator[:12] + "...")
-            else:
-                display_creators.append(creator)
-        
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 12))
-        fig.suptitle(f'Stable谱面创作者统计\n模式: {mode_str}', fontsize=16, fontweight='bold')
-        
-        # 左上：Stable谱面数量柱状图
-        y_pos = range(len(display_creators))
-        bars = ax1.barh(y_pos, counts, color='lightgreen', alpha=0.7)
-        ax1.set_yticks(y_pos)
-        ax1.set_yticklabels(display_creators)
-        ax1.set_xlabel('Stable谱面数量')
-        ax1.set_title('Stable谱面数量排行')
-        
-        # 在柱状图上添加数值
-        for bar, count in zip(bars, counts):
-            width = bar.get_width()
-            ax1.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
-                    f'{count}', ha='left', va='center', fontsize=9)
-        
-        # 右上：平均难度柱状图
-        bars2 = ax2.barh(y_pos, avg_levels, color='lightblue', alpha=0.7)
-        ax2.set_yticks(y_pos)
-        ax2.set_yticklabels(display_creators)
-        ax2.set_xlabel('平均难度')
-        ax2.set_title('创作者平均难度')
-        
-        # 在柱状图上添加数值
-        for bar, level in zip(bars2, avg_levels):
-            width = bar.get_width()
-            ax2.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
-                    f'{level:.1f}', ha='left', va='center', fontsize=9)
-        
-        # 左下：平均热度柱状图
-        bars3 = ax3.barh(y_pos, avg_heats, color='lightcoral', alpha=0.7)
-        ax3.set_yticks(y_pos)
-        ax3.set_yticklabels(display_creators)
-        ax3.set_xlabel('平均热度')
-        ax3.set_title('创作者平均热度')
-        
-        # 在柱状图上添加数值
-        for bar, heat in zip(bars3, avg_heats):
-            width = bar.get_width()
-            ax3.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
-                    f'{heat:.1f}', ha='left', va='center', fontsize=9)
-        
-        # 右下：散点图 - 谱面数量 vs 平均热度
-        scatter = ax4.scatter(counts, avg_heats, s=100, c=avg_levels, 
-                            cmap='viridis', alpha=0.7)
-        ax4.set_xlabel('Stable谱面数量')
-        ax4.set_ylabel('平均热度')
-        ax4.set_title('谱面数量 vs 平均热度 (颜色表示平均难度)')
-        ax4.grid(True, alpha=0.3)
-        
-        # 添加数据点标签
-        for i, (creator, count, heat) in enumerate(zip(display_creators, counts, avg_heats)):
-            ax4.annotate(creator, (count, heat), xytext=(5, 5), 
-                        textcoords='offset points', fontsize=8, alpha=0.7)
-        
-        # 添加颜色条
-        cbar = plt.colorbar(scatter, ax=ax4)
-        cbar.set_label('平均难度')
-        
-        plt.tight_layout()
-        
-        # 保存图表
-        base_filename = "stb_stabled_creators.png"
-        filename = self.get_unique_filename(base_filename, "png")
-        filepath = os.path.join(self.output_dir, filename)
-        plt.savefig(filepath, dpi=150, facecolor='white', bbox_inches='tight')
-        plt.close()
-        
-        print(colorize(f"\n已生成stable创作者图表: {filepath}", Colors.GREEN))
-
-    def _generate_stabled_by_chart(self, results, player_name, mode_str, total_count):
-        """生成稳定者统计图表"""
-        if not results:
-            return
-        
-        # 准备数据
-        titles = [row[4] for row in results]  # 歌曲标题
-        heats = [row[7] or 0 for row in results]  # 热度
-        levels = [row[2] for row in results]  # 难度
-        
-        # 截断过长的标题
-        display_titles = []
-        for title in titles:
-            if len(title) > 20:
-                display_titles.append(title[:17] + "...")
-            else:
-                display_titles.append(title)
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
-        fig.suptitle(f'{player_name} 作为稳定者的谱面统计\n模式: {mode_str} | 总谱面数: {total_count}', 
-                    fontsize=14, fontweight='bold')
-        
-        # 左侧：热度分布柱状图
-        y_pos = range(len(display_titles))
-        bars = ax1.barh(y_pos, heats, color='lightcoral', alpha=0.7)
-        ax1.set_yticks(y_pos)
-        ax1.set_yticklabels(display_titles)
-        ax1.set_xlabel('热度')
-        ax1.set_title('谱面热度分布')
-        
-        # 在柱状图上添加数值
-        for bar, heat in zip(bars, heats):
-            width = bar.get_width()
-            ax1.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
-                    f'{heat}', ha='left', va='center', fontsize=9)
-        
-        # 右侧：难度分布饼图
-        level_counts = {}
-        for level in levels:
-            if level:
-                level_counts[level] = level_counts.get(level, 0) + 1
-        
-        if level_counts:
-            level_labels = [f'Lv.{lvl}' for lvl in level_counts.keys()]
-            level_values = list(level_counts.values())
-            
-            colors = plt.cm.Set3(np.linspace(0, 1, len(level_labels)))
-            wedges, texts, autotexts = ax2.pie(level_values, labels=level_labels, autopct='%1.1f%%',
-                                            colors=colors, startangle=90)
-            
-            for autotext in autotexts:
-                autotext.set_color('white')
-                autotext.set_fontweight('bold')
-            
-            ax2.set_title('难度分布')
-        else:
-            ax2.text(0.5, 0.5, '无难度数据', ha='center', va='center', transform=ax2.transAxes)
-            ax2.set_title('难度分布')
-        
-        plt.tight_layout()
-        
-        # 保存图表
-        safe_player_name = re.sub(r'[^\w]', '_', player_name)
-        base_filename = f"stabled_by_{safe_player_name}.png"
-        filename = self.get_unique_filename(base_filename, "png")
-        filepath = os.path.join(self.output_dir, filename)
-        plt.savefig(filepath, dpi=150, facecolor='white', bbox_inches='tight')
-        plt.close()
-        
-        print(colorize(f"\n已生成稳定者统计图表: {filepath}", Colors.GREEN))
-
-    @db_safe_operation
-    def do_stb_top_stabilizers(self, arg):
-        """
-        显示顶级稳定者排行榜（审核上架谱面最多的玩家）
-        
-        用法: stb_top_stabilizers [模式] [数量]
-        参数:
-        模式 - 可选，模式编号，默认为所有模式
-        数量 - 可选，要显示的稳定者数量，默认为20
-        
-        示例:
-        stb_top_stabilizers        # 所有模式的顶级稳定者
-        stb_top_stabilizers 0 10   # 模式0前10名稳定者
-        """
-        args = arg.split()
-        mode = -1  # 默认所有模式
-        limit = 20
-        
-        if args:
-            try:
-                mode = int(args[0])
-                if mode not in self.mode_names:
-                    print(colorize("错误: 无效的模式编号", Colors.RED))
-                    return
-                if len(args) > 1:
-                    limit = int(args[1])
-            except ValueError:
-                print(colorize("错误: 请输入有效的数字", Colors.RED))
-                return
-        
-        if limit <= 0:
-            print(colorize("错误: 数量必须大于0", Colors.RED))
-            return
-        
-        cursor = self.conn.cursor()
-        
-        try:
-            # 构建查询条件
-            where_conditions = ["c.stabled_by_name IS NOT NULL", "c.status = 2"]
-            params = []
-            
-            # 模式筛选
-            if mode != -1:
-                where_conditions.append("c.mode = ?")
-                params.append(mode)
-            
-            where_clause = " AND ".join(where_conditions)
-            
-            query = f"""
-            SELECT 
-                c.stabled_by_name,
-                COUNT(*) as stable_count,
-                AVG(c.heat) as avg_heat,
-                MAX(c.heat) as max_heat,
-                MIN(c.last_updated) as first_stable,
-                MAX(c.last_updated) as last_stable
-            FROM charts c
-            WHERE {where_clause}
-            GROUP BY c.stabled_by_name
-            ORDER BY stable_count DESC, avg_heat DESC
-            LIMIT ?
-            """
-            params.append(limit)
-            
-            cursor.execute(query, params)
-            results = cursor.fetchall()
-            
-            if not results:
-                mode_str = "所有模式" if mode == -1 else f"模式 {mode}"
-                print(colorize(f"\n在{mode_str}中没有找到稳定者数据", Colors.YELLOW))
-                return
-            
-            # 显示结果
-            mode_str = "所有模式" if mode == -1 else f"模式 {mode} ({self.mode_names.get(mode, '未知')})"
-            
-            print(colorize(f"\n顶级稳定者排行榜", Colors.CYAN))
-            print(colorize(f"模式: {mode_str}", Colors.YELLOW))
-            print(get_separator())
-            
-            # 显示表头
-            header_format = "{:<4} {:<20} {:<10} {:<10} {:<10} {:<12} {:<12}"
-            print(colorize(header_format.format(
-                "排名", "稳定者", "稳定谱面", "平均热度", "最高热度", "首次稳定", "最后稳定"
-            ), Colors.BOLD))
-            print(get_separator())
-            
-            # 显示数据
-            for i, (stabilizer, count, avg_heat, max_heat, first_stable, last_stable) in enumerate(results, 1):
-                # 处理过长的稳定者名
-                display_stabilizer = stabilizer if len(stabilizer) <= 20 else stabilizer[:17] + "..."
-                
-                # 格式化日期 - 修复strftime错误
-                def format_date(date_value):
-                    if not date_value:
-                        return "未知"
-                    if isinstance(date_value, datetime):
-                        return date_value.strftime('%Y-%m-%d')
-                    elif isinstance(date_value, str):
-                        # 如果是字符串，尝试提取日期部分
-                        if len(date_value) >= 10:
-                            return date_value[:10]
-                        else:
-                            return date_value
-                    else:
-                        return str(date_value)
-                
-                first_date = format_date(first_stable)
-                last_date = format_date(last_stable)
-                
-                print(header_format.format(
-                    f"#{i}",
-                    display_stabilizer,
-                    count,
-                    f"{avg_heat:.1f}" if avg_heat else "N/A",
-                    f"{max_heat:.0f}" if max_heat else "N/A",
-                    first_date,
-                    last_date
-                ))
-            
-            print(get_separator())
-            
-            # 显示统计信息
-            if results:
-                total_stable = sum(row[1] for row in results)
-                avg_stable = total_stable / len(results)
-                max_stable = max(row[1] for row in results)
-                
-                print(colorize(f"\n统计信息:", Colors.BOLD))
-                print(f"  总稳定谱面数: {total_stable}")
-                print(f"  平均每人稳定谱面: {avg_stable:.1f}")
-                print(f"  最高稳定谱面数: {max_stable}")
-                
-                # 生成图表的选项
-                chart_choice = input(colorize("\n是否生成统计图表? (y/N): ", Colors.CYAN)).lower()
-                if chart_choice == 'y':
-                    self._generate_top_stabilizers_chart(results, mode_str)
-                    
-        except sqlite3.Error as e:
-            print(colorize(f"数据库错误: {e}", Colors.RED))
-        except Exception as e:
-            print(colorize(f"操作错误: {e}", Colors.RED))
-
-    def _generate_top_stabilizers_chart(self, results, mode_str):
-        """生成顶级稳定者统计图表"""
-        if not results:
-            return
-        
-        stabilizers = [row[0] for row in results]
-        counts = [row[1] for row in results]
-        avg_heats = [row[2] if row[2] else 0 for row in results]
-        max_heats = [row[3] if row[3] else 0 for row in results]
-        
-        # 截断过长的稳定者名
-        display_stabilizers = []
-        for stabilizer in stabilizers:
-            if len(stabilizer) > 15:
-                display_stabilizers.append(stabilizer[:12] + "...")
-            else:
-                display_stabilizers.append(stabilizer)
-        
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 12))
-        fig.suptitle(f'顶级稳定者统计\n模式: {mode_str}', fontsize=16, fontweight='bold')
-        
-        # 左上：稳定谱面数量柱状图
-        y_pos = range(len(display_stabilizers))
-        bars = ax1.barh(y_pos, counts, color='lightgreen', alpha=0.7)
-        ax1.set_yticks(y_pos)
-        ax1.set_yticklabels(display_stabilizers)
-        ax1.set_xlabel('稳定谱面数量')
-        ax1.set_title('稳定谱面数量排行')
-        
-        # 在柱状图上添加数值
-        for bar, count in zip(bars, counts):
-            width = bar.get_width()
-            ax1.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
-                    f'{count}', ha='left', va='center', fontsize=9)
-        
-        # 右上：平均热度柱状图
-        bars2 = ax2.barh(y_pos, avg_heats, color='lightcoral', alpha=0.7)
-        ax2.set_yticks(y_pos)
-        ax2.set_yticklabels(display_stabilizers)
-        ax2.set_xlabel('平均热度')
-        ax2.set_title('稳定谱面平均热度')
-        
-        # 在柱状图上添加数值
-        for bar, heat in zip(bars2, avg_heats):
-            width = bar.get_width()
-            ax2.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
-                    f'{heat:.1f}', ha='left', va='center', fontsize=9)
-        
-        # 左下：最高热度柱状图
-        bars3 = ax3.barh(y_pos, max_heats, color='gold', alpha=0.7)
-        ax3.set_yticks(y_pos)
-        ax3.set_yticklabels(display_stabilizers)
-        ax3.set_xlabel('最高热度')
-        ax3.set_title('稳定谱面最高热度')
-        
-        # 在柱状图上添加数值
-        for bar, heat in zip(bars3, max_heats):
-            width = bar.get_width()
-            ax3.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
-                    f'{heat:.0f}', ha='left', va='center', fontsize=9)
-        
-        # 右下：散点图 - 稳定谱面数量 vs 平均热度
-        scatter = ax4.scatter(counts, avg_heats, s=100, c=max_heats, 
-                            cmap='viridis', alpha=0.7)
-        ax4.set_xlabel('稳定谱面数量')
-        ax4.set_ylabel('平均热度')
-        ax4.set_title('稳定谱面数量 vs 平均热度 (颜色表示最高热度)')
-        ax4.grid(True, alpha=0.3)
-        
-        # 添加数据点标签
-        for i, (stabilizer, count, heat) in enumerate(zip(display_stabilizers, counts, avg_heats)):
-            ax4.annotate(stabilizer, (count, heat), xytext=(5, 5), 
-                        textcoords='offset points', fontsize=8, alpha=0.7)
-        
-        # 添加颜色条
-        cbar = plt.colorbar(scatter, ax=ax4)
-        cbar.set_label('最高热度')
-        
-        plt.tight_layout()
-        
-        # 保存图表
-        base_filename = "stb_top_stabilizers.png"
-        filename = self.get_unique_filename(base_filename, "png")
-        filepath = os.path.join(self.output_dir, filename)
-        plt.savefig(filepath, dpi=150, facecolor='white', bbox_inches='tight')
-        plt.close()
-        
-        print(colorize(f"\n已生成顶级稳定者统计图表: {filepath}", Colors.GREEN))
-
     @db_safe_operation
     def do_player(self, arg):
         """
@@ -1493,7 +977,218 @@ class MalodyViz(cmd.Cmd):
         
         if len(aliases) > 1:
             print(f"曾用名: {', '.join(aliases)}")
-    
+            
+    @db_safe_operation
+    def do_profile(self, arg):
+        """
+        查看玩家详细资料（包括头衔、成就、个人信息等）
+
+        用法: profile <玩家名> [模式]
+        参数:
+        玩家名 - 要查询的玩家名称
+        模式   - 可选，模式编号，默认为当前模式
+
+        示例:
+        profile Zani      # 查看Zani的详细资料
+        profile Zani 0    # 查看Zani在模式0的排名信息及资料
+        """
+        args = arg.split()
+        if not args:
+            print(colorize("错误: 请输入玩家名", Colors.RED))
+            return
+
+        player_name = args[0]
+        mode = self.current_mode
+        if len(args) > 1:
+            try:
+                mode = int(args[1])
+                if mode not in self.mode_names or mode == -1:
+                    print(colorize("错误: 模式必须在0-9之间", Colors.RED))
+                    return
+            except ValueError:
+                print(colorize("错误: 请输入有效的模式数字", Colors.RED))
+                return
+
+        cursor = self.conn.cursor()
+
+        player_id = None
+        uid = None
+
+        # 根据输入获取 player_id 和 uid
+        if player_name.isdigit():
+            uid = player_name
+            cursor.execute("SELECT player_id FROM player_identity WHERE uid = ?", (uid,))
+            row = cursor.fetchone()
+            if row:
+                player_id = row[0]
+        else:
+            cursor.execute("SELECT player_id FROM player_aliases WHERE alias = ?", (player_name,))
+            row = cursor.fetchone()
+            if row:
+                player_id = row[0]
+                cursor.execute("SELECT uid FROM player_identity WHERE player_id = ?", (player_id,))
+                uid_row = cursor.fetchone()
+                if uid_row and uid_row[0]:
+                    uid = uid_row[0]
+            else:
+                print(colorize(f"未找到玩家: {player_name}", Colors.YELLOW))
+                return
+
+        if player_id is None and uid is None:
+            print(colorize(f"未找到玩家: {player_name}", Colors.YELLOW))
+            return
+
+        # 查询玩家资料（依赖 uid）
+        profile = {}
+        if uid:
+            cursor.execute("SELECT * FROM player_profiles WHERE uid = ?", (uid,))
+            row = cursor.fetchone()
+            if row:
+                col_names = [description[0] for description in cursor.description]
+                profile = dict(zip(col_names, row))
+
+        # 查询头衔（依赖 uid）
+        titles = []
+        if uid:
+            cursor.execute("SELECT title FROM player_titles WHERE uid = ?", (uid,))
+            titles = [r[0] for r in cursor.fetchall()]
+
+        # 查询成就（依赖 uid）
+        achievements = []
+        if uid:
+            cursor.execute("SELECT achievement_code FROM player_achievements WHERE uid = ?", (uid,))
+            achievements = [r[0] for r in cursor.fetchall()]
+
+        # 获取当前排名信息（依赖 player_id 和 mode）
+        ranking = None
+        rankings = []
+        if player_id:
+            if mode != -1:
+                cursor.execute("""
+                    SELECT rank, lv, exp, acc, combo, pc, crawl_time
+                    FROM player_rankings
+                    WHERE player_id = ? AND mode = ?
+                    ORDER BY crawl_time DESC LIMIT 1
+                """, (player_id, mode))
+                ranking = cursor.fetchone()
+            else:
+                cursor.execute("""
+                    SELECT mode, rank, lv, exp, acc, combo, pc, crawl_time
+                    FROM player_rankings
+                    WHERE player_id = ?
+                    ORDER BY crawl_time DESC LIMIT 10
+                """, (player_id,))
+                rankings = cursor.fetchall()
+
+        # 显示信息
+        print(colorize(f"\n玩家详细资料: {player_name}", Colors.CYAN))
+        print(get_separator())
+
+        if profile:
+            print(colorize("基本信息:", Colors.BOLD))
+            print(f"  头像: {profile.get('avatar_url', 'N/A')}")
+            print(f"  加入日期: {profile.get('join_date', 'N/A')}")
+            print(f"  最后游玩: {profile.get('last_play_date', 'N/A')}")
+            print(f"  总游玩时长: {profile.get('total_play_time', 'N/A')}")
+            print(f"  性别: {profile.get('gender', 'N/A')}")
+            print(f"  年龄: {profile.get('age', 'N/A')}")
+            print(f"  地区: {profile.get('location', 'N/A')}")
+            print(f"  金币: {profile.get('gold', 'N/A')}")
+            print(f"  收入: {profile.get('income', 'N/A')}")
+            print(f"  谱面游玩时长: {profile.get('charts_played_time', 'N/A')}")
+            print(f"  稳定谱面: {profile.get('stable_charts', 0)}")
+            print(f"  不稳定谱面: {profile.get('unstable_charts', 0)}")
+            print(f"  谱面槽位: {profile.get('chart_slots', 0)}")
+            if profile.get('bio'):
+                print(f"  个人简介: {profile['bio']}")
+        else:
+            print(colorize("无详细资料记录", Colors.YELLOW))
+
+        if titles:
+            print(colorize(f"\n头衔 ({len(titles)}):", Colors.BOLD))
+            for title in titles:
+                print(f"  {title}")
+
+        if achievements:
+            print(colorize(f"\n成就 ({len(achievements)}):", Colors.BOLD))
+            for code in achievements[:20]:
+                print(f"  {code}")
+            if len(achievements) > 20:
+                print(f"  ... 还有 {len(achievements)-20} 个")
+
+        # 显示排名信息（根据 mode 决定显示方式）
+        if mode != -1 and ranking:
+            rank, lv, exp, acc, combo, pc, ct = ranking
+            mode_name = self.mode_names.get(mode, "未知")
+            print(colorize(f"\n当前排名 (模式 {mode} - {mode_name}):", Colors.BOLD))
+            print(f"  排名: {rank}")
+            print(f"  等级: {lv}")
+            print(f"  经验: {exp}")
+            print(f"  准确率: {acc:.2f}%")
+            print(f"  最大连击: {combo}")
+            print(f"  游玩次数: {pc}")
+            print(f"  更新时间: {ct}")
+        elif mode == -1 and rankings:
+            print(colorize("\n各模式最新排名:", Colors.BOLD))
+            for r in rankings[:5]:
+                m, rank, lv, exp, acc, combo, pc, ct = r
+                mode_name = self.mode_names.get(m, "未知")
+                print(f"  模式 {m}({mode_name}): 排名 {rank}, 等级 {lv}, 准确率 {acc:.2f}%")
+
+        # 只询问一次图表生成
+        chart_choice = input(colorize("\n是否生成资料统计图表? (y/N): ", Colors.CYAN)).lower()
+        if chart_choice == 'y':
+            self._generate_profile_chart(profile, titles, achievements, player_name)
+        
+    def _generate_profile_chart(self, profile, titles, achievements, player_name):
+        """生成玩家资料统计图表（简单示例）"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle(f'玩家资料统计 - {player_name}', fontsize=16)
+
+        # 左侧：头衔数量（若无头衔则显示无）
+        if titles:
+            # 头衔按长度分组展示（简单柱状图）
+            title_len_groups = {'短(1-5)':0, '中(6-10)':0, '长(11+)':0}
+            for t in titles:
+                l = len(t)
+                if l <= 5:
+                    title_len_groups['短(1-5)'] += 1
+                elif l <= 10:
+                    title_len_groups['中(6-10)'] += 1
+                else:
+                    title_len_groups['长(11+)'] += 1
+            ax1.bar(title_len_groups.keys(), title_len_groups.values(), color='lightblue')
+            ax1.set_title('头衔长度分布')
+            ax1.set_ylabel('数量')
+        else:
+            ax1.text(0.5, 0.5, '无头衔', ha='center', va='center', transform=ax1.transAxes)
+            ax1.set_title('头衔')
+
+        # 右侧：成就代码分布（按十位数分组）
+        if achievements:
+            # 按成就代码的十位分组（粗略分组）
+            groups = {}
+            for code in achievements:
+                group = code // 10
+                groups[group] = groups.get(group, 0) + 1
+            codes = sorted(groups.keys())
+            counts = [groups[k] for k in codes]
+            ax2.bar([str(c) for c in codes], counts, color='lightgreen')
+            ax2.set_title('成就分组分布')
+            ax2.set_xlabel('成就组')
+            ax2.set_ylabel('数量')
+        else:
+            ax2.text(0.5, 0.5, '无成就', ha='center', va='center', transform=ax2.transAxes)
+            ax2.set_title('成就')
+
+        plt.tight_layout()
+        safe_name = re.sub(r'[^\w]', '_', player_name)
+        filename = self.get_unique_filename(f"profile_{safe_name}.png", "png")
+        filepath = os.path.join(self.output_dir, filename)
+        plt.savefig(filepath, dpi=150, facecolor='white')
+        plt.close()
+        print(colorize(f"已生成资料统计图表: {filepath}", Colors.GREEN))
+
     @db_safe_operation
     def do_history(self, arg):
         """
@@ -2565,134 +2260,28 @@ class MalodyViz(cmd.Cmd):
             else:
                 print(colorize(f"未找到包含 '{keyword}' 的玩家", Colors.YELLOW))
 
-        def _search_charts(self, cursor, keyword, mode):
-            """搜索谱面"""
-            # 使用选择器构建谱面查询条件
-            where_clause, params = self.selector.build_chart_sql_where("c")
-            where_clause += " AND (s.title LIKE ? OR s.artist LIKE ?)"
-            params.extend([f'%{keyword}%', f'%{keyword}%'])
-            
-            cursor.execute(
-                f"""
-                SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
-                    c.creator_name, c.heat, c.donate_count, c.last_updated
-                FROM charts c
-                JOIN songs s ON c.sid = s.sid
-                WHERE {where_clause}
-                ORDER BY c.heat DESC LIMIT 10
-                """,
-                params
-            )
-            results = cursor.fetchall()
-            if results:
-                print(colorize(f"\n找到 {len(results)} 个匹配谱面:", Colors.CYAN))
-                print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-                print(get_separator())
-                for cid, version, level, status, title, artist, creator, heat, donate, updated in results:
-                    status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, "Unknown")
-                    print(f"  {title} - {artist} (Lv.{level})")
-                    print(f"    版本: {version}, 状态: {status_name}, 热度: {heat}")
-                    print(f"    创作者: {creator}, CID: {cid}")
-            else:
-                print(colorize(f"未找到包含 '{keyword}' 的谱面", Colors.YELLOW))
-
-        def _search_creators(self, cursor, keyword, mode):
-            """搜索创作者"""
-            # 使用选择器构建谱面查询条件
-            where_clause, params = self.selector.build_chart_sql_where("c")
-            where_clause += " AND c.creator_name LIKE ?"
-            params.append(f'%{keyword}%')
-            
-            cursor.execute(
-                f"""
-                SELECT c.creator_name, COUNT(*) as chart_count, 
-                    AVG(c.heat) as avg_heat, MAX(c.heat) as max_heat
-                FROM charts c
-                WHERE {where_clause}
-                GROUP BY c.creator_name
-                ORDER BY chart_count DESC LIMIT 10
-                """,
-                params
-            )
-            results = cursor.fetchall()
-            if results:
-                print(colorize(f"\n找到 {len(results)} 个匹配创作者:", Colors.CYAN))
-                print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-                print(get_separator())
-                for creator, count, avg_heat, max_heat in results:
-                    print(f"  {creator}: {count} 个谱面")
-                    print(f"    平均热度: {avg_heat:.1f}, 最高热度: {max_heat}")
-            else:
-                print(colorize(f"未找到包含 '{keyword}' 的创作者", Colors.YELLOW))
-
-
-    def _search_players(self, cursor, keyword, mode):
-        """搜索玩家（支持名称和UID）"""
-        if keyword.isdigit():
-            # UID搜索
-            cursor.execute(
-                "SELECT pi.player_id, pi.current_name, pi.uid "
-                "FROM player_identity pi WHERE pi.uid = ?", 
-                (keyword,)
-            )
-            result = cursor.fetchone()
-            if result:
-                player_id, name, uid = result
-                cursor.execute(
-                    """
-                    SELECT pr.rank, pr.lv, pr.acc, pr.combo, pr.pc, pr.crawl_time
-                    FROM player_rankings pr
-                    WHERE pr.player_id = ? AND pr.mode = ?
-                    ORDER BY pr.crawl_time DESC LIMIT 1
-                    """,
-                    (player_id, mode)
-                )
-                player_data = cursor.fetchone()
-                if player_data:
-                    rank, lv, acc, combo, pc, crawl_time = player_data
-                    print(colorize(f"\n玩家: {name} (UID: {uid})", Colors.CYAN))
-                    print(get_separator())
-                    print(f"排名: {rank}, 等级: {lv}, 准确率: {acc:.2f}%")
-                    print(f"连击: {combo}, 游玩次数: {pc}")
-                    return
-            
-            print(colorize(f"未找到UID为 {keyword} 的玩家", Colors.YELLOW))
-        else:
-            # 名称搜索
-            cursor.execute(
-                """
-                SELECT DISTINCT pr.name, pr.rank, pr.lv, pr.acc, pr.crawl_time
-                FROM player_rankings pr
-                WHERE pr.name LIKE ? AND pr.mode = ?
-                ORDER BY pr.rank LIMIT 10
-                """,
-                (f'%{keyword}%', mode)
-            )
-            results = cursor.fetchall()
-            if results:
-                print(colorize(f"\n找到 {len(results)} 个匹配玩家:", Colors.CYAN))
-                print(get_separator())
-                for name, rank, lv, acc, crawl_time in results:
-                    print(f"{name}: 排名 {rank}, 等级 {lv}, 准确率 {acc:.2f}%")
-            else:
-                print(colorize(f"未找到包含 '{keyword}' 的玩家", Colors.YELLOW))
-    
     def _search_charts(self, cursor, keyword, mode):
         """搜索谱面"""
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
+        where_clause += " AND (s.title LIKE ? OR s.artist LIKE ?)"
+        params.extend([f'%{keyword}%', f'%{keyword}%'])
+        
         cursor.execute(
-            """
+            f"""
             SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
-                   c.creator_name, c.heat, c.donate_count, c.last_updated
+                c.creator_name, c.heat, c.donate_count, c.last_updated
             FROM charts c
             JOIN songs s ON c.sid = s.sid
-            WHERE (s.title LIKE ? OR s.artist LIKE ?) AND c.mode = ?
+            WHERE {where_clause}
             ORDER BY c.heat DESC LIMIT 10
             """,
-            (f'%{keyword}%', f'%{keyword}%', mode)
+            params
         )
         results = cursor.fetchall()
         if results:
             print(colorize(f"\n找到 {len(results)} 个匹配谱面:", Colors.CYAN))
+            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             print(get_separator())
             for cid, version, level, status, title, artist, creator, heat, donate, updated in results:
                 status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, "Unknown")
@@ -2701,205 +2290,35 @@ class MalodyViz(cmd.Cmd):
                 print(f"    创作者: {creator}, CID: {cid}")
         else:
             print(colorize(f"未找到包含 '{keyword}' 的谱面", Colors.YELLOW))
-    
+
     def _search_creators(self, cursor, keyword, mode):
         """搜索创作者"""
+        # 使用选择器构建谱面查询条件
+        where_clause, params = self.selector.build_chart_sql_where("c")
+        where_clause += " AND c.creator_name LIKE ?"
+        params.append(f'%{keyword}%')
+        
         cursor.execute(
-            """
-            SELECT creator_name, COUNT(*) as chart_count, 
-                   AVG(heat) as avg_heat, MAX(heat) as max_heat
-            FROM charts 
-            WHERE creator_name LIKE ? AND mode = ?
-            GROUP BY creator_name
+            f"""
+            SELECT c.creator_name, COUNT(*) as chart_count, 
+                AVG(c.heat) as avg_heat, MAX(c.heat) as max_heat
+            FROM charts c
+            WHERE {where_clause}
+            GROUP BY c.creator_name
             ORDER BY chart_count DESC LIMIT 10
             """,
-            (f'%{keyword}%', mode)
+            params
         )
         results = cursor.fetchall()
         if results:
             print(colorize(f"\n找到 {len(results)} 个匹配创作者:", Colors.CYAN))
+            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             print(get_separator())
             for creator, count, avg_heat, max_heat in results:
                 print(f"  {creator}: {count} 个谱面")
                 print(f"    平均热度: {avg_heat:.1f}, 最高热度: {max_heat}")
         else:
             print(colorize(f"未找到包含 '{keyword}' 的创作者", Colors.YELLOW))
-
-    @db_safe_operation
-    def do_stb_stats(self, arg):
-        """
-        谱面基础统计（支持选择器筛选）
-        
-        用法: stb_stats [模式]
-        参数:
-        模式 - 可选，模式编号，默认为当前模式
-        
-        示例:
-        stb_stats      # 当前模式统计
-        stb_stats 0    # 模式0统计
-        """
-        args = arg.split()
-        mode = self.current_mode
-        if args:
-            try:
-                mode = int(args[0])
-            except ValueError:
-                print(colorize("错误: 模式必须是数字", Colors.RED))
-                return
-        
-        cursor = self.conn.cursor()
-        
-        # 使用选择器构建谱面查询条件
-        where_clause, params = self.selector.build_chart_sql_where("c")
-        
-        # 如果选择器中没有指定模式，使用当前模式
-        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
-            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
-            params.append(mode)
-        
-        stats = self._get_chart_stats(cursor, where_clause, params)
-        self._display_chart_stats(stats, mode)
-        self._display_chart_stats(stats, mode)
-
-    def _get_chart_stats(self, cursor, where_clause, params):
-        """获取谱面统计信息"""
-        stats = {}
-        
-        # 总谱面数
-        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
-        stats['total_charts'] = cursor.fetchone()[0]
-        
-        # 按状态统计
-        cursor.execute(
-            f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
-            params
-        )
-        stats['status_dist'] = dict(cursor.fetchall())
-        
-        # 难度统计 - 修复空字符串问题
-        cursor.execute(
-            f"SELECT c.level, COUNT(*) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
-            params
-        )
-        stats['level_dist'] = dict(cursor.fetchall())
-        
-        # 创作者统计
-        cursor.execute(
-            f"SELECT c.creator_name, COUNT(*) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY COUNT(*) DESC LIMIT 10",
-            params
-        )
-        stats['top_creators'] = cursor.fetchall()
-        
-        # 热度统计
-        cursor.execute(
-            f"SELECT AVG(c.heat), MAX(c.heat), AVG(c.donate_count), MAX(c.donate_count) FROM charts c WHERE {where_clause}",
-            params
-        )
-        heat_stats = cursor.fetchone()
-        stats['heat_avg'], stats['heat_max'], stats['donate_avg'], stats['donate_max'] = heat_stats or (0, 0, 0, 0)
-        
-        return stats
-    
-    def _display_chart_stats(self, stats, mode):
-        """显示谱面统计信息"""
-        mode_name = self.mode_names.get(mode, "未知")
-        
-        print(colorize(f"\n谱面统计 - 模式 {mode} ({mode_name})", Colors.CYAN))
-        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-        print(get_separator())
-        
-        if not stats or stats['total_charts'] == 0:
-            print(colorize("没有找到符合条件的谱面", Colors.YELLOW))
-            return
-        
-        print(f"总谱面数: {colorize(stats['total_charts'], Colors.GREEN)}")
-        
-        # 状态分布
-        if stats['status_dist']:
-            print(f"\n{colorize('状态分布:', Colors.BOLD)}")
-            status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
-            for status, count in stats['status_dist'].items():
-                status_name = status_names.get(status, f"未知({status})")
-                print(f"  {status_name}: {count}")
-        
-        # 难度分布
-        if stats['level_dist']:
-            print(f"\n{colorize('难度分布:', Colors.BOLD)}")
-            for level, count in sorted(stats['level_dist'].items(), key=lambda x: float(x[0])):
-                print(f"  Lv.{level}: {count}")
-        
-        # 热门创作者
-        if stats['top_creators']:
-            print(f"\n{colorize('热门创作者:', Colors.BOLD)}")
-            for creator, count in stats['top_creators']:
-                print(f"  {creator}: {count} 个谱面")
-        
-        # 热度统计
-        print(f"\n{colorize('热度统计:', Colors.BOLD)}")
-        print(f"  平均热度: {stats['heat_avg']:.1f}")
-        print(f"  最高热度: {stats['heat_max']}")
-        print(f"  平均打赏: {stats['donate_avg']:.1f}")
-        print(f"  最多打赏: {stats['donate_max']}")
-
-    def _get_chart_stats(self, cursor, where_clause, params):
-        """获取谱面统计信息"""
-        stats = {}
-        
-        try:
-            # 总谱面数
-            cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
-            stats['total_charts'] = cursor.fetchone()[0]
-            
-            # 按状态统计 - 确保正确统计所有状态
-            cursor.execute(
-                f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
-                params
-            )
-            status_results = cursor.fetchall()
-            
-            # 确保所有状态都显示，即使数量为0
-            stats['status_dist'] = {0: 0, 1: 0, 2: 0}
-            for status, count in status_results:
-                if status in [0, 1, 2]:
-                    stats['status_dist'][status] = count
-            
-            # 难度统计 - 修复空字符串问题
-            cursor.execute(
-                f"SELECT c.level, COUNT(*) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
-                params
-            )
-            stats['level_dist'] = dict(cursor.fetchall())
-            
-            # 创作者统计
-            cursor.execute(
-                f"SELECT c.creator_name, COUNT(*) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY COUNT(*) DESC LIMIT 10",
-                params
-            )
-            stats['top_creators'] = cursor.fetchall()
-            
-            # 热度统计
-            cursor.execute(
-                f"SELECT AVG(c.heat), MAX(c.heat), AVG(c.donate_count), MAX(c.donate_count) FROM charts c WHERE {where_clause}",
-                params
-            )
-            heat_stats = cursor.fetchone()
-            stats['heat_avg'], stats['heat_max'], stats['donate_avg'], stats['donate_max'] = heat_stats or (0, 0, 0, 0)
-            
-        except Exception as e:
-            print(colorize(f"获取统计信息时出错: {e}", Colors.RED))
-            # 返回空的统计字典
-            stats = {
-                'total_charts': 0,
-                'status_dist': {0: 0, 1: 0, 2: 0},
-                'level_dist': {},
-                'top_creators': [],
-                'heat_avg': 0,
-                'heat_max': 0,
-                'donate_avg': 0,
-                'donate_max': 0
-            }
-        
-        return stats
 
     @db_safe_operation
     def do_stb_stats(self, arg):
@@ -2945,6 +2364,66 @@ class MalodyViz(cmd.Cmd):
         
         self._display_chart_stats(stats, mode_str)
 
+    def _get_chart_stats(self, cursor, where_clause, params):
+        """获取谱面统计信息"""
+        stats = {}
+        
+        try:
+            # 总谱面数
+            cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
+            stats['total_charts'] = cursor.fetchone()[0] or 0
+            
+            # 按状态统计
+            cursor.execute(
+                f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
+                params
+            )
+            status_results = cursor.fetchall()
+            
+            # 确保所有状态都显示，即使数量为0
+            stats['status_dist'] = {0: 0, 1: 0, 2: 0}
+            for status, count in status_results:
+                if status in [0, 1, 2]:
+                    stats['status_dist'][status] = count
+            
+            # 难度统计
+            cursor.execute(
+                f"SELECT c.level, COUNT(*) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
+                params
+            )
+            stats['level_dist'] = dict(cursor.fetchall())
+            
+            # 创作者统计
+            cursor.execute(
+                f"SELECT c.creator_name, COUNT(*) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY COUNT(*) DESC LIMIT 10",
+                params
+            )
+            stats['top_creators'] = cursor.fetchall()
+            
+            # 热度统计
+            cursor.execute(
+                f"SELECT AVG(c.heat), MAX(c.heat), AVG(c.donate_count), MAX(c.donate_count) FROM charts c WHERE {where_clause}",
+                params
+            )
+            heat_stats = cursor.fetchone()
+            stats['heat_avg'], stats['heat_max'], stats['donate_avg'], stats['donate_max'] = heat_stats or (0, 0, 0, 0)
+            
+        except Exception as e:
+            print(colorize(f"获取统计信息时出错: {e}", Colors.RED))
+            # 返回空的统计字典
+            stats = {
+                'total_charts': 0,
+                'status_dist': {0: 0, 1: 0, 2: 0},
+                'level_dist': {},
+                'top_creators': [],
+                'heat_avg': 0,
+                'heat_max': 0,
+                'donate_avg': 0,
+                'donate_max': 0
+            }
+        
+        return stats
+
     def _display_chart_stats(self, stats, mode_str):
         """显示谱面统计信息"""
         print(colorize(f"\n谱面统计 - 模式 {mode_str}", Colors.CYAN))
@@ -2984,420 +2463,6 @@ class MalodyViz(cmd.Cmd):
         print(f"  最高热度: {stats['heat_max']}")
         print(f"  平均打赏: {stats['donate_avg']:.1f}")
         print(f"  最多打赏: {stats['donate_max']}")
-    
-    @db_safe_operation
-    def do_fix_status_query(self, arg):
-        """
-        修复状态查询问题
-        
-        用法: fix_status_query
-        """
-        cursor = self.conn.cursor()
-        
-        print(colorize("\n修复状态查询问题:", Colors.CYAN))
-        print(get_separator())
-        
-        # 首先，让我们手动执行一些查询来诊断问题
-        print("1. 手动查询状态分布:")
-        cursor.execute("SELECT status, COUNT(*) FROM charts GROUP BY status ORDER BY status")
-        manual_results = cursor.fetchall()
-        
-        status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
-        for status, count in manual_results:
-            status_name = status_names.get(status, f"未知({status})")
-            print(f"  状态 {status} ({status_name}): {count} 个谱面")
-        
-        # 检查是否有状态为1的记录
-        print(f"\n2. 检查状态为1的记录:")
-        cursor.execute("SELECT cid, version, creator_name FROM charts WHERE status = 1 LIMIT 10")
-        beta_records = cursor.fetchall()
-        
-        if beta_records:
-            print(f"  找到 {len(beta_records)} 个状态为1的记录:")
-            for cid, version, creator in beta_records:
-                print(f"    CID: {cid}, 版本: {version}, 创作者: {creator}")
-        else:
-            print("  没有找到状态为1的记录")
-        
-        # 检查特定CID
-        print(f"\n3. 检查特定CID 139970:")
-        cursor.execute("SELECT cid, status FROM charts WHERE cid = 139970")
-        specific_record = cursor.fetchone()
-        if specific_record:
-            cid, status = specific_record
-            status_name = status_names.get(status, f"未知({status})")
-            print(f"  CID {cid}: 状态 = {status} ({status_name})")
-        
-        # 修复索引问题
-        print(f"\n4. 修复数据库索引:")
-        try:
-            cursor.execute("REINDEX idx_charts_last_updated")
-            print("  已重新构建索引: idx_charts_last_updated")
-            
-            cursor.execute("REINDEX")
-            print("  已重新构建所有索引")
-            
-            # 再次检查完整性
-            cursor.execute("PRAGMA integrity_check")
-            integrity = cursor.fetchone()
-            print(f"  完整性检查: {integrity[0]}")
-            
-        except sqlite3.Error as e:
-            print(f"  索引修复失败: {e}")
-
-    @db_safe_operation
-    def do_debug_db_integrity(self, arg):
-        """
-        检查数据库完整性
-        
-        用法: debug_db_integrity
-        """
-        cursor = self.conn.cursor()
-        
-        print(colorize("\n数据库完整性检查:", Colors.CYAN))
-        print(get_separator())
-        
-        # 检查数据库文件路径
-        cursor.execute("PRAGMA database_list")
-        db_list = cursor.fetchall()
-        print("数据库文件:")
-        for db in db_list:
-            print(f"  序号: {db[0]}, 名称: {db[1]}, 文件: {db[2]}")
-        
-        # 检查charts表的结构
-        cursor.execute("PRAGMA table_info(charts)")
-        columns = cursor.fetchall()
-        print(f"\ncharts表结构:")
-        for col in columns:
-            print(f"  列名: {col[1]}, 类型: {col[2]}, 可空: {'是' if col[3] else '否'}")
-        
-        # 检查状态字段的实际值分布
-        print(f"\n状态字段实际值分布:")
-        cursor.execute("SELECT status, COUNT(*) FROM charts GROUP BY status ORDER BY status")
-        status_dist = cursor.fetchall()
-        
-        status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
-        for status, count in status_dist:
-            status_name = status_names.get(status, f"未知({status})")
-            print(f"  状态 {status} ({status_name}): {count} 个谱面")
-        
-        # 检查是否有任何状态为1的记录
-        print(f"\n状态为1的记录检查:")
-        cursor.execute("SELECT COUNT(*) FROM charts WHERE status = 1")
-        beta_count = cursor.fetchone()[0]
-        print(f"  状态为1的记录总数: {beta_count}")
-        
-        if beta_count > 0:
-            cursor.execute("SELECT cid, version, level, mode, creator_name FROM charts WHERE status = 1 LIMIT 10")
-            beta_records = cursor.fetchall()
-            print(f"  前{len(beta_records)}个状态为1的记录:")
-            for cid, version, level, mode, creator in beta_records:
-                mode_name = self.mode_names.get(mode, "未知")
-                print(f"    CID: {cid}, 版本: {version}, 难度: Lv.{level}, 模式: {mode}({mode_name}), 创作者: {creator}")
-        
-        # 检查特定CID的状态值
-        print(f"\n特定CID状态检查:")
-        test_cids = [139970]  # 您之前提到的CID
-        for cid in test_cids:
-            cursor.execute("SELECT cid, status FROM charts WHERE cid = ?", (cid,))
-            result = cursor.fetchone()
-            if result:
-                actual_cid, actual_status = result
-                status_name = status_names.get(actual_status, f"未知({actual_status})")
-                print(f"  CID {actual_cid}: 状态 = {actual_status} ({status_name})")
-            else:
-                print(f"  CID {cid}: 记录不存在")
-        
-        # 执行完整性检查
-        print(f"\n数据库完整性:")
-        cursor.execute("PRAGMA integrity_check")
-        integrity = cursor.fetchone()
-        print(f"  完整性检查: {integrity[0]}")
-        
-    @db_safe_operation
-    def do_debug_beta(self, arg):
-        """
-        专门调试状态为1（Beta）的谱面
-        
-        用法: debug_beta [谱师名]
-        参数:
-        谱师名 - 可选，要调试的谱师名称
-        
-        示例:
-        debug_beta          # 调试所有Beta谱面
-        debug_beta chuanyuan # 调试chuanyuan的Beta谱面
-        """
-        args = arg.split()
-        creator_name = args[0] if args else None
-        
-        cursor = self.conn.cursor()
-        
-        # 构建基础查询条件
-        where_clause, params = self.selector.build_chart_sql_where("c")
-        
-        # 强制添加状态为1（Beta）的条件
-        if where_clause != "1=1":
-            where_clause += " AND c.status = 1"
-        else:
-            where_clause = "c.status = 1"
-        
-        if creator_name:
-            where_clause += " AND c.creator_name LIKE ?"
-            params.append(f"%{creator_name}%")
-        
-        print(colorize("\nBeta谱面调试信息:", Colors.CYAN))
-        print(get_separator())
-        print(f"当前筛选条件: {self.selector.get_current_selection()}")
-        print(f"生成的WHERE子句: {where_clause}")
-        print(f"参数: {params}")
-        
-        # 查询所有Beta谱面
-        query = f"""
-        SELECT c.cid, c.version, c.level, c.mode, c.status, c.creator_name, c.heat
-        FROM charts c
-        WHERE {where_clause}
-        ORDER BY c.heat DESC
-        LIMIT 50
-        """
-        
-        try:
-            cursor.execute(query, params)
-            beta_charts = cursor.fetchall()
-            
-            status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
-            
-            if beta_charts:
-                print(f"\n找到 {len(beta_charts)} 个Beta谱面:")
-                for cid, version, level, mode, status, creator, heat in beta_charts:
-                    mode_name = self.mode_names.get(mode, "未知")
-                    status_name = status_names.get(status, f"未知({status})")
-                    print(f"  CID: {cid}, 版本: {version}, 难度: Lv.{level}, 模式: {mode}({mode_name}), 状态: {status}({status_name}), 创作者: {creator}, 热度: {heat}")
-            else:
-                print(colorize("没有找到任何Beta谱面", Colors.YELLOW))
-                
-                # 尝试查询所有状态为1的谱面，忽略其他筛选条件
-                print(colorize("\n尝试查询数据库中所有状态为1的谱面:", Colors.YELLOW))
-                all_beta_query = "SELECT cid, version, level, mode, status, creator_name FROM charts WHERE status = 1 LIMIT 20"
-                cursor.execute(all_beta_query)
-                all_beta = cursor.fetchall()
-                
-                if all_beta:
-                    print(f"数据库中总共有 {len(all_beta)} 个Beta谱面:")
-                    for cid, version, level, mode, status, creator in all_beta:
-                        mode_name = self.mode_names.get(mode, "未知")
-                        print(f"  CID: {cid}, 版本: {version}, 难度: Lv.{level}, 模式: {mode}({mode_name}), 创作者: {creator}")
-                else:
-                    print("数据库中没有任何状态为1的谱面")
-        
-        except sqlite3.Error as e:
-            print(colorize(f"数据库错误: {e}", Colors.RED))
-            print(f"有问题的SQL: {query}")
-
-    @db_safe_operation
-    def do_debug_status(self, arg):
-        """
-        调试状态筛选和统计
-        
-        用法: debug_status [谱师名]
-        参数:
-        谱师名 - 可选，要调试的谱师名称
-        
-        示例:
-        debug_status          # 调试当前筛选条件的状态
-        debug_status chuanyuan # 调试特定谱师的状态
-        """
-        args = arg.split()
-        creator_name = args[0] if args else None
-        
-        cursor = self.conn.cursor()
-        
-        # 构建查询条件
-        where_clause, params = self.selector.build_chart_sql_where("c")
-        
-        if creator_name:
-            # 如果指定了谱师，添加到筛选条件
-            if "c.creator_name LIKE" in where_clause:
-                # 替换现有的谱师条件
-                where_clause = re.sub(r'c\.creator_name LIKE \?', 'c.creator_name LIKE ?', where_clause)
-                # 找到并替换对应的参数
-                for i, param in enumerate(params):
-                    if isinstance(param, str) and '%' in param:
-                        params[i] = f"%{creator_name}%"
-                        break
-            else:
-                where_clause += " AND c.creator_name LIKE ?" if where_clause != "1=1" else "c.creator_name LIKE ?"
-                params.append(f"%{creator_name}%")
-        
-        print(colorize("\n状态调试信息:", Colors.CYAN))
-        print(get_separator())
-        print(f"当前筛选条件: {self.selector.get_current_selection()}")
-        print(f"生成的WHERE子句: {where_clause}")
-        print(f"参数: {params}")
-        
-        # 查询每个状态的详细统计
-        query = f"""
-        SELECT c.status, COUNT(*) as count, 
-            GROUP_CONCAT(c.cid || ':' || c.version || ' Lv.' || c.level) as chart_info
-        FROM charts c
-        WHERE {where_clause}
-        GROUP BY c.status
-        ORDER BY c.status
-        """
-        
-        try:
-            cursor.execute(query, params)
-            status_results = cursor.fetchall()
-            
-            print(f"\n状态详细统计:")
-            status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
-            for status, count, chart_info in status_results:
-                status_name = status_names.get(status, f"未知({status})")
-                print(f"\n{status_name}({status}): {count} 个谱面")
-                if chart_info:
-                    charts = chart_info.split(',')
-                    for i, chart in enumerate(charts[:5]):  # 只显示前5个
-                        print(f"  {chart}")
-                    if len(charts) > 5:
-                        print(f"  ... 还有 {len(charts) - 5} 个谱面")
-            
-            # 如果没有找到任何状态，显示所有谱面
-            if not status_results:
-                print(colorize("没有找到任何谱面", Colors.YELLOW))
-                # 查询所有谱面看看
-                all_query = f"SELECT cid, version, level, status, creator_name FROM charts c WHERE {where_clause} LIMIT 10"
-                cursor.execute(all_query, params)
-                all_charts = cursor.fetchall()
-                if all_charts:
-                    print(f"\n前10个谱面:")
-                    for cid, version, level, status, creator in all_charts:
-                        status_name = status_names.get(status, f"未知({status})")
-                        print(f"  CID: {cid}, 版本: {version}, 难度: Lv.{level}, 状态: {status_name}, 创作者: {creator}")
-        
-        except sqlite3.Error as e:
-            print(colorize(f"数据库错误: {e}", Colors.RED))
-            print(f"有问题的SQL: {query}")
-
-    @db_safe_operation
-    def do_debug_cid(self, arg):
-        """
-        调试特定CID的记录
-        
-        用法: debug_cid <CID>
-        参数:
-        CID - 要调试的谱面CID
-        
-        示例:
-        debug_cid 139970
-        """
-        if not arg:
-            print(colorize("错误: 请输入CID", Colors.RED))
-            return
-        
-        cid = arg.strip()
-        cursor = self.conn.cursor()
-        
-        # 查询特定CID的详细信息
-        query = """
-        SELECT c.cid, c.sid, s.title, c.version, c.level, c.mode, c.status, 
-            c.creator_name, c.heat, c.donate_count, c.last_updated
-        FROM charts c
-        JOIN songs s ON c.sid = s.sid
-        WHERE c.cid = ?
-        """
-        
-        cursor.execute(query, (cid,))
-        result = cursor.fetchone()
-        
-        print(colorize(f"\nCID {cid} 的详细信息:", Colors.CYAN))
-        print(get_separator())
-        
-        if result:
-            cid, sid, title, version, level, mode, status, creator, heat, donate, updated = result
-            mode_name = self.mode_names.get(mode, "未知")
-            status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, f"未知({status})")
-            
-            print(f"CID: {cid}")
-            print(f"SID: {sid}")
-            print(f"标题: {title}")
-            print(f"版本: {version}")
-            print(f"难度: Lv.{level}")
-            print(f"模式: {mode} ({mode_name})")
-            print(f"状态: {status} ({status_name})")
-            print(f"创作者: {creator}")
-            print(f"热度: {heat}")
-            print(f"打赏: {donate}")
-            print(f"最后更新: {updated}")
-            
-            # 检查这条记录是否会被当前筛选条件选中
-            where_clause, params = self.selector.build_chart_sql_where("c")
-            check_query = f"SELECT COUNT(*) FROM charts c WHERE c.cid = ? AND ({where_clause})"
-            check_params = [cid] + params
-            
-            cursor.execute(check_query, check_params)
-            match_count = cursor.fetchone()[0]
-            
-            print(f"\n当前筛选条件匹配: {'是' if match_count > 0 else '否'}")
-            print(f"当前筛选条件: {self.selector.get_current_selection()}")
-            print(f"筛选SQL: {where_clause}")
-            print(f"筛选参数: {params}")
-        else:
-            print(colorize(f"未找到CID为 {cid} 的谱面", Colors.RED))
-
-    @db_safe_operation
-    def do_debug_status_values(self, arg):
-        """
-        调试数据库中所有可能的状态值
-        
-        用法: debug_status_values
-        """
-        cursor = self.conn.cursor()
-        
-        print(colorize("\n数据库中所有状态值:", Colors.CYAN))
-        print(get_separator())
-        
-        # 查询所有不同的状态值
-        cursor.execute("SELECT DISTINCT status, COUNT(*) FROM charts GROUP BY status ORDER BY status")
-        status_results = cursor.fetchall()
-        
-        status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
-        for status, count in status_results:
-            status_name = status_names.get(status, f"未知({status})")
-            print(f"状态 {status} ({status_name}): {count} 个谱面")
-        
-        # 查询特定创作者的每个状态的数量
-        print(colorize(f"\nchuanyuan 的状态分布:", Colors.CYAN))
-        print(get_separator())
-        
-        cursor.execute("""
-        SELECT status, COUNT(*) 
-        FROM charts 
-        WHERE creator_name LIKE '%chuanyuan%' 
-        GROUP BY status 
-        ORDER BY status
-        """)
-        chuanyuan_status = cursor.fetchall()
-        
-        for status, count in chuanyuan_status:
-            status_name = status_names.get(status, f"未知({status})")
-            print(f"状态 {status} ({status_name}): {count} 个谱面")
-        
-        # 查询所有状态为1（Beta）的chuanyuan谱面
-        print(colorize(f"\nchuanyuan 的状态为1（Beta）的谱面:", Colors.CYAN))
-        print(get_separator())
-        
-        cursor.execute("""
-        SELECT cid, version, level, mode, status, creator_name
-        FROM charts 
-        WHERE creator_name LIKE '%chuanyuan%' AND status = 1
-        """)
-        beta_charts = cursor.fetchall()
-        
-        if beta_charts:
-            for cid, version, level, mode, status, creator in beta_charts:
-                mode_name = self.mode_names.get(mode, "未知")
-                print(f"CID: {cid}, 版本: {version}, 难度: Lv.{level}, 模式: {mode}({mode_name}), 状态: {status}, 创作者: {creator}")
-        else:
-            print("没有找到状态为1（Beta）的chuanyuan谱面")
 
     @db_safe_operation
     def do_stb_pie(self, arg):
@@ -3615,7 +2680,7 @@ class MalodyViz(cmd.Cmd):
         
         query = f"""
         SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
-            c.creator_name, c.heat, c.last_updated, c.crawl_time
+            c.creator_name, c.stabled_by_name, c.heat, c.donate_count, c.play_count, c.last_updated, c.crawl_time
         FROM charts c
         JOIN songs s ON c.sid = s.sid
         WHERE {where_clause}
@@ -3644,13 +2709,14 @@ class MalodyViz(cmd.Cmd):
         print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
-        for cid, version, level, status, title, artist, creator, heat, last_updated, crawl_time in results:
+        for cid, version, level, status, title, artist, creator, stabled, heat, donate, play, last_updated, crawl_time in results:
             status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, "Unknown")
             days_ago = (datetime.now() - last_updated).days if last_updated else "未知"
             
             print(f"{colorize(title, Colors.BOLD)} - {artist}")
             print(f"  版本: {version}, 难度: Lv.{level}, 状态: {status_name}")
-            print(f"  创作者: {creator}, 热度: {heat}")
+            print(f"  创作者: {creator}, 稳定者: {stabled if stabled else 'N/A'}")
+            print(f"  热度: {heat}, 打赏: {donate}, 游玩: {play}")
             print(f"  最后更新: {last_updated} ({days_ago}天前), CID: {cid}")
             print()
     
@@ -3660,10 +2726,7 @@ class MalodyViz(cmd.Cmd):
         显示热门谱面排行榜（支持选择器筛选）
         
         用法: stb_hot [模式] [排序字段] [数量]
-        参数:
-        模式     - 可选，模式编号，默认为当前模式
-        排序字段 - 可选，heat(热度), donate_count(打赏数), 默认为heat
-        数量     - 可选，要显示的谱面数量，默认为10
+        排序字段: heat(热度), donate_count(打赏数), play_count(游玩次数)
         
         示例:
         stb_hot           # 当前模式按热度前10
@@ -3693,8 +2756,7 @@ class MalodyViz(cmd.Cmd):
                 print(colorize("错误: 参数必须是数字", Colors.RED))
                 return
         
-        # 验证排序字段
-        valid_fields = ["heat", "donate_count"]
+        valid_fields = ["heat", "donate_count", "play_count"]
         if sort_field not in valid_fields:
             print(colorize(f"错误: 排序字段必须是 {valid_fields} 之一", Colors.RED))
             return
@@ -3711,7 +2773,7 @@ class MalodyViz(cmd.Cmd):
         
         query = f"""
         SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
-            c.creator_name, c.heat, c.donate_count, c.last_updated
+            c.creator_name, c.stabled_by_name, c.heat, c.donate_count, c.play_count, c.last_updated
         FROM charts c
         JOIN songs s ON c.sid = s.sid
         WHERE {where_clause}
@@ -3735,19 +2797,20 @@ class MalodyViz(cmd.Cmd):
         else:
             mode_str = "所有模式"
         
-        field_name = "热度" if sort_field == "heat" else "打赏数"
+        field_name = {"heat":"热度", "donate_count":"打赏数", "play_count":"游玩次数"}.get(sort_field, sort_field)
         print(colorize(f"\n热门谱面排行榜 ({field_name})", Colors.CYAN))
         print(colorize(f"模式: {mode_str}", Colors.YELLOW))
         print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         print(get_separator())
         
-        for i, (cid, version, level, status, title, artist, creator, heat, donate, updated) in enumerate(results, 1):
+        for i, (cid, version, level, status, title, artist, creator, stabled, heat, donate, play, updated) in enumerate(results, 1):
             status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, "Unknown")
-            value = heat if sort_field == "heat" else donate
+            value = heat if sort_field=="heat" else donate if sort_field=="donate_count" else play
             
             print(f"{colorize(f'#{i}', Colors.YELLOW)} {colorize(title, Colors.BOLD)} - {artist}")
             print(f"  难度: Lv.{level}, 状态: {status_name}, 版本: {version}")
-            print(f"  创作者: {creator}, {field_name}: {value}, CID: {cid}")
+            print(f"  创作者: {creator}, 稳定者: {stabled if stabled else 'N/A'}, {field_name}: {value}")
+            print(f"  热度: {heat}, 打赏: {donate}, 游玩: {play}, CID: {cid}")
             print()
     
     @db_safe_operation
@@ -3824,15 +2887,14 @@ class MalodyViz(cmd.Cmd):
         
         # 热度统计
         cursor.execute(
-            f"SELECT AVG(c.heat), MAX(c.heat), MIN(c.heat), STDDEV(c.heat) FROM charts c WHERE {where_clause} AND c.heat > 0",
+            f"SELECT AVG(c.heat), MAX(c.heat), MIN(c.heat) FROM charts c WHERE {where_clause} AND c.heat > 0",
             params
         )
         heat_stats = cursor.fetchone()
         stats['heat_stats'] = {
             'avg': heat_stats[0] or 0,
             'max': heat_stats[1] or 0,
-            'min': heat_stats[2] or 0,
-            'std': heat_stats[3] or 0
+            'min': heat_stats[2] or 0
         }
         
         # 难度统计
@@ -3927,8 +2989,8 @@ class MalodyViz(cmd.Cmd):
         print(f"  平均热度: {heat['avg']:.1f}")
         print(f"  最高热度: {heat['max']}")
         print(f"  最低热度: {heat['min']}")
-        if heat['std'] > 0:
-            print(f"  热度标准差: {heat['std']:.1f}")
+        # if heat['std'] > 0:
+        #     print(f"  热度标准差: {heat['std']:.1f}")
         
         # 难度统计
         if stats['level_stats']['avg'] > 0:
@@ -4145,32 +3207,33 @@ class MalodyViz(cmd.Cmd):
         """
         分析谱面数据趋势（支持选择器筛选）
         
-        用法: stb_trends [模式] [时间段]
-        参数:
-        模式 - 可选，模式编号，默认为当前模式
-        时间段 - 可选，days(天), months(月), 默认为months
+        用法: stb_trends [模式] [时间段] [--by 分组维度]
+        时间段: days(日), months(月), 默认为months
+        分组维度: mode(按模式), creator(按创作者), status(按状态)
         
         示例:
         stb_trends           # 当前模式月度趋势
         stb_trends 0 days    # 模式0每日趋势
+        stb_trends 0 months --by creator   # 按创作者分组月度趋势
         """
         args = arg.split()
         mode = self.current_mode
         period = "months"
+        group_by = None
         
-        if args:
-            try:
-                if args[0].isdigit():
-                    mode = int(args[0])
-                    if len(args) > 1:
-                        period = args[1].lower()
-                else:
-                    period = args[0].lower()
-                    if len(args) > 1 and args[1].isdigit():
-                        mode = int(args[1])
-            except ValueError:
-                print(colorize("错误: 模式必须是数字", Colors.RED))
-                return
+        i = 0
+        while i < len(args):
+            if args[i] in ["days", "months"]:
+                period = args[i]
+                i += 1
+            elif args[i] == "--by" and i+1 < len(args):
+                group_by = args[i+1].lower()
+                i += 2
+            elif args[i].isdigit():
+                mode = int(args[i])
+                i += 1
+            else:
+                i += 1
         
         cursor = self.conn.cursor()
         
@@ -4193,37 +3256,48 @@ class MalodyViz(cmd.Cmd):
             
             # 添加时间范围条件
             if period == "days":
-                # 每日趋势（最近30天）
                 time_condition = "c.last_updated >= date('now', '-30 days')"
-                group_by = "DATE(c.last_updated)"
+                group_by_time = "DATE(c.last_updated)"
                 order_by = "DATE(c.last_updated)"
                 period_name = "每日"
                 x_label = "日期"
             else:
-                # 月度趋势（最近12个月）
                 time_condition = "c.last_updated >= date('now', '-1 year')"
-                group_by = "strftime('%Y-%m', c.last_updated)"
+                group_by_time = "strftime('%Y-%m', c.last_updated)"
                 order_by = "strftime('%Y-%m', c.last_updated)"
                 period_name = "月度"
                 x_label = "月份"
             
-            # 正确拼接时间条件
             if where_clause != "1=1":
                 where_clause += f" AND {time_condition}"
             else:
                 where_clause = time_condition
             
+            # 构建分组查询
+            if group_by == "mode":
+                group_col = f"{group_by_time}, c.mode"
+                select_cols = f"{group_by_time} as period, c.mode, COUNT(*) as count"
+                title_suffix = "按模式分组"
+            elif group_by == "creator":
+                group_col = f"{group_by_time}, c.creator_name"
+                select_cols = f"{group_by_time} as period, c.creator_name, COUNT(*) as count"
+                title_suffix = "按创作者分组"
+            elif group_by == "status":
+                group_col = f"{group_by_time}, c.status"
+                select_cols = f"{group_by_time} as period, c.status, COUNT(*) as count"
+                title_suffix = "按状态分组"
+            else:
+                group_col = group_by_time
+                select_cols = f"{group_by_time} as period, COUNT(*) as count"
+                title_suffix = ""
+            
             query = f"""
-            SELECT {group_by}, COUNT(*) 
-            FROM charts c 
-            WHERE {where_clause} 
-            GROUP BY {group_by} 
+            SELECT {select_cols}
+            FROM charts c
+            WHERE {where_clause}
+            GROUP BY {group_col}
             ORDER BY {order_by}
             """
-            
-            # 调试信息（可选）
-            # print(f"DEBUG: Query: {query}")
-            # print(f"DEBUG: Params: {params}")
             
             cursor.execute(query, params)
             trend_data = cursor.fetchall()
@@ -4232,67 +3306,73 @@ class MalodyViz(cmd.Cmd):
                 print(colorize(f"没有找到趋势数据", Colors.YELLOW))
                 return
             
-            dates = [item[0] for item in trend_data]
-            counts = [item[1] for item in trend_data]
-            
-            # 显示趋势统计
             mode_name = self.mode_names.get(mode, "未知")
-            print(colorize(f"\n谱面{period_name}趋势", Colors.CYAN))
+            print(colorize(f"\n谱面{period_name}趋势 {title_suffix}", Colors.CYAN))
             print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             print(get_separator())
             
-            total_updates = sum(counts)
-            avg_updates = total_updates / len(counts) if counts else 0
-            max_updates = max(counts) if counts else 0
-            min_updates = min(counts) if counts else 0
+            if group_by is None:
+                # 简单趋势
+                dates = [row[0] for row in trend_data]
+                counts = [row[1] for row in trend_data]
+                total_updates = sum(counts)
+                avg_updates = total_updates / len(counts) if counts else 0
+                max_updates = max(counts) if counts else 0
+                min_updates = min(counts) if counts else 0
+                
+                print(f"总更新谱面: {total_updates}")
+                print(f"平均{period_name}更新: {avg_updates:.1f}")
+                print(f"最高{period_name}更新: {max_updates}")
+                print(f"最低{period_name}更新: {min_updates}")
+                
+                print(colorize(f"\n{period_name}详细数据:", Colors.BOLD))
+                for date, count in trend_data[-10:]:
+                    print(f"  {date}: {count} 个谱面")
+                
+                # 生成图表
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.plot(dates, counts, 'o-', linewidth=2, markersize=6, color='#2196F3')
+                ax.fill_between(dates, counts, alpha=0.3, color='#2196F3')
+                ax.axhline(y=avg_updates, color='red', linestyle='--', alpha=0.7, label=f'平均值: {avg_updates:.1f}')
+                ax.set_title(f'谱面{period_name}更新趋势\n筛选条件: {self.selector.get_current_selection()}')
+                ax.set_xlabel(x_label)
+                ax.set_ylabel('更新谱面数量')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                
+                base_filename = f"stb_trends_{period}_mode{mode}.png"
+                filename = self.get_unique_filename(base_filename, "png")
+                filepath = os.path.join(self.output_dir, filename)
+                plt.savefig(filepath, dpi=150, facecolor='white')
+                plt.close()
+                print(colorize(f"\n已生成趋势图表: {filepath}", Colors.GREEN))
             
-            print(f"总更新谱面: {total_updates}")
-            print(f"平均{period_name}更新: {avg_updates:.1f}")
-            print(f"最高{period_name}更新: {max_updates}")
-            print(f"最低{period_name}更新: {min_updates}")
-            
-            # 显示趋势数据
-            print(colorize(f"\n{period_name}详细数据:", Colors.BOLD))
-            for date, count in trend_data[-10:]:  # 显示最近10个周期
-                print(f"  {date}: {count} 个谱面")
-            
-            # 生成趋势图表
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            # 创建趋势线
-            ax.plot(dates, counts, 'o-', linewidth=2, markersize=6, color='#2196F3')
-            ax.fill_between(dates, counts, alpha=0.3, color='#2196F3')
-            
-            # 添加平均线
-            ax.axhline(y=avg_updates, color='red', linestyle='--', alpha=0.7, label=f'平均值: {avg_updates:.1f}')
-            
-            ax.set_title(f'谱面{period_name}更新趋势\n筛选条件: {self.selector.get_current_selection()}')
-            ax.set_xlabel(x_label)
-            ax.set_ylabel('更新谱面数量')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # 旋转x轴标签
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            
-            # 保存图表
-            base_filename = f"stb_trends_{period}_mode{mode}.png"
-            filename = self.get_unique_filename(base_filename, "png")
-            filepath = os.path.join(self.output_dir, filename)
-            plt.savefig(filepath, dpi=150, facecolor='white')
-            plt.close()
-            
-            print(colorize(f"\n已生成趋势图表: {filepath}", Colors.GREEN))
+            else:
+                # 分组趋势：简单打印表格
+                print(colorize(f"\n分组趋势数据 (前20行):", Colors.BOLD))
+                for row in trend_data[:20]:
+                    if group_by == "mode":
+                        period, m, cnt = row
+                        mode_name_g = self.mode_names.get(m, "未知")
+                        print(f"  {period} 模式 {m}({mode_name_g}): {cnt}")
+                    elif group_by == "creator":
+                        period, creator, cnt = row
+                        print(f"  {period} {creator}: {cnt}")
+                    elif group_by == "status":
+                        period, status, cnt = row
+                        status_name = {0:"Alpha",1:"Beta",2:"Stable"}.get(status, "未知")
+                        print(f"  {period} {status_name}: {cnt}")
+                
+                # 可以选择生成堆叠柱状图，这里省略
+                print(colorize("\n详细图表生成暂不支持分组趋势", Colors.YELLOW))
             
         except sqlite3.Error as e:
             print(colorize(f"数据库错误: {e}", Colors.RED))
-            # 打印调试信息以帮助诊断问题
-            print(colorize(f"SQL: {query}", Colors.YELLOW))
-            print(colorize(f"参数: {params}", Colors.YELLOW))
         except Exception as e:
             print(colorize(f"操作错误: {e}", Colors.RED))
-        
+    
     @db_safe_operation
     def do_stb_compare(self, arg):
         """
@@ -4430,51 +3510,830 @@ class MalodyViz(cmd.Cmd):
         plt.close()
         
         print(colorize(f"\n已生成模式比较图表: {filepath}", Colors.GREEN))
+    
+    @db_safe_operation
+    def do_stb_stabled_by(self, arg):
+        """
+        查询玩家作为稳定者的谱面统计（支持选择器筛选）
+        
+        用法: stb_stabled_by <玩家名> [模式] [数量]
+        参数:
+        玩家名 - 作为稳定者的玩家名称
+        模式   - 可选，模式编号，默认为当前模式
+        数量   - 可选，要显示的谱面数量，默认为20
+        
+        示例:
+        stb_stabled_by chuanyuan        # 查询chuanyuan作为稳定者的谱面
+        stb_stabled_by chuanyuan 0 10   # 模式0前10个
+        """
+        args = arg.split()
+        if not args:
+            print(colorize("错误: 请输入玩家名", Colors.RED))
+            return
+        
+        player_name = args[0]
+        mode = self.current_mode
+        limit = 20
+        
+        if len(args) > 1:
+            try:
+                mode = int(args[1])
+                if len(args) > 2:
+                    limit = int(args[2])
+            except ValueError:
+                print(colorize("错误: 请输入有效的数字", Colors.RED))
+                return
+        
+        cursor = self.conn.cursor()
+        
+        # 构建查询条件：稳定者名称匹配
+        where_conditions = ["c.stabled_by_name LIKE ?"]
+        params = [f"%{player_name}%"]
+        
+        if mode != -1:
+            where_conditions.append("c.mode = ?")
+            params.append(mode)
+        
+        # 应用选择器的其他筛选（如难度、时间等）
+        selector_where, selector_params = self.selector.build_chart_sql_where("c")
+        if selector_where != "1=1":
+            where_conditions.append(f"({selector_where})")
+            params.extend(selector_params)
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        query = f"""
+        SELECT c.cid, s.title, s.artist, c.version, c.level, c.mode, c.status,
+               c.heat, c.donate_count, c.play_count, c.last_updated
+        FROM charts c
+        JOIN songs s ON c.sid = s.sid
+        WHERE {where_clause}
+        ORDER BY c.heat DESC
+        LIMIT ?
+        """
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        results = cursor.fetchall()
+        
+        if not results:
+            print(colorize(f"\n没有找到 {player_name} 作为稳定者的谱面", Colors.YELLOW))
+            return
+        
+        print(colorize(f"\n{player_name} 作为稳定者的谱面", Colors.CYAN))
+        print(colorize(f"模式: {mode if mode!=-1 else '所有'}", Colors.YELLOW))
+        print(get_separator())
+        
+        for cid, title, artist, version, level, m, status, heat, donate, play, updated in results:
+            status_name = {0:"Alpha",1:"Beta",2:"Stable"}.get(status, "Unknown")
+            mode_name = self.mode_names.get(m, "未知")
+            print(f"{title} - {artist}")
+            print(f"  CID:{cid} 模式:{m}({mode_name}) 难度:Lv.{level} 状态:{status_name}")
+            print(f"  热度:{heat} 打赏:{donate} 游玩:{play}")
+            print()
+        
+        print(get_separator())
+        
+        # 统计信息
+        total = len(results)
+        modes_dist = {}
+        status_dist = {}
+        for row in results:
+            m = row[5]
+            modes_dist[m] = modes_dist.get(m, 0) + 1
+            status = row[6]
+            status_dist[status] = status_dist.get(status, 0) + 1
+        
+        print(f"总计: {total} 个谱面")
+        print("模式分布:", ", ".join([f"{self.mode_names.get(m,'未知')}:{c}" for m,c in modes_dist.items()]))
+        print("状态分布:", ", ".join([f"{['Alpha','Beta','Stable'][s]}:{c}" for s,c in status_dist.items()]))
+        
+        # 生成图表
+        chart_choice = input(colorize("\n是否生成统计图表? (y/N): ", Colors.CYAN)).lower()
+        if chart_choice == 'y':
+            self._generate_stabled_by_chart(results, player_name, f"模式 {mode if mode!=-1 else '所有'}", total)
 
-
-    def _generate_comparison_chart(self, comparison_data):
-        """生成模式比较图表"""
-        modes = [f"{d['mode']}\n({d['name']})" for d in comparison_data]
-        total_charts = [d['total_charts'] for d in comparison_data]
-        unique_creators = [d['unique_creators'] for d in comparison_data]
+    def _generate_stabled_by_chart(self, results, player_name, mode_str, total_count):
+        """生成稳定者统计图表"""
+        if not results:
+            return
         
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        titles = [row[1] for row in results]
+        heats = [row[7] or 0 for row in results]
+        levels = [row[4] for row in results]
         
-        # 左侧：总谱面数比较
-        bars1 = ax1.bar(modes, total_charts, color='lightblue', alpha=0.7)
-        ax1.set_title('各模式总谱面数比较')
-        ax1.set_ylabel('谱面数量')
-        ax1.tick_params(axis='x', rotation=45)
+        # 截断过长的标题
+        display_titles = [t[:17]+"..." if len(t)>20 else t for t in titles]
         
-        # 添加数值标签
-        for bar in bars1:
-            height = bar.get_height()
-            ax1.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                    f'{int(height)}', ha='center', va='bottom')
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+        fig.suptitle(f'{player_name} 作为稳定者的谱面统计\n模式: {mode_str} | 总谱面数: {total_count}', 
+                    fontsize=14, fontweight='bold')
         
-        # 右侧：创作者数比较
-        bars2 = ax2.bar(modes, unique_creators, color='lightgreen', alpha=0.7)
-        ax2.set_title('各模式创作者数比较')
-        ax2.set_ylabel('创作者数量')
-        ax2.tick_params(axis='x', rotation=45)
+        # 左侧：热度分布柱状图
+        y_pos = range(len(display_titles))
+        bars = ax1.barh(y_pos, heats, color='lightcoral', alpha=0.7)
+        ax1.set_yticks(y_pos)
+        ax1.set_yticklabels(display_titles)
+        ax1.set_xlabel('热度')
+        ax1.set_title('谱面热度分布')
         
-        # 添加数值标签
-        for bar in bars2:
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                    f'{int(height)}', ha='center', va='bottom')
+        for bar, heat in zip(bars, heats):
+            width = bar.get_width()
+            ax1.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
+                    f'{heat}', ha='left', va='center', fontsize=9)
+        
+        # 右侧：难度分布饼图
+        level_counts = {}
+        for level in levels:
+            if level:
+                level_counts[level] = level_counts.get(level, 0) + 1
+        
+        if level_counts:
+            level_labels = [f'Lv.{lvl}' for lvl in level_counts.keys()]
+            level_values = list(level_counts.values())
+            colors = plt.cm.Set3(np.linspace(0, 1, len(level_labels)))
+            wedges, texts, autotexts = ax2.pie(level_values, labels=level_labels, autopct='%1.1f%%',
+                                            colors=colors, startangle=90)
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontweight('bold')
+            ax2.set_title('难度分布')
+        else:
+            ax2.text(0.5, 0.5, '无难度数据', ha='center', va='center', transform=ax2.transAxes)
+            ax2.set_title('难度分布')
         
         plt.tight_layout()
         
-        # 保存图表
-        base_filename = "stb_mode_comparison.png"
+        safe_name = re.sub(r'[^\w]', '_', player_name)
+        filename = self.get_unique_filename(f"stabled_by_{safe_name}.png", "png")
+        filepath = os.path.join(self.output_dir, filename)
+        plt.savefig(filepath, dpi=150, facecolor='white', bbox_inches='tight')
+        plt.close()
+        
+        print(colorize(f"\n已生成稳定者统计图表: {filepath}", Colors.GREEN))
+
+    @db_safe_operation
+    def do_stb_top_stabilizers(self, arg):
+        """
+        显示顶级稳定者排行榜（审核上架谱面最多的玩家）
+        
+        用法: stb_top_stabilizers [模式] [数量]
+        参数:
+        模式 - 可选，模式编号，默认为所有模式
+        数量 - 可选，要显示的稳定者数量，默认为20
+        
+        示例:
+        stb_top_stabilizers        # 所有模式的顶级稳定者
+        stb_top_stabilizers 0 10   # 模式0前10名稳定者
+        """
+        args = arg.split()
+        mode = -1  # 默认所有模式
+        limit = 20
+        
+        if args:
+            try:
+                mode = int(args[0])
+                if mode not in self.mode_names:
+                    print(colorize("错误: 无效的模式编号", Colors.RED))
+                    return
+                if len(args) > 1:
+                    limit = int(args[1])
+            except ValueError:
+                print(colorize("错误: 请输入有效的数字", Colors.RED))
+                return
+        
+        if limit <= 0:
+            print(colorize("错误: 数量必须大于0", Colors.RED))
+            return
+        
+        cursor = self.conn.cursor()
+        
+        try:
+            # 构建查询条件
+            where_conditions = ["c.stabled_by_name IS NOT NULL", "c.status = 2"]
+            params = []
+            
+            # 模式筛选
+            if mode != -1:
+                where_conditions.append("c.mode = ?")
+                params.append(mode)
+            
+            where_clause = " AND ".join(where_conditions)
+            
+            query = f"""
+            SELECT 
+                c.stabled_by_name,
+                COUNT(*) as stable_count,
+                AVG(c.heat) as avg_heat,
+                MAX(c.heat) as max_heat,
+                MIN(c.last_updated) as first_stable,
+                MAX(c.last_updated) as last_stable
+            FROM charts c
+            WHERE {where_clause}
+            GROUP BY c.stabled_by_name
+            ORDER BY stable_count DESC, avg_heat DESC
+            LIMIT ?
+            """
+            params.append(limit)
+            
+            cursor.execute(query, params)
+            results = cursor.fetchall()
+            
+            if not results:
+                mode_str = "所有模式" if mode == -1 else f"模式 {mode}"
+                print(colorize(f"\n在{mode_str}中没有找到稳定者数据", Colors.YELLOW))
+                return
+            
+            # 显示结果
+            mode_str = "所有模式" if mode == -1 else f"模式 {mode} ({self.mode_names.get(mode, '未知')})"
+            
+            print(colorize(f"\n顶级稳定者排行榜", Colors.CYAN))
+            print(colorize(f"模式: {mode_str}", Colors.YELLOW))
+            print(get_separator())
+            
+            # 显示表头
+            header_format = "{:<4} {:<20} {:<10} {:<10} {:<10} {:<12} {:<12}"
+            print(colorize(header_format.format(
+                "排名", "稳定者", "稳定谱面", "平均热度", "最高热度", "首次稳定", "最后稳定"
+            ), Colors.BOLD))
+            print(get_separator())
+            
+            # 显示数据
+            for i, (stabilizer, count, avg_heat, max_heat, first_stable, last_stable) in enumerate(results, 1):
+                # 处理过长的稳定者名
+                display_stabilizer = stabilizer if len(stabilizer) <= 20 else stabilizer[:17] + "..."
+                
+                # 格式化日期
+                def format_date(date_value):
+                    if not date_value:
+                        return "未知"
+                    if isinstance(date_value, datetime):
+                        return date_value.strftime('%Y-%m-%d')
+                    elif isinstance(date_value, str):
+                        return date_value[:10] if len(date_value) >= 10 else date_value
+                    else:
+                        return str(date_value)
+                
+                first_date = format_date(first_stable)
+                last_date = format_date(last_stable)
+                
+                print(header_format.format(
+                    f"#{i}",
+                    display_stabilizer,
+                    count,
+                    f"{avg_heat:.1f}" if avg_heat else "N/A",
+                    f"{max_heat:.0f}" if max_heat else "N/A",
+                    first_date,
+                    last_date
+                ))
+            
+            print(get_separator())
+            
+            # 显示统计信息
+            if results:
+                total_stable = sum(row[1] for row in results)
+                avg_stable = total_stable / len(results)
+                max_stable = max(row[1] for row in results)
+                
+                print(colorize(f"\n统计信息:", Colors.BOLD))
+                print(f"  总稳定谱面数: {total_stable}")
+                print(f"  平均每人稳定谱面: {avg_stable:.1f}")
+                print(f"  最高稳定谱面数: {max_stable}")
+                
+                # 生成图表的选项
+                chart_choice = input(colorize("\n是否生成统计图表? (y/N): ", Colors.CYAN)).lower()
+                if chart_choice == 'y':
+                    self._generate_top_stabilizers_chart(results, mode_str)
+                    
+        except sqlite3.Error as e:
+            print(colorize(f"数据库错误: {e}", Colors.RED))
+        except Exception as e:
+            print(colorize(f"操作错误: {e}", Colors.RED))
+
+    def _generate_top_stabilizers_chart(self, results, mode_str):
+        """生成顶级稳定者统计图表"""
+        if not results:
+            return
+        
+        stabilizers = [row[0] for row in results]
+        counts = [row[1] for row in results]
+        avg_heats = [row[2] if row[2] else 0 for row in results]
+        max_heats = [row[3] if row[3] else 0 for row in results]
+        
+        # 截断过长的稳定者名
+        display_stabilizers = [s[:12]+"..." if len(s)>15 else s for s in stabilizers]
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 12))
+        fig.suptitle(f'顶级稳定者统计\n模式: {mode_str}', fontsize=16, fontweight='bold')
+        
+        # 左上：稳定谱面数量柱状图
+        y_pos = range(len(display_stabilizers))
+        bars = ax1.barh(y_pos, counts, color='lightgreen', alpha=0.7)
+        ax1.set_yticks(y_pos)
+        ax1.set_yticklabels(display_stabilizers)
+        ax1.set_xlabel('稳定谱面数量')
+        ax1.set_title('稳定谱面数量排行')
+        
+        for bar, count in zip(bars, counts):
+            width = bar.get_width()
+            ax1.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
+                    f'{count}', ha='left', va='center', fontsize=9)
+        
+        # 右上：平均热度柱状图
+        bars2 = ax2.barh(y_pos, avg_heats, color='lightcoral', alpha=0.7)
+        ax2.set_yticks(y_pos)
+        ax2.set_yticklabels(display_stabilizers)
+        ax2.set_xlabel('平均热度')
+        ax2.set_title('稳定谱面平均热度')
+        
+        for bar, heat in zip(bars2, avg_heats):
+            width = bar.get_width()
+            ax2.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
+                    f'{heat:.1f}', ha='left', va='center', fontsize=9)
+        
+        # 左下：最高热度柱状图
+        bars3 = ax3.barh(y_pos, max_heats, color='gold', alpha=0.7)
+        ax3.set_yticks(y_pos)
+        ax3.set_yticklabels(display_stabilizers)
+        ax3.set_xlabel('最高热度')
+        ax3.set_title('稳定谱面最高热度')
+        
+        for bar, heat in zip(bars3, max_heats):
+            width = bar.get_width()
+            ax3.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
+                    f'{heat:.0f}', ha='left', va='center', fontsize=9)
+        
+        # 右下：散点图 - 稳定谱面数量 vs 平均热度
+        scatter = ax4.scatter(counts, avg_heats, s=100, c=max_heats, 
+                            cmap='viridis', alpha=0.7)
+        ax4.set_xlabel('稳定谱面数量')
+        ax4.set_ylabel('平均热度')
+        ax4.set_title('稳定谱面数量 vs 平均热度 (颜色表示最高热度)')
+        ax4.grid(True, alpha=0.3)
+        
+        for i, (stabilizer, count, heat) in enumerate(zip(display_stabilizers, counts, avg_heats)):
+            ax4.annotate(stabilizer, (count, heat), xytext=(5, 5), 
+                        textcoords='offset points', fontsize=8, alpha=0.7)
+        
+        cbar = plt.colorbar(scatter, ax=ax4)
+        cbar.set_label('最高热度')
+        
+        plt.tight_layout()
+        
+        base_filename = "stb_top_stabilizers.png"
         filename = self.get_unique_filename(base_filename, "png")
+        filepath = os.path.join(self.output_dir, filename)
+        plt.savefig(filepath, dpi=150, facecolor='white', bbox_inches='tight')
+        plt.close()
+        
+        print(colorize(f"\n已生成顶级稳定者统计图表: {filepath}", Colors.GREEN))
+
+    @db_safe_operation
+    def do_stb_creator_details(self, arg):
+        """
+        查看指定创作者的所有谱面统计
+
+        用法: stb_creator_details <创作者名> [模式] [状态]
+        参数:
+        创作者名 - 要查询的创作者名称
+        模式     - 可选，模式编号，默认为所有模式
+        状态     - 可选，0=Alpha,1=Beta,2=Stable，默认全部
+
+        示例:
+        stb_creator_details chuanyuan
+        stb_creator_details chuanyuan 0 2   # 模式0的Stable谱面
+        """
+        args = arg.split()
+        if not args:
+            print(colorize("错误: 请输入创作者名", Colors.RED))
+            return
+        creator = args[0]
+        mode = self.current_mode
+        status = None
+        if len(args) > 1:
+            try:
+                mode = int(args[1])
+            except:
+                pass
+        if len(args) > 2:
+            try:
+                status = int(args[2])
+            except:
+                pass
+
+        # 构建选择器
+        selector = copy.deepcopy(self.selector)
+        selector.set_filters(players=[creator])
+        if mode != -1:
+            selector.set_filters(modes=[mode])
+        if status is not None:
+            selector.set_filters(statuses=[status])
+
+        where_clause, params = selector.build_chart_sql_where("c")
+        cursor = self.conn.cursor()
+
+        # 获取创作者的总览
+        query_total = f"""
+        SELECT COUNT(*), COUNT(DISTINCT c.mode), AVG(c.heat), AVG(CAST(c.level AS REAL))
+        FROM charts c
+        WHERE {where_clause}
+        """
+        cursor.execute(query_total, params)
+        total, modes_count, avg_heat, avg_level = cursor.fetchone()
+
+        # 按状态分组
+        query_status = f"""
+        SELECT c.status, COUNT(*)
+        FROM charts c
+        WHERE {where_clause}
+        GROUP BY c.status
+        """
+        cursor.execute(query_status, params)
+        status_dist = cursor.fetchall()
+
+        # 按模式分组
+        query_mode = f"""
+        SELECT c.mode, COUNT(*)
+        FROM charts c
+        WHERE {where_clause}
+        GROUP BY c.mode
+        ORDER BY c.mode
+        """
+        cursor.execute(query_mode, params)
+        mode_dist = cursor.fetchall()
+
+        # 显示结果
+        print(colorize(f"\n创作者详情: {creator}", Colors.CYAN))
+        print(get_separator())
+        print(f"总谱面数: {colorize(total, Colors.GREEN)}")
+        print(f"涉及模式数: {modes_count}")
+        print(f"平均热度: {avg_heat:.1f}")
+        print(f"平均难度: {avg_level:.1f}")
+
+        if status_dist:
+            print(colorize("\n状态分布:", Colors.BOLD))
+            status_names = {0:"Alpha",1:"Beta",2:"Stable"}
+            for s,c in status_dist:
+                print(f"  {status_names.get(s, s)}: {c}")
+
+        if mode_dist:
+            print(colorize("\n模式分布:", Colors.BOLD))
+            for m,c in mode_dist:
+                mode_name = self.mode_names.get(m, "未知")
+                print(f"  模式 {m}({mode_name}): {c}")
+
+        # 可选的详细列表
+        show_list = input(colorize("\n是否显示谱面列表? (y/N): ", Colors.CYAN)).lower()
+        if show_list == 'y':
+            query_list = f"""
+            SELECT c.cid, s.title, c.version, c.level, c.status, c.heat
+            FROM charts c JOIN songs s ON c.sid = s.sid
+            WHERE {where_clause}
+            ORDER BY c.heat DESC LIMIT 50
+            """
+            cursor.execute(query_list, params)
+            charts = cursor.fetchall()
+            print(colorize("\n谱面列表 (前50):", Colors.BOLD))
+            for cid, title, ver, level, status, heat in charts:
+                status_name = {0:"A",1:"B",2:"S"}.get(status, "?")
+                print(f"  CID:{cid} [{status_name}] Lv.{level} {title} ({ver}) - 热度:{heat}")
+
+        # 图表生成
+        chart_choice = input(colorize("\n是否生成创作者统计图表? (y/N): ", Colors.CYAN)).lower()
+        if chart_choice == 'y':
+            self._generate_creator_chart(creator, status_dist, mode_dist)
+
+    def _generate_creator_chart(self, creator, status_dist, mode_dist):
+        """生成创作者统计图表"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14,6))
+        fig.suptitle(f'创作者统计 - {creator}', fontsize=14)
+
+        if status_dist:
+            status_names = {0:"Alpha",1:"Beta",2:"Stable"}
+            labels = [status_names.get(s, str(s)) for s,_ in status_dist]
+            counts = [c for _,c in status_dist]
+            ax1.pie(counts, labels=labels, autopct='%1.1f%%', startangle=90)
+            ax1.set_title('状态分布')
+        else:
+            ax1.text(0.5,0.5,'无数据', ha='center', va='center', transform=ax1.transAxes)
+
+        if mode_dist:
+            mode_names = {0:"Key",1:"Step",2:"DJ",3:"Catch",4:"Pad",5:"Taiko",6:"Ring",7:"Slide",8:"Live",9:"Cube"}
+            labels = [mode_names.get(m, str(m)) for m,_ in mode_dist]
+            counts = [c for _,c in mode_dist]
+            ax2.bar(labels, counts, color='lightblue')
+            ax2.set_title('模式分布')
+            ax2.set_ylabel('谱面数量')
+        else:
+            ax2.text(0.5,0.5,'无数据', ha='center', va='center', transform=ax2.transAxes)
+
+        plt.tight_layout()
+        safe_creator = re.sub(r'[^\w]', '_', creator)
+        filename = self.get_unique_filename(f"creator_{safe_creator}.png", "png")
         filepath = os.path.join(self.output_dir, filename)
         plt.savefig(filepath, dpi=150, facecolor='white')
         plt.close()
-        
-        print(colorize(f"\n已生成模式比较图表: {filepath}", Colors.GREEN))
-    
+        print(colorize(f"已生成创作者统计图表: {filepath}", Colors.GREEN))
+
+    @db_safe_operation
+    def do_stb_creator_trends(self, arg):
+        """
+        分析特定创作者的谱面更新趋势
+
+        用法: stb_creator_trends <创作者名> [周期]
+        周期: days(日), months(月), 默认months
+
+        示例:
+        stb_creator_trends chuanyuan
+        stb_creator_trends chuanyuan days
+        """
+        args = arg.split()
+        if not args:
+            print(colorize("错误: 请输入创作者名", Colors.RED))
+            return
+        creator = args[0]
+        period = "months" if len(args) < 2 else args[1].lower()
+
+        selector = copy.deepcopy(self.selector)
+        selector.set_filters(players=[creator])
+        where_clause, params = selector.build_chart_sql_where("c")
+
+        # 按时间分组
+        if period == "days":
+            time_condition = "c.last_updated >= date('now', '-30 days')"
+            group_by = "DATE(c.last_updated)"
+            order_by = "DATE(c.last_updated)"
+        else:
+            time_condition = "c.last_updated >= date('now', '-1 year')"
+            group_by = "strftime('%Y-%m', c.last_updated)"
+            order_by = "strftime('%Y-%m', c.last_updated)"
+
+        if where_clause != "1=1":
+            where_clause += f" AND {time_condition}"
+        else:
+            where_clause = time_condition
+
+        query = f"""
+        SELECT {group_by}, COUNT(*)
+        FROM charts c
+        WHERE {where_clause}
+        GROUP BY {group_by}
+        ORDER BY {order_by}
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(query, params)
+        trend_data = cursor.fetchall()
+
+        if not trend_data:
+            print(colorize("没有找到趋势数据", Colors.YELLOW))
+            return
+
+        dates = [row[0] for row in trend_data]
+        counts = [row[1] for row in trend_data]
+
+        # 显示统计
+        print(colorize(f"\n创作者 {creator} 的谱面更新趋势 ({period})", Colors.CYAN))
+        total = sum(counts)
+        avg = total/len(counts)
+        print(f"总更新谱面: {total}, 平均{period}更新: {avg:.1f}")
+
+        # 生成图表
+        fig, ax = plt.subplots(figsize=(12,6))
+        ax.plot(dates, counts, 'o-', linewidth=2, markersize=6, color='#2196F3')
+        ax.fill_between(dates, counts, alpha=0.3, color='#2196F3')
+        ax.axhline(y=avg, color='red', linestyle='--', alpha=0.7, label=f'平均 {avg:.1f}')
+        ax.set_title(f'创作者 {creator} 谱面更新趋势')
+        ax.set_xlabel('日期' if period=='days' else '月份')
+        ax.set_ylabel('更新谱面数量')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+
+        safe_creator = re.sub(r'[^\w]', '_', creator)
+        filename = self.get_unique_filename(f"creator_trends_{safe_creator}_{period}.png", "png")
+        filepath = os.path.join(self.output_dir, filename)
+        plt.savefig(filepath, dpi=150, facecolor='white')
+        plt.close()
+        print(colorize(f"已生成趋势图表: {filepath}", Colors.GREEN))
+
+    # 增强 do_update 命令
+    def do_update(self, arg):
+        """
+        更新数据（调用外部爬虫脚本）
+
+        用法: update [--leaderboard] [--player] [--stb] [--once] [--limit N] [--rpm N]
+        选项:
+          --leaderboard   : 更新排行榜数据（默认）
+          --player        : 更新玩家个人主页资料
+          --stb           : 更新谱面数据
+          --once          : 只运行一次
+          --limit N       : 最大爬取数量（对玩家和谱面有效）
+          --rpm N         : 每分钟请求数限制
+          --no-resume     : 不从进度恢复（对谱面有效）
+
+        示例:
+          update                      # 更新排行榜
+          update --player             # 更新玩家资料（从players.txt）
+          update --stb --once --limit 50   # 更新谱面数据，只运行一次，最多50个
+        """
+        args = arg.split()
+        if not args:
+            # 默认更新排行榜
+            script = "malody_rankings.py"
+            cmd = [sys.executable, script, "--once"]
+        else:
+            if "--leaderboard" in args or (not "--player" in args and not "--stb" in args):
+                # 默认或明确指定排行榜
+                script = "malody_rankings.py"
+                cmd = [sys.executable, script]
+                if "--once" in args:
+                    cmd.append("--once")
+                # 排行榜不支持 limit 和 rpm，忽略
+            elif "--player" in args:
+                script = "player_profile_crawler.py"
+                cmd = [sys.executable, script]
+                if "--once" in args:
+                    cmd.append("--once")
+                # 解析 limit
+                if "--limit" in args:
+                    idx = args.index("--limit")
+                    if idx+1 < len(args):
+                        cmd.extend(["--limit", args[idx+1]])
+                # 其他参数如 --rpm 可添加
+            elif "--stb" in args:
+                script = "stb_crawler.py"
+                cmd = [sys.executable, script]
+                if "--once" in args:
+                    cmd.append("--once")
+                if "--limit" in args:
+                    idx = args.index("--limit")
+                    if idx+1 < len(args):
+                        cmd.extend(["--max-charts", args[idx+1]])
+                if "--rpm" in args:
+                    idx = args.index("--rpm")
+                    if idx+1 < len(args):
+                        cmd.extend(["--rpm", args[idx+1]])
+                if "--no-resume" in args:
+                    cmd.append("--no-resume")
+            else:
+                print(colorize("错误: 请指定爬虫类型: --leaderboard, --player, --stb", Colors.RED))
+                return
+
+        print(colorize(f"\n开始执行: {' '.join(cmd)}", Colors.CYAN))
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                bufsize=1
+            )
+            for line in process.stdout:
+                clean_line = re.sub(r'\x1b\[[0-9;]*[mK]', '', line.strip())
+                if clean_line:
+                    print(clean_line)
+            process.wait()
+            if process.returncode == 0:
+                print(colorize("\n数据更新成功!", Colors.GREEN))
+            else:
+                print(colorize(f"\n数据更新失败，退出码: {process.returncode}", Colors.RED))
+        except Exception as e:
+            print(colorize(f"\n更新过程中发生错误: {e}", Colors.RED))
+
+    # 新增 optimize 命令
+    def do_optimize(self, arg):
+        """
+        优化数据库：清理冗余记录并压缩数据库
+
+        用法: optimize
+        """
+        print(colorize("正在优化数据库，请稍候...", Colors.CYAN))
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "malody_rankings.py")
+        cmd = [sys.executable, script, "--optimize-db"]
+        try:
+            subprocess.run(cmd, check=True)
+            print(colorize("数据库优化完成。", Colors.GREEN))
+        except subprocess.CalledProcessError as e:
+            print(colorize(f"优化失败: {e}", Colors.RED))
+
+    # 新增 crawl_status 命令
+    def do_crawl_status(self, arg):
+        """
+        查看各爬虫的进度状态
+
+        用法: crawl_status
+        """
+        print(colorize("\n爬虫进度状态", Colors.CYAN))
+        print(get_separator())
+
+        # 检查 CID 进度文件
+        cid_progress = "cid_progress.json"
+        if os.path.exists(cid_progress):
+            try:
+                with open(cid_progress, 'r') as f:
+                    data = json.load(f)
+                current = data.get('current_cid', 'N/A')
+                success = data.get('total_success', 0)
+                errors = data.get('total_errors', 0)
+                retry = len(data.get('retry_queue', []))
+                print(f"CID爬虫: 当前CID={current}, 成功={success}, 错误={errors}, 待重试={retry}")
+            except:
+                print(f"CID爬虫: 无法解析进度文件")
+        else:
+            print("CID爬虫: 无进度文件")
+
+        # SID 进度文件
+        sid_progress = "sid_progress.json"
+        if os.path.exists(sid_progress):
+            try:
+                with open(sid_progress, 'r') as f:
+                    data = json.load(f)
+                current = data.get('current_sid', 'N/A')
+                songs = data.get('total_songs', 0)
+                charts = data.get('total_charts', 0)
+                empty = len(data.get('empty_songs', []))
+                print(f"SID爬虫: 当前SID={current}, 歌曲={songs}, 谱面={charts}, 空歌曲={empty}")
+            except:
+                print("SID爬虫: 无法解析进度文件")
+        else:
+            print("SID爬虫: 无进度文件")
+
+        # 向后SID进度
+        sid_back = "sid_backwards_progress.json"
+        if os.path.exists(sid_back):
+            try:
+                with open(sid_back, 'r') as f:
+                    data = json.load(f)
+                current = data.get('current_sid', 'N/A')
+                last_valid = data.get('last_valid_sid', 'N/A')
+                songs = data.get('total_songs', 0)
+                charts = data.get('total_charts', 0)
+                print(f"向后SID爬虫: 当前SID={current}, 最后有效={last_valid}, 歌曲={songs}, 谱面={charts}")
+            except:
+                print("向后SID爬虫: 无法解析进度文件")
+        else:
+            print("向后SID爬虫: 无进度文件")
+
+        # 全局进度
+        global_prog = "global_progress.bin"
+        if os.path.exists(global_prog):
+            size = os.path.getsize(global_prog)
+            print(f"全局进度文件: 存在 ({size} bytes)")
+        else:
+            print("全局进度文件: 不存在")
+
+    # 增强 do_export 支持导出谱面、歌曲、玩家资料
+    @db_safe_operation
+    def do_export(self, arg):
+        """
+        导出数据为CSV文件（支持选择器筛选）
+
+        用法: export <类型> [--mode 模式] [--limit 数量] [--players 玩家列表] ...
+        类型: top(顶级玩家), history(玩家历史), chart(谱面), song(歌曲), profile(玩家资料)
+
+        示例:
+        export top --limit 100
+        export chart --mode 0 --limit 500
+        export profile --players Zani
+        """
+        args = arg.split()
+        if not args:
+            print(colorize("错误: 请指定导出类型", Colors.RED))
+            return
+
+        export_type = args[0].lower()
+        # 简单解析，实际应使用 argparse 等
+        # 这里仅实现 chart 类型作为示例
+        if export_type == "chart":
+            selector = copy.deepcopy(self.selector)
+            # 处理简单参数
+            if "--mode" in args:
+                idx = args.index("--mode")
+                if idx+1 < len(args):
+                    try:
+                        mode = int(args[idx+1])
+                        selector.set_filters(modes=[mode])
+                        selector.current_mode = mode
+                    except:
+                        pass
+            where, params = selector.build_chart_sql_where("c")
+            query = f"""
+            SELECT c.cid, s.title, s.artist, c.version, c.level, c.status,
+                   c.creator_name, c.stabled_by_name, c.heat, c.donate_count, c.play_count,
+                   c.last_updated, c.mode
+            FROM charts c
+            JOIN songs s ON c.sid = s.sid
+            WHERE {where}
+            """
+            df = pd.read_sql_query(query, self.conn, params=params)
+            filename = self.get_unique_filename("charts_export.csv", "csv")
+            filepath = os.path.join(self.output_dir, filename)
+            df.to_csv(filepath, index=False, encoding='utf-8-sig')
+            print(colorize(f"已导出谱面数据: {filepath}", Colors.GREEN))
+        else:
+            print(colorize(f"导出类型 '{export_type}' 暂未实现", Colors.YELLOW))
+
     @db_safe_operation
     def do_alias(self, arg):
         """
@@ -4541,449 +4400,6 @@ class MalodyViz(cmd.Cmd):
         except sqlite3.Error as e:
             self.conn.rollback()
             print(colorize(f"\n数据库错误: {e}", Colors.RED))
-    
-    @db_safe_operation
-    def do_stb_stabled(self, arg):
-        """
-        统计stable谱面的创作者排行榜（支持选择器筛选）
-        
-        用法: stb_stabled [模式] [数量]
-        参数:
-        模式 - 可选，模式编号，默认为当前模式
-        数量 - 可选，要显示的创作者数量，默认为20
-        
-        示例:
-        stb_stabled        # 当前模式stable谱面创作者排行榜
-        stb_stabled 0 10   # 模式0前10名stable谱面创作者
-        """
-        args = arg.split()
-        mode = self.current_mode
-        limit = 20
-        
-        if args:
-            try:
-                if int(args[0]) in self.mode_names:
-                    mode = int(args[0])
-                    if len(args) > 1:
-                        limit = int(args[1])
-                else:
-                    limit = int(args[0])
-                    if len(args) > 1 and int(args[1]) in self.mode_names:
-                        mode = int(args[1])
-            except ValueError:
-                print(colorize("错误: 请输入有效的数字", Colors.RED))
-                return
-        
-        if limit <= 0:
-            print(colorize("错误: 数量必须大于0", Colors.RED))
-            return
-        
-        cursor = self.conn.cursor()
-        
-        # 使用选择器构建谱面查询条件，并强制筛选状态为Stable(2)
-        where_clause, params = self.selector.build_chart_sql_where("c")
-        
-        # 确保只统计stable谱面
-        if "c.status IN" in where_clause or "c.status =" in where_clause:
-            # 如果已有状态筛选，确保包含stable状态
-            where_clause = re.sub(r'c\.status IN \(.*?\)|c\.status = \?', 'c.status = 2', where_clause)
-        else:
-            where_clause += " AND c.status = 2" if where_clause != "1=1" else "c.status = 2"
-        
-        # 如果选择器中没有指定模式，使用当前模式
-        if not self.selector.filters['modes'] and self.selector.current_mode != -1:
-            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
-            params.append(mode)
-        
-        query = f"""
-        SELECT c.creator_name, COUNT(*) as stable_count,
-            AVG(CAST(c.level AS REAL)) as avg_level,
-            AVG(c.heat) as avg_heat,
-            MAX(c.heat) as max_heat
-        FROM charts c
-        WHERE {where_clause} AND c.creator_name IS NOT NULL
-        GROUP BY c.creator_name
-        ORDER BY stable_count DESC, avg_heat DESC
-        LIMIT ?
-        """
-        params.append(limit)
-        
-        cursor.execute(query, params)
-        results = cursor.fetchall()
-        
-        if not results:
-            print(colorize(f"\n没有找到符合条件的stable谱面", Colors.YELLOW))
-            return
-        
-        # 显示模式信息
-        if self.selector.filters['modes']:
-            mode_str = ", ".join([f"{m}({self.mode_names.get(m, '未知')})" for m in self.selector.filters['modes']])
-        elif self.selector.current_mode != -1:
-            mode_str = f"{self.selector.current_mode}({self.mode_names.get(self.selector.current_mode, '未知')})"
-        else:
-            mode_str = "所有模式"
-        
-        print(colorize(f"\nStable谱面创作者排行榜", Colors.CYAN))
-        print(colorize(f"模式: {mode_str}", Colors.YELLOW))
-        print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-        print(get_separator())
-        
-        # 显示表头
-        header_format = "{:<4} {:<20} {:<8} {:<10} {:<10} {:<10}"
-        print(colorize(header_format.format(
-            "排名", "创作者", "Stable数", "平均难度", "平均热度", "最高热度"
-        ), Colors.BOLD))
-        print(get_separator())
-        
-        # 显示数据
-        for i, (creator, count, avg_level, avg_heat, max_heat) in enumerate(results, 1):
-            # 处理过长的创作者名
-            display_creator = creator if len(creator) <= 20 else creator[:17] + "..."
-            
-            print(header_format.format(
-                f"#{i}",
-                display_creator,
-                count,
-                f"{avg_level:.1f}" if avg_level else "N/A",
-                f"{avg_heat:.1f}" if avg_heat else "N/A",
-                f"{max_heat:.0f}" if max_heat else "N/A"
-            ))
-        
-        print(get_separator())
-        
-        # 生成图表的选项
-        chart_choice = input(colorize("\n是否生成图表? (y/N): ", Colors.CYAN)).lower()
-        if chart_choice == 'y':
-            self._generate_stabled_chart(results, mode_str)
-
-    @db_safe_operation
-    def do_stb_stabled(self, arg):
-        """
-        统计stable谱面的创作者排行榜（支持选择器筛选）
-        
-        用法: stb_stabled [模式] [数量]
-        参数:
-        模式 - 可选，模式编号，默认为当前模式
-        数量 - 可选，要显示的创作者数量，默认为20
-        
-        示例:
-        stb_stabled        # 当前模式stable谱面创作者排行榜
-        stb_stabled 0 10   # 模式0前10名stable谱面创作者
-        """
-        args = arg.split()
-        mode = self.current_mode
-        limit = 20
-        
-        if args:
-            try:
-                if int(args[0]) in self.mode_names:
-                    mode = int(args[0])
-                    if len(args) > 1:
-                        limit = int(args[1])
-                else:
-                    limit = int(args[0])
-                    if len(args) > 1 and int(args[1]) in self.mode_names:
-                        mode = int(args[1])
-            except ValueError:
-                print(colorize("错误: 请输入有效的数字", Colors.RED))
-                return
-        
-        if limit <= 0:
-            print(colorize("错误: 数量必须大于0", Colors.RED))
-            return
-        
-        cursor = self.conn.cursor()
-        
-        try:
-            # 使用选择器构建谱面查询条件，并强制筛选状态为Stable(2)
-            # 先保存原始筛选条件
-            original_filters = self.selector.filters.copy()
-            
-            # 创建临时选择器，强制设置状态为2 (Stable)
-            temp_selector = MCSelector()
-            temp_selector.current_mode = self.selector.current_mode
-            temp_selector.set_filters(
-                players=self.selector.filters['players'],
-                difficulties=self.selector.filters['difficulties'],
-                time_range=self.selector.filters['time_range'],
-                modes=self.selector.filters['modes'],
-                statuses=[2]  # 强制只显示Stable谱面
-            )
-            
-            where_clause, params = temp_selector.build_chart_sql_where("c")
-            
-            # 如果选择器中没有指定模式，使用当前模式
-            if not temp_selector.filters['modes'] and temp_selector.current_mode != -1:
-                where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
-                params.append(mode)
-            
-            # 添加creator_name不为空的条件
-            if where_clause != "1=1":
-                where_clause += " AND c.creator_name IS NOT NULL"
-            else:
-                where_clause = "c.creator_name IS NOT NULL"
-            
-            query = f"""
-            SELECT c.creator_name, COUNT(*) as stable_count,
-                AVG(CAST(c.level AS REAL)) as avg_level,
-                AVG(c.heat) as avg_heat,
-                MAX(c.heat) as max_heat
-            FROM charts c
-            WHERE {where_clause}
-            GROUP BY c.creator_name
-            ORDER BY stable_count DESC, avg_heat DESC
-            LIMIT ?
-            """
-            params.append(limit)
-            
-            # 调试信息
-            print(colorize(f"调试信息:", Colors.YELLOW))
-            print(f"SQL: {query}")
-            print(f"参数: {params}")
-            
-            cursor.execute(query, params)
-            results = cursor.fetchall()
-            
-            if not results:
-                print(colorize(f"\n没有找到符合条件的stable谱面", Colors.YELLOW))
-                return
-            
-            # 显示模式信息
-            if self.selector.filters['modes']:
-                mode_str = ", ".join([f"{m}({self.mode_names.get(m, '未知')})" for m in self.selector.filters['modes']])
-            elif self.selector.current_mode != -1:
-                mode_str = f"{self.selector.current_mode}({self.mode_names.get(self.selector.current_mode, '未知')})"
-            else:
-                mode_str = "所有模式"
-            
-            print(colorize(f"\nStable谱面创作者排行榜", Colors.CYAN))
-            print(colorize(f"模式: {mode_str}", Colors.YELLOW))
-            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-            print(get_separator())
-            
-            # 显示表头
-            header_format = "{:<4} {:<20} {:<8} {:<10} {:<10} {:<10}"
-            print(colorize(header_format.format(
-                "排名", "创作者", "Stable数", "平均难度", "平均热度", "最高热度"
-            ), Colors.BOLD))
-            print(get_separator())
-            
-            # 显示数据
-            for i, (creator, count, avg_level, avg_heat, max_heat) in enumerate(results, 1):
-                # 处理过长的创作者名
-                display_creator = creator if len(creator) <= 20 else creator[:17] + "..."
-                
-                print(header_format.format(
-                    f"#{i}",
-                    display_creator,
-                    count,
-                    f"{avg_level:.1f}" if avg_level else "N/A",
-                    f"{avg_heat:.1f}" if avg_heat else "N/A",
-                    f"{max_heat:.0f}" if max_heat else "N/A"
-                ))
-            
-            print(get_separator())
-            
-            # 生成图表的选项
-            chart_choice = input(colorize("\n是否生成图表? (y/N): ", Colors.CYAN)).lower()
-            if chart_choice == 'y':
-                self._generate_stabled_chart(results, mode_str)
-                
-        except sqlite3.Error as e:
-            print(colorize(f"数据库错误: {e}", Colors.RED))
-            # 打印详细的调试信息
-            print(colorize(f"有问题的SQL: {query}", Colors.YELLOW))
-            print(colorize(f"参数: {params}", Colors.YELLOW))
-        except Exception as e:
-            print(colorize(f"操作错误: {e}", Colors.RED))
-        finally:
-            # 恢复原始筛选条件
-            self.selector.set_filters(**original_filters)
-
-    @db_safe_operation
-    def do_export(self, arg):
-        """
-        导出数据为CSV文件（支持选择器筛选）
-        
-        用法: export <类型> [模式] [天数]
-        参数:
-        类型 - 导出类型: top(顶级玩家) 或 history(历史数据)
-        模式 - 可选，模式编号，默认为当前模式
-        天数 - 可选，要导出的历史天数，仅对history类型有效，默认为30天
-        
-        示例:
-        export top        # 导出当前模式的顶级玩家数据
-        export top 0      # 导出模式0的顶级玩家数据
-        export history    # 导出最近30天的历史数据
-        export history 0 60  # 导出模式0最近60天的历史数据
-        """
-        args = arg.split()
-        if not args:
-            print(colorize("错误: 请指定导出类型: top 或 history", Colors.RED))
-            return
-        
-        export_type = args[0].lower()
-        mode = self.current_mode
-        days = 30
-        
-        if len(args) > 1:
-            try:
-                if int(args[1]) in self.mode_names and int(args[1]) != -1:
-                    mode = int(args[1])
-                    if len(args) > 2:
-                        days = int(args[2])
-                else:
-                    days = int(args[1])
-            except ValueError:
-                print(colorize("错误: 请输入有效的数字", Colors.RED))
-                return
-        
-        cursor = self.conn.cursor()
-        
-        if export_type == "top":
-            # 使用选择器构建玩家查询条件
-            where_clause, params = self.selector.build_player_sql_where("pr")
-            
-            # 获取最新爬取时间
-            if self.selector.filters['modes']:
-                mode_condition = "pr.mode IN ({})".format(','.join(['?']*len(self.selector.filters['modes'])))
-                cursor.execute(
-                    f"SELECT MAX(crawl_time) FROM player_rankings pr WHERE {mode_condition}",
-                    self.selector.filters['modes']
-                )
-            elif self.selector.current_mode != -1:
-                cursor.execute(
-                    "SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?",
-                    (self.selector.current_mode,)
-                )
-            else:
-                cursor.execute("SELECT MAX(crawl_time) FROM player_rankings")
-            
-            latest_time = cursor.fetchone()[0]
-            
-            if not latest_time:
-                print(colorize("没有找到数据", Colors.YELLOW))
-                return
-            
-            # 添加时间条件（如果没有设置时间筛选）
-            if not self.selector.filters['time_range']:
-                if "crawl_time" not in where_clause:
-                    where_clause += " AND pr.crawl_time = ?"
-                    params.append(latest_time)
-            
-            query = f"""
-            SELECT pr.mode, pr.rank, pr.name, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc
-            FROM player_rankings pr
-            WHERE {where_clause}
-            ORDER BY pr.mode, pr.rank
-            """
-            
-            cursor.execute(query, params)
-            players = cursor.fetchall()
-            
-            if not players:
-                print(colorize("没有找到符合条件的玩家", Colors.YELLOW))
-                return 
-            
-            df = pd.DataFrame(players, columns=['模式', '排名', '玩家名', '等级', '经验', '准确率', '连击', '游玩次数'])
-            
-            # 使用唯一文件名避免覆盖
-            base_filename = f"top_players.csv"
-            filename = self.get_unique_filename(base_filename, "csv")
-            filepath = os.path.join(self.output_dir, filename)
-            df.to_csv(filepath, index=False, encoding='utf-8-sig')
-            
-            print(colorize(f"\n已导出顶级玩家数据: {filepath}", Colors.GREEN))
-            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-            
-        elif export_type == "history":
-            # 使用选择器构建玩家查询条件
-            where_clause, params = self.selector.build_player_sql_where("pr")
-            
-            # 如果选择器中没有时间筛选，使用参数中的天数
-            if not self.selector.filters['time_range']:
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=days)
-                where_clause += " AND pr.crawl_time >= ?" if where_clause != "1=1" else "pr.crawl_time >= ?"
-                params.append(start_date)
-            
-            query = f"""
-            SELECT pr.name, pr.rank, pr.crawl_time, pr.mode
-            FROM player_rankings pr
-            WHERE {where_clause}
-            ORDER BY pr.crawl_time, pr.mode, pr.rank
-            """
-            
-            cursor.execute(query, params)
-            history_data = cursor.fetchall()
-            
-            if not history_data:
-                print(colorize(f"\n没有找到数据", Colors.YELLOW))
-                return
-            
-            df = pd.DataFrame(history_data, columns=['玩家名', '排名', '时间', '模式'])
-            
-            # 使用唯一文件名避免覆盖
-            base_filename = f"history_data.csv"
-            filename = self.get_unique_filename(base_filename, "csv")
-            filepath = os.path.join(self.output_dir, filename)
-            df.to_csv(filepath, index=False, encoding='utf-8-sig')
-            
-            print(colorize(f"\n已导出历史数据: {filepath}", Colors.GREEN))
-            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-            
-        else:
-            print(colorize("错误: 请指定有效的导出类型: top 或 history", Colors.RED))
-    
-    def do_update(self, arg):
-        """
-        更新数据（调用爬虫脚本）
-        
-        用法: update
-        说明: 此命令会调用malody_rankings.py脚本更新数据
-        
-        注意: 更新过程中会暂时断开数据库连接，更新完成后会自动重连
-        """
-        print(colorize("\n开始更新数据...", Colors.CYAN))
-        
-        if self.conn:
-            self.conn.close()
-            self.conn = None
-            print(colorize("已断开数据库连接", Colors.YELLOW))
-        
-        try:
-            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "malody_rankings.py")
-            
-            cmd = [sys.executable, script_path, "--once"]
-            
-            print(colorize(f"执行命令: {' '.join(cmd)}", Colors.YELLOW))
-            print(get_separator())
-            
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1
-            )
-            
-            for line in process.stdout:
-                clean_line = re.sub(r'\x1b\[[0-9;]*[mK]', '', line.strip())
-                if clean_line:
-                    print(clean_line)
-            
-            process.wait()
-            
-            if process.returncode == 0:
-                print(colorize("\n数据更新成功!", Colors.GREEN))
-            else:
-                print(colorize(f"\n数据更新失败，退出码: {process.returncode}", Colors.RED))
-                
-        except Exception as e:
-            print(colorize(f"\n更新过程中发生错误: {e}", Colors.RED))
-        finally:
-            print(colorize("重新连接数据库...", Colors.YELLOW))
-            self.connect_db()
     
     def do_exit(self, arg):
         """退出程序"""
