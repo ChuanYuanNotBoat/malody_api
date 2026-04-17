@@ -5,9 +5,9 @@ mail:
     server: "smtp.qq.com"
     port: 587
     use_tls: true
-    username: "your-email@qq.com"          # 你的QQ邮箱（接收命令的邮箱）
-    password: "your-authorization-code"     # 授权码（QQ邮箱设置中获取）
-    from_addr: "your-email@qq.com"          # 与username相同
+    username: ""                            # ?????????
+    password: ""                            # ?????????
+    from_addr: ""                           # ?????????
 
   # 接收邮件配置（通过IMAP读取收件箱）
   imap:
@@ -15,8 +15,8 @@ mail:
     server: "imap.qq.com"
     port: 993
     use_ssl: true
-    username: "your-email@qq.com"           # 与发送邮箱相同
-    password: "your-authorization-code"      # 授权码（与smtp_out相同）
+    username: ""                            # ?????????
+    password: ""                            # ?????????
 
   # 内置SMTP服务器（仅用于本地测试，可以禁用）
   smtp_in:
@@ -31,7 +31,7 @@ allowed_senders:
   - "your-command-sender@example.com"        # 你的私人邮箱（命令邮件的发件人）
 
 # 报告接收邮箱（运行/停止爬虫时结果发送到此地址）
-report_to: "your-notification-email@example.com"
+report_to: ""                               # ?? MALODY_REPORT_TO
 
 # 爬虫定义（保持不变）
 crawlers:

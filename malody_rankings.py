@@ -57,10 +57,52 @@ console_handler.setLevel(logging.INFO)
 logger.addHandler(console_handler)
 
 # Cookie 配置（请根据实际情况更新）
-COOKIES = {
-    "sessionid": "--",
-    "csrftoken": "--",
-}
+def _load_cookies() -> dict:
+    """
+    Load cookies from runtime sources, highest priority first:
+    1) MALODY_COOKIES_JSON (full JSON string)
+    2) MALODY_COOKIES_FILE (json file path, default: cookies.local.json)
+    3) MALODY_SESSIONID / MALODY_CSRFTOKEN
+    """
+    cookies = {}
+
+    cookies_file = os.getenv("MALODY_COOKIES_FILE", "cookies.local.json")
+    if os.path.exists(cookies_file):
+        try:
+            with open(cookies_file, "r", encoding="utf-8") as f:
+                file_cookies = json.load(f)
+            if isinstance(file_cookies, dict):
+                cookies.update(file_cookies)
+                logger.info("Loaded crawler cookies from %s", cookies_file)
+        except Exception as e:
+            logger.warning("Failed to load cookies file %s: %s", cookies_file, e)
+
+    cookies_json = os.getenv("MALODY_COOKIES_JSON")
+    if cookies_json:
+        try:
+            env_cookies = json.loads(cookies_json)
+            if isinstance(env_cookies, dict):
+                cookies.update(env_cookies)
+                logger.info("Loaded crawler cookies from MALODY_COOKIES_JSON")
+        except Exception as e:
+            logger.warning("Invalid MALODY_COOKIES_JSON: %s", e)
+
+    sessionid = os.getenv("MALODY_SESSIONID")
+    csrftoken = os.getenv("MALODY_CSRFTOKEN")
+    if sessionid:
+        cookies["sessionid"] = sessionid
+    if csrftoken:
+        cookies["csrftoken"] = csrftoken
+
+    if not cookies.get("sessionid"):
+        logger.warning("No sessionid configured for crawler cookies.")
+    if not cookies.get("csrftoken"):
+        logger.warning("No csrftoken configured for crawler cookies.")
+
+    return cookies
+
+
+COOKIES = _load_cookies()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1361,7 +1403,7 @@ def run_player_crawler():
                     pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
             finally:
                 if HAS_TQDM:
-                    pbar.update(1)
+                    _ = pbar.update(1)
                 player_queue.task_done()
 
         if HAS_TQDM:
@@ -1690,7 +1732,7 @@ def run_crawler_cycle(crawl_players=False, crawl_leaderboard_players=False, save
     # 只有在明确指定时才推送 Git
     if push_to_git:
         try:
-            git_add_commit_push(has_changes)
+            _ = git_add_commit_push(has_changes)
         except Exception as e:
             logger.warning("Git推送失败，但数据已保存到本地: %s", e)
     else:
@@ -1768,7 +1810,7 @@ def optimize_database():
             cursor.execute(f"DELETE FROM player_rankings WHERE id IN ({placeholders})", to_delete)
             deleted_total += len(to_delete)
             if HAS_TQDM:
-                iterator.set_postfix(deleted=deleted_total)
+                _ = iterator.set_postfix(deleted=deleted_total)
 
     conn.commit()
 
@@ -1804,24 +1846,24 @@ def optimize_database():
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='Malody排行榜爬虫')
-    parser.add_argument('--all', action='store_true',
-                        help='爬取排行榜和玩家主页数据（包括将排行榜玩家加入队列）')
-    parser.add_argument('--leaderboard-only', action='store_true',
-                        help='只爬取排行榜数据，不爬取任何玩家主页（包括配置文件中的玩家）')
-    parser.add_argument('--players-only', action='store_true',
-                        help='只爬取玩家主页数据（从players.txt读取，不爬取排行榜）')
-    parser.add_argument('--no-player-crawl', action='store_true',
-                        help='禁用默认的玩家主页爬取（默认已开启配置文件玩家爬取，使用此参数可关闭）')
-    parser.add_argument('--migrate-db', action='store_true',
-                        help='执行数据库迁移（添加uid字段）')
-    parser.add_argument('--once', action='store_true',
-                        help='运行一次爬取周期后退出')
-    parser.add_argument('--save-excel', action='store_true',
-                        help='保存数据到Excel文件（默认不保存）')
-    parser.add_argument('--push-to-git', action='store_true',
-                        help='推送数据到Git仓库（默认不推送）')
-    parser.add_argument('--optimize-db', action='store_true',
-                        help='优化数据库（按新规则清理冗余记录）并退出')
+    _ = parser.add_argument('--all', action='store_true',
+                            help='爬取排行榜和玩家主页数据（包括将排行榜玩家加入队列）')
+    _ = parser.add_argument('--leaderboard-only', action='store_true',
+                            help='只爬取排行榜数据，不爬取任何玩家主页（包括配置文件中的玩家）')
+    _ = parser.add_argument('--players-only', action='store_true',
+                            help='只爬取玩家主页数据（从players.txt读取，不爬取排行榜）')
+    _ = parser.add_argument('--no-player-crawl', action='store_true',
+                            help='禁用默认的玩家主页爬取（默认已开启配置文件玩家爬取，使用此参数可关闭）')
+    _ = parser.add_argument('--migrate-db', action='store_true',
+                            help='执行数据库迁移（添加uid字段）')
+    _ = parser.add_argument('--once', action='store_true',
+                            help='运行一次爬取周期后退出')
+    _ = parser.add_argument('--save-excel', action='store_true',
+                            help='保存数据到Excel文件（默认不保存）')
+    _ = parser.add_argument('--push-to-git', action='store_true',
+                            help='推送数据到Git仓库（默认不推送）')
+    _ = parser.add_argument('--optimize-db', action='store_true',
+                            help='优化数据库（按新规则清理冗余记录）并退出')
 
     return parser.parse_args()
 

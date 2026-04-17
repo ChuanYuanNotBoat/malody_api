@@ -1,5 +1,5 @@
 # malody_api/routers/crawler.py
-from fastapi import APIRouter, BackgroundTasks, Query
+from fastapi import APIRouter, BackgroundTasks, Query, Depends
 import subprocess
 import os
 import sys
@@ -9,9 +9,14 @@ from typing import Optional
 
 # 改为绝对导入
 from malody_api.core.models import APIResponse
+from malody_api.core.security import require_api_key
 from malody_api.utils.crawler_manager import crawler_manager
 
-router = APIRouter(prefix="/crawler", tags=["crawler"])
+router = APIRouter(
+    prefix="/crawler",
+    tags=["crawler"],
+    dependencies=[Depends(require_api_key)],
+)
 
 def run_subprocess(cmd):
     """后台运行子进程"""

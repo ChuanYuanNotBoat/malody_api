@@ -1,0 +1,4 @@
+{
+  "sessionid": "your-session-id",
+  "csrftoken": "your-csrf-token"
+}

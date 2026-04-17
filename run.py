@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
+from config import config
 
 def create_app():
     """创建FastAPI应用"""
@@ -46,10 +47,12 @@ def create_app():
     )
     
     # CORS配置
+    allow_origins = config.ALLOWED_ORIGINS if config.ALLOWED_ORIGINS else ["*"]
+    wildcard_origins = "*" in allow_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=allow_origins,
+        allow_credentials=not wildcard_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -90,11 +93,11 @@ def register_routers(app):
         app.include_router(page_parser_router)
         app.include_router(crawler_router)                     # 新增
         
-        print("✅ 所有路由注册成功")
+        print("All routers registered successfully.")
         
     except ImportError as e:
-        print(f"❌ 路由导入失败: {e}")
-        print("请确保所有路由文件存在于 routers 目录中")
+        print(f"Failed to import routers: {e}")
+        print("Please ensure all router files exist under the routers directory.")
         sys.exit(1)
 
 def setup_routes(app):
@@ -234,21 +237,21 @@ def main():
     # 检查数据库文件是否存在
     db_path = os.path.join(current_dir, "malody_rankings.db")
     if not os.path.exists(db_path):
-        print(f"❌ 错误: 数据库文件不存在: {db_path}")
-        print("请确保malody_rankings.db文件在当前目录下")
+        print(f"Error: database file not found: {db_path}")
+        print("Please ensure malody_rankings.db exists in current directory.")
         sys.exit(1)
     
     # 创建静态文件目录
     static_dir = os.path.join(current_dir, "static")
     if not os.path.exists(static_dir):
         os.makedirs(static_dir)
-        print(f"📁 创建静态文件目录: {static_dir}")
-    
-    print("🚀 启动Malody数据API服务器...")
-    print(f"📊 数据库文件: {db_path}")
-    print("📚 文档地址: http://localhost:8000/docs")
-    print("🌐 API地址: http://localhost:8000")
-    print("⏹️  按 Ctrl+C 停止服务器")
+        print(f"Created static directory: {static_dir}")
+
+    print("Starting Malody API server...")
+    print(f"Database: {db_path}")
+    print("Docs: http://localhost:8000/docs")
+    print("API: http://localhost:8000")
+    print("Press Ctrl+C to stop.")
     print("-" * 50)
     
     # 创建并配置应用

@@ -40,6 +40,43 @@ CONFIG_FILE = "config.yaml"
 RUNNING_PIDS_FILE = "running_pids.json"
 
 
+def _set_nested(config: dict, path: List[str], value: Any):
+    node = config
+    for key in path[:-1]:
+        if key not in node or not isinstance(node[key], dict):
+            node[key] = {}
+        node = node[key]
+    node[path[-1]] = value
+
+
+def _apply_env_overrides(config: dict) -> dict:
+    """
+    Allow sensitive config to be provided by env vars, so credentials
+    do not need to be hardcoded in config.yaml.
+    """
+    mapping = {
+        "MALODY_MAIL_SMTP_USERNAME": ["mail", "smtp_out", "username"],
+        "MALODY_MAIL_SMTP_PASSWORD": ["mail", "smtp_out", "password"],
+        "MALODY_MAIL_SMTP_FROM_ADDR": ["mail", "smtp_out", "from_addr"],
+        "MALODY_MAIL_IMAP_USERNAME": ["mail", "imap", "username"],
+        "MALODY_MAIL_IMAP_PASSWORD": ["mail", "imap", "password"],
+        "MALODY_REPORT_TO": ["report_to"],
+    }
+
+    for env_name, nested_path in mapping.items():
+        value = os.getenv(env_name)
+        if value:
+            _set_nested(config, nested_path, value)
+
+    allowed_senders = os.getenv("MALODY_ALLOWED_SENDERS")
+    if allowed_senders:
+        config["allowed_senders"] = [
+            s.strip() for s in allowed_senders.split(",") if s.strip()
+        ]
+
+    return config
+
+
 class Mailer:
     """邮件发送（外部 SMTP）"""
     def __init__(self, config: dict):
@@ -284,10 +321,11 @@ class CommandParser:
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
-        logger.error(f"配置文件 {CONFIG_FILE} 不存在")
+        logger.error(f"Config file {CONFIG_FILE} not found")
         sys.exit(1)
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    return _apply_env_overrides(config or {})
 
 
 def handle_command(cmd: dict, manager: CrawlerManager, mailer: Mailer = None, reply_to: str = None) -> str:
