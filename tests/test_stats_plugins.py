@@ -21,3 +21,4 @@ class TestStatsPlugins(TestCase):
         self.assertEqual(MalodyViz.do_select.__module__, "stats_cli.plugins.select_plugin")
         self.assertEqual(MalodyViz.do_repair.__module__, "stats_cli.plugins.repair_plugin")
         self.assertEqual(MalodyViz.do_top.__module__, "stats_cli.plugins.top_plugin")
+        self.assertEqual(MalodyViz.do_player.__module__, "stats_cli.plugins.player_plugin")
