@@ -667,75 +667,6 @@ class MalodyViz(cmd.Cmd):
         except Exception as e:
             print(colorize(f"修复过程中发生错误: {e}", Colors.RED))
 
-    @db_safe_operation
-    def do_ls(self, arg):
-        """
-        列出当前目录的文件和文件夹
-        
-        用法: ls [路径]
-        参数:
-          路径 - 可选，要列出的目录路径，默认为当前目录
-        
-        示例:
-          ls        # 列出当前目录
-          ls viz_output  # 列出viz_output目录
-        """
-        path = arg if arg else "."
-        try:
-            if os.path.exists(path):
-                items = os.listdir(path)
-                print(colorize(f"\n{path} 目录内容:", Colors.CYAN))
-                print(get_separator())
-                for item in items:
-                    full_path = os.path.join(path, item)
-                    if os.path.isdir(full_path):
-                        print(colorize(f"[目录] {item}/", Colors.BLUE))
-                    else:
-                        size = os.path.getsize(full_path)
-                        print(f"[文件] {item} ({size} 字节)")
-            else:
-                print(colorize(f"路径不存在: {path}", Colors.RED))
-        except Exception as e:
-            print(colorize(f"列出目录时出错: {e}", Colors.RED))
-    
-    def do_mode(self, arg):
-        """
-        设置或查看当前模式（支持*表示所有模式）
-        
-        用法: mode [模式编号|*]
-        参数:
-        模式编号 - 0到9之间的数字，表示不同的游戏模式，*表示所有模式
-        
-        示例:
-        mode     # 查看当前模式
-        mode 0   # 切换到Key模式  
-        mode *   # 切换到所有模式
-        """
-        if not arg:
-            mode_name = self.mode_names.get(self.current_mode, "未知")
-            print(colorize(f"\n当前模式: {self.current_mode} ({mode_name})", Colors.CYAN))
-            print(colorize(f"当前筛选: {self.selector.get_current_selection()}", Colors.YELLOW))
-            return
-        
-        if arg == '*':
-            self.current_mode = -1
-            self.selector.current_mode = -1
-            self.selector.set_filters(modes=[])  # 清除模式筛选
-            print(colorize("\n已切换到所有模式", Colors.GREEN))
-            return
-        
-        try:
-            mode = int(arg)
-            if mode not in self.mode_names or mode == -1:
-                print(colorize("错误: 模式必须在0-9之间，或使用*表示所有模式", Colors.RED))
-                return
-            self.current_mode = mode
-            self.selector.current_mode = mode
-            self.selector.set_filters(modes=[mode])  # 设置模式筛选
-            mode_name = self.mode_names.get(mode, "未知")
-            print(colorize(f"\n已切换到模式: {mode} ({mode_name})", Colors.GREEN))
-        except ValueError:
-            print(colorize("错误: 请输入有效的模式数字(0-9)或*", Colors.RED))
 
     @db_safe_operation
     def do_top(self, arg):
@@ -4421,19 +4352,6 @@ class MalodyViz(cmd.Cmd):
         except sqlite3.Error as e:
             self.conn.rollback()
             print(colorize(f"\n数据库错误: {e}", Colors.RED))
-    
-    def do_exit(self, arg):
-        """退出程序"""
-        print(colorize("\n感谢使用Malody排行榜数据可视化工具!", Colors.CYAN))
-        self.cleanup()
-        return True
-    
-    def do_quit(self, arg):
-        """退出程序"""
-        return self.do_exit(arg)
-    
-    do_q = do_quit
-    do_e = do_exit
 
     def print_topics(self, header, cmds, cmdlen, maxcol):
         if cmds:
