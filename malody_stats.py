@@ -20,6 +20,7 @@ import re
 import math
 import json
 import copy                     # 新增导入，用于深拷贝选择器
+import shlex
 from selector import global_selector, MCSelector
 
 # 修复matplotlib中文字体问题
@@ -4355,63 +4356,200 @@ class MalodyViz(cmd.Cmd):
         """
         更新数据（调用外部爬虫脚本）
 
-        用法: update [--leaderboard] [--player] [--stb] [--once] [--limit N] [--rpm N]
-        选项:
-          --leaderboard   : 更新排行榜数据（默认）
-          --player        : 更新玩家个人主页资料
-          --stb           : 更新谱面数据
-          --once          : 只运行一次
-          --limit N       : 最大爬取数量（对玩家和谱面有效）
-          --rpm N         : 每分钟请求数限制
-          --no-resume     : 不从进度恢复（对谱面有效）
-
-        示例:
-          update                      # 更新排行榜
-          update --player             # 更新玩家资料（从players.txt）
-          update --stb --once --limit 50   # 更新谱面数据，只运行一次，最多50个
+        用法: update [--leaderboard|--player|--stb] [参数...]
+        说明:
+          - 默认更新 leaderboard
+          - 参数采用白名单映射，避免传入脚本不支持参数
         """
-        args = arg.split()
-        if not args:
-            # 默认更新排行榜
-            script = "malody_rankings.py"
-            cmd = [sys.executable, script, "--once"]
-        else:
-            if "--leaderboard" in args or (not "--player" in args and not "--stb" in args):
-                # 默认或明确指定排行榜
-                script = "malody_rankings.py"
-                cmd = [sys.executable, script]
-                if "--once" in args:
-                    cmd.append("--once")
-                # 排行榜不支持 limit 和 rpm，忽略
-            elif "--player" in args:
-                script = "player_profile_crawler.py"
-                cmd = [sys.executable, script]
-                if "--once" in args:
-                    cmd.append("--once")
-                # 解析 limit
-                if "--limit" in args:
-                    idx = args.index("--limit")
-                    if idx+1 < len(args):
-                        cmd.extend(["--limit", args[idx+1]])
-                # 其他参数如 --rpm 可添加
-            elif "--stb" in args:
-                script = "stb_crawler.py"
-                cmd = [sys.executable, script]
-                if "--once" in args:
-                    cmd.append("--once")
-                if "--limit" in args:
-                    idx = args.index("--limit")
-                    if idx+1 < len(args):
-                        cmd.extend(["--max-charts", args[idx+1]])
-                if "--rpm" in args:
-                    idx = args.index("--rpm")
-                    if idx+1 < len(args):
-                        cmd.extend(["--rpm", args[idx+1]])
-                if "--no-resume" in args:
-                    cmd.append("--no-resume")
-            else:
-                print(colorize("错误: 请指定爬虫类型: --leaderboard, --player, --stb", Colors.RED))
+        def parse_tokens(text):
+            try:
+                return shlex.split(text) if text else []
+            except ValueError as e:
+                print(colorize(f"参数解析失败: {e}", Colors.RED))
+                return None
+
+        def parse_options(tokens):
+            options = {}
+            i = 0
+            while i < len(tokens):
+                token = tokens[i]
+                if not token.startswith("--"):
+                    print(colorize(f"无效参数: {token}", Colors.RED))
+                    return None
+                if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                    options[token] = tokens[i + 1]
+                    i += 2
+                else:
+                    options[token] = True
+                    i += 1
+            return options
+
+        def parse_positive_int(name, value):
+            try:
+                iv = int(value)
+                if iv <= 0:
+                    raise ValueError()
+                return iv
+            except Exception:
+                print(colorize(f"参数 {name} 必须是正整数: {value}", Colors.RED))
+                return None
+
+        tokens = parse_tokens(arg)
+        if tokens is None:
+            return
+
+        crawler_flags = ["--leaderboard", "--player", "--stb"]
+        selected = [f for f in crawler_flags if f in tokens]
+        if len(selected) > 1:
+            print(colorize("错误: --leaderboard/--player/--stb 只能选一个", Colors.RED))
+            return
+        crawler_type = selected[0] if selected else "--leaderboard"
+        filtered_tokens = [t for t in tokens if t not in crawler_flags]
+        options = parse_options(filtered_tokens)
+        if options is None:
+            return
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        if crawler_type == "--leaderboard":
+            script = os.path.join(base_dir, "malody_rankings.py")
+            cmd = [sys.executable, script]
+            allow = {"--once"}
+            unknown = [k for k in options.keys() if k not in allow]
+            if unknown:
+                print(colorize(f"leaderboard 不支持参数: {', '.join(unknown)}", Colors.RED))
                 return
+            if options.get("--once") is True or not tokens:
+                cmd.append("--once")
+
+        elif crawler_type == "--player":
+            script = os.path.join(base_dir, "player_profile_crawler.py")
+            cmd = [sys.executable, script]
+            allow = {
+                "--uid", "--uid-list", "--uid-range", "--uid-file", "--from-db", "--from-leaderboard",
+                "--leaderboard-mode", "--limit", "--days-since-update", "--max-workers", "--rpm",
+                "--test", "--print-only", "--status", "--log-level", "--log-file",
+                "--no-default-players", "--resume-file", "--save-interval", "--once"
+            }
+            unknown = [k for k in options.keys() if k not in allow]
+            if unknown:
+                print(colorize(f"player 不支持参数: {', '.join(unknown)}", Colors.RED))
+                return
+
+            if options.get("--once"):
+                print(colorize("提示: player_profile_crawler.py 不支持 --once，已忽略", Colors.YELLOW))
+
+            value_flags = ["--uid", "--uid-list", "--uid-range", "--uid-file", "--log-level", "--log-file", "--resume-file"]
+            int_flags = ["--leaderboard-mode", "--limit", "--days-since-update", "--max-workers", "--rpm", "--save-interval"]
+            bool_flags = ["--from-db", "--from-leaderboard", "--test", "--print-only", "--status", "--no-default-players"]
+
+            for f in value_flags:
+                v = options.get(f)
+                if isinstance(v, str):
+                    cmd.extend([f, v])
+
+            for f in int_flags:
+                v = options.get(f)
+                if isinstance(v, str):
+                    iv = parse_positive_int(f, v)
+                    if iv is None:
+                        return
+                    cmd.extend([f, str(iv)])
+
+            for f in bool_flags:
+                if options.get(f) is True:
+                    cmd.append(f)
+
+        else:  # --stb
+            script = os.path.join(base_dir, "stb_crawler.py")
+            cmd = [sys.executable, script]
+            allow = {
+                "--once", "--limit", "--rpm", "--source", "--cid-crawl", "--sid-crawl",
+                "--retry-failed", "--start", "--end", "--resume", "--no-resume",
+                "--max-retries", "--skip-test", "--log-level", "--log-file"
+            }
+            unknown = [k for k in options.keys() if k not in allow]
+            if unknown:
+                print(colorize(f"stb 不支持参数: {', '.join(unknown)}", Colors.RED))
+                return
+
+            if options.get("--once") is True:
+                cmd.append("--once")
+            if options.get("--skip-test") is True:
+                cmd.append("--skip-test")
+
+            if isinstance(options.get("--source"), str):
+                source = options["--source"]
+                if source not in ["all", "home", "latest", "api"]:
+                    print(colorize("--source 仅支持 all/home/latest/api", Colors.RED))
+                    return
+                cmd.extend(["--source", source])
+
+            if isinstance(options.get("--limit"), str):
+                iv = parse_positive_int("--limit", options["--limit"])
+                if iv is None:
+                    return
+                cmd.extend(["--max-charts", str(iv)])
+
+            if isinstance(options.get("--rpm"), str):
+                iv = parse_positive_int("--rpm", options["--rpm"])
+                if iv is None:
+                    return
+                cmd.extend(["--rpm", str(iv)])
+
+            if isinstance(options.get("--max-retries"), str):
+                iv = parse_positive_int("--max-retries", options["--max-retries"])
+                if iv is None:
+                    return
+                cmd.extend(["--max-retries", str(iv)])
+
+            cid_crawl = options.get("--cid-crawl") is True
+            sid_crawl = options.get("--sid-crawl") is True
+            retry_failed = options.get("--retry-failed") is True
+            if cid_crawl:
+                cmd.append("--cid-crawl")
+            if sid_crawl:
+                cmd.append("--sid-crawl")
+            if retry_failed:
+                cmd.append("--retry-failed")
+
+            start_value = options.get("--start")
+            end_value = options.get("--end")
+            if isinstance(start_value, str):
+                sv = parse_positive_int("--start", start_value)
+                if sv is None:
+                    return
+                if cid_crawl or (not sid_crawl):
+                    cmd.extend(["--start-cid", str(sv)])
+                if sid_crawl:
+                    cmd.extend(["--start-sid", str(sv)])
+            if isinstance(end_value, str):
+                ev = parse_positive_int("--end", end_value)
+                if ev is None:
+                    return
+                if cid_crawl or (not sid_crawl):
+                    cmd.extend(["--end-cid", str(ev)])
+                if sid_crawl:
+                    cmd.extend(["--end-sid", str(ev)])
+
+            if "--no-resume" in options:
+                cmd.append("--no-resume")
+            elif isinstance(options.get("--resume"), str):
+                rv = options["--resume"].strip().lower()
+                if rv in ["false", "0", "no", "n"]:
+                    cmd.append("--no-resume")
+                elif rv not in ["true", "1", "yes", "y"]:
+                    print(colorize("--resume 仅支持 true/false", Colors.RED))
+                    return
+
+            if isinstance(options.get("--log-level"), str):
+                level = options["--log-level"].upper()
+                if level not in ["DEBUG", "INFO", "WARNING", "ERROR"]:
+                    print(colorize("--log-level 仅支持 DEBUG/INFO/WARNING/ERROR", Colors.RED))
+                    return
+                cmd.extend(["--log-level", level])
+            if isinstance(options.get("--log-file"), str):
+                cmd.extend(["--log-file", options["--log-file"]])
 
         print(colorize(f"\n开始执行: {' '.join(cmd)}", Colors.CYAN))
         try:
@@ -4530,42 +4668,206 @@ class MalodyViz(cmd.Cmd):
         export chart --mode 0 --limit 500
         export profile --players Zani
         """
-        args = arg.split()
+        args = shlex.split(arg) if arg else []
         if not args:
             print(colorize("错误: 请指定导出类型", Colors.RED))
             return
 
         export_type = args[0].lower()
-        # 简单解析，实际应使用 argparse 等
-        # 这里仅实现 chart 类型作为示例
+        opts = {}
+        i = 1
+        while i < len(args):
+            key = args[i]
+            if not key.startswith("--"):
+                print(colorize(f"无效参数: {key}", Colors.RED))
+                return
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                opts[key] = args[i + 1]
+                i += 2
+            else:
+                opts[key] = True
+                i += 1
+
+        mode = None
+        if "--mode" in opts and isinstance(opts["--mode"], str):
+            try:
+                mode = int(opts["--mode"])
+            except Exception:
+                print(colorize("--mode 必须是整数", Colors.RED))
+                return
+
+        limit = 1000
+        if "--limit" in opts and isinstance(opts["--limit"], str):
+            try:
+                limit = int(opts["--limit"])
+                if limit <= 0:
+                    raise ValueError()
+            except Exception:
+                print(colorize("--limit 必须是正整数", Colors.RED))
+                return
+
+        players = []
+        if "--players" in opts and isinstance(opts["--players"], str):
+            players = [x.strip() for x in opts["--players"].split(",") if x.strip()]
+
+        time_range = None
+        if "--time-range" in opts and isinstance(opts["--time-range"], str):
+            time_range = self._parse_time_range_string(opts["--time-range"])
+            if not time_range:
+                print(colorize("--time-range 格式无效，示例: 30d / 8w / 6m / 1y / 2025-01-01", Colors.RED))
+                return
+
         if export_type == "chart":
             selector = copy.deepcopy(self.selector)
-            # 处理简单参数
-            if "--mode" in args:
-                idx = args.index("--mode")
-                if idx+1 < len(args):
-                    try:
-                        mode = int(args[idx+1])
-                        selector.set_filters(modes=[mode])
-                        selector.current_mode = mode
-                    except:
-                        pass
+            if mode is not None:
+                selector.set_filters(modes=[mode])
+                selector.current_mode = mode
+            if players:
+                selector.set_filters(players=players)
+            if time_range:
+                selector.set_filters(time_range=time_range)
+
             where, params = selector.build_chart_sql_where("c")
             query = f"""
-            SELECT c.cid, s.title, s.artist, c.version, c.level, c.status,
+            SELECT c.cid, c.sid, s.title, s.artist, c.version, c.level, c.status,
                    c.creator_name, c.stabled_by_name, c.heat, c.donate_count, c.play_count,
                    c.last_updated, c.mode
             FROM charts c
             JOIN songs s ON c.sid = s.sid
             WHERE {where}
+            ORDER BY c.last_updated DESC, c.cid DESC
+            LIMIT ?
             """
-            df = pd.read_sql_query(query, self.conn, params=params)
+            df = pd.read_sql_query(query, self.conn, params=params + [limit])
             filename = self.get_unique_filename("charts_export.csv", "csv")
-            filepath = os.path.join(self.output_dir, filename)
-            df.to_csv(filepath, index=False, encoding='utf-8-sig')
-            print(colorize(f"已导出谱面数据: {filepath}", Colors.GREEN))
+
+        elif export_type == "top":
+            use_mode = mode if mode is not None else self.selector.current_mode
+            placeholders = ""
+            params = [use_mode, use_mode]
+            player_filter = ""
+            if players:
+                placeholders = ",".join(["?"] * len(players))
+                player_filter = f" AND pr.name IN ({placeholders})"
+                params.extend(players)
+
+            query = f"""
+            WITH latest AS (
+              SELECT MAX(crawl_time) AS ct FROM player_rankings WHERE mode = ?
+            )
+            SELECT pr.rank, pr.name, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc, pr.crawl_time, pr.mode
+            FROM player_rankings pr
+            WHERE pr.mode = ?
+              AND pr.crawl_time = (SELECT ct FROM latest)
+              {player_filter}
+            ORDER BY pr.rank ASC
+            LIMIT ?
+            """
+            params.append(limit)
+            df = pd.read_sql_query(query, self.conn, params=params)
+            filename = self.get_unique_filename("players_top_export.csv", "csv")
+
+        elif export_type == "history":
+            use_mode = mode if mode is not None else self.selector.current_mode
+            params = [use_mode]
+            player_filter = ""
+            if players:
+                placeholders = ",".join(["?"] * len(players))
+                player_filter = (
+                    f" AND (pr.name IN ({placeholders}) "
+                    f"OR pr.player_id IN (SELECT player_id FROM player_aliases WHERE alias IN ({placeholders})))"
+                )
+                params.extend(players)
+                params.extend(players)
+
+            time_filter = ""
+            if time_range:
+                time_filter = " AND pr.crawl_time BETWEEN ? AND ?"
+                params.extend([time_range["start"], time_range["end"]])
+
+            query = f"""
+            SELECT pr.player_id, pr.name, pr.mode, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc, pr.crawl_time
+            FROM player_rankings pr
+            WHERE pr.mode = ?
+              {player_filter}
+              {time_filter}
+            ORDER BY pr.crawl_time DESC, pr.rank ASC
+            LIMIT ?
+            """
+            params.append(limit)
+            df = pd.read_sql_query(query, self.conn, params=params)
+            filename = self.get_unique_filename("players_history_export.csv", "csv")
+
+        elif export_type == "song":
+            params = []
+            having_mode = ""
+            if mode is not None:
+                having_mode = " AND SUM(CASE WHEN c.mode = ? THEN 1 ELSE 0 END) > 0"
+                params.append(mode)
+
+            query = f"""
+            SELECT s.sid, s.title, s.artist,
+                   COUNT(DISTINCT c.cid) AS chart_count,
+                   COUNT(DISTINCT CASE WHEN c.status = 2 THEN c.cid END) AS stable_count,
+                   COUNT(DISTINCT c.mode) AS mode_count,
+                   MAX(c.last_updated) AS latest_chart_update
+            FROM songs s
+            LEFT JOIN charts c ON s.sid = c.sid
+            GROUP BY s.sid, s.title, s.artist
+            HAVING 1=1 {having_mode}
+            ORDER BY stable_count DESC, chart_count DESC, s.sid ASC
+            LIMIT ?
+            """
+            params.append(limit)
+            df = pd.read_sql_query(query, self.conn, params=params)
+            filename = self.get_unique_filename("songs_export.csv", "csv")
+
+        elif export_type == "profile":
+            cursor = self.conn.cursor()
+            cursor.execute("PRAGMA table_info(player_profiles)")
+            profile_columns = [row[1] for row in cursor.fetchall()]
+            if not profile_columns:
+                print(colorize("未找到 player_profiles 表，无法导出 profile", Colors.RED))
+                return
+
+            preferred = [
+                "player_id", "uid", "avatar_url", "country", "bio",
+                "join_date", "last_crawled", "needs_update"
+            ]
+            selected = [c for c in preferred if c in profile_columns]
+            if "player_id" not in selected:
+                selected.insert(0, "player_id")
+
+            selected_sql = ", ".join([f"pp.{c}" for c in selected])
+            params = []
+            player_filter = ""
+            if players:
+                placeholders = ",".join(["?"] * len(players))
+                player_filter = f"WHERE pi.current_name IN ({placeholders}) OR pa.alias IN ({placeholders})"
+                params.extend(players)
+                params.extend(players)
+
+            query = f"""
+            SELECT pi.current_name, {selected_sql}
+            FROM player_profiles pp
+            LEFT JOIN player_identity pi ON pp.player_id = pi.player_id
+            LEFT JOIN player_aliases pa ON pp.player_id = pa.player_id
+            {player_filter}
+            GROUP BY pp.player_id
+            ORDER BY pp.player_id DESC
+            LIMIT ?
+            """
+            params.append(limit)
+            df = pd.read_sql_query(query, self.conn, params=params)
+            filename = self.get_unique_filename("profiles_export.csv", "csv")
+
         else:
             print(colorize(f"导出类型 '{export_type}' 暂未实现", Colors.YELLOW))
+            return
+
+        filepath = os.path.join(self.output_dir, filename)
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+        print(colorize(f"已导出 {export_type} 数据: {filepath}", Colors.GREEN))
 
     @db_safe_operation
     def do_alias(self, arg):
