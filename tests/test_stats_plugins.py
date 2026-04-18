@@ -16,3 +16,4 @@ class TestStatsPlugins(TestCase):
         self.assertEqual(MalodyViz.do_crawl_status.__module__, "stats_cli.plugins.crawl_status_plugin")
         self.assertEqual(MalodyViz.do_mode.__module__, "stats_cli.plugins.utility_plugin")
         self.assertEqual(MalodyViz.do_exit.__module__, "stats_cli.plugins.utility_plugin")
+        self.assertEqual(MalodyViz.do_alias.__module__, "stats_cli.plugins.alias_plugin")
