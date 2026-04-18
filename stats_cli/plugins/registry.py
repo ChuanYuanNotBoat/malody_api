@@ -16,6 +16,7 @@ from stats_cli.plugins import (
     stb_quality_plugin,
     stb_compare_plugin,
     stb_creator_details_plugin,
+    stb_creator_trends_plugin,
     stb_stabled_by_plugin,
     stb_top_stabilizers_plugin,
     stb_summary_plugin,
@@ -181,6 +182,12 @@ def install_plugins(
         colors=colors,
         db_safe_operation=db_safe_operation,
         get_separator=get_separator,
+    )
+    stb_creator_trends_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
     )
     player_plugin.install(
         cls,
