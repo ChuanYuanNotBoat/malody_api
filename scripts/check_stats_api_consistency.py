@@ -9,9 +9,10 @@
 import argparse
 import json
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import requests
 
@@ -109,47 +110,95 @@ def compare_values(name: str, baseline: Any, api_value: Any) -> Dict[str, Any]:
     }
 
 
+def parse_csv_ints(raw: str) -> List[int]:
+    if not raw.strip():
+        return []
+    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def run_consistency_case(conn: sqlite3.Connection, base_url: str, mode: int, limit: int) -> Dict[str, Any]:
+    summary_base = calc_summary_baseline(conn, mode)
+    quality_base = calc_quality_baseline(conn, mode)
+    top_base = calc_top_stabilizers_baseline(conn, mode, limit)
+
+    summary_api = api_get(base_url, "/charts/summary", {"mode": mode})
+    quality_api = api_get(base_url, "/charts/quality", {"mode": mode})
+    top_api = api_get(base_url, "/charts/stabilizers/top", {"mode": mode, "limit": limit})
+
+    checks: List[Dict[str, Any]] = []
+    checks.append(compare_values("summary.total_charts", summary_base["total_charts"], summary_api.get("total_charts")))
+    checks.append(compare_values("summary.unique_songs", summary_base["unique_songs"], summary_api.get("unique_songs")))
+    checks.append(compare_values("summary.unique_creators", summary_base["unique_creators"], summary_api.get("unique_creators")))
+    checks.append(
+        compare_values("quality.total_charts_checked", quality_base["total_charts_checked"], quality_api.get("total_charts_checked"))
+    )
+    for key, val in quality_base["issues"].items():
+        api_count = (quality_api.get("issues", {}).get(key) or {}).get("count")
+        checks.append(compare_values(f"quality.issues.{key}.count", val, api_count))
+
+    baseline_top_pairs = [(x["stabilizer_name"], x["stable_count"]) for x in top_base]
+    api_top_pairs = [(x.get("stabilizer_name"), x.get("stable_count")) for x in top_api]
+    checks.append(compare_values("top_stabilizers.rank_pairs", baseline_top_pairs, api_top_pairs))
+
+    failed = [x for x in checks if not x["equal"]]
+    return {
+        "mode": mode,
+        "limit": limit,
+        "checks": checks,
+        "summary": {"total_checks": len(checks), "failed_checks": len(failed)},
+        "failed_items": [x["name"] for x in failed],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compare DB baseline stats with API responses.")
     parser.add_argument("--db-path", default="malody_rankings.db")
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--mode", type=int, default=-1)
+    parser.add_argument("--modes", default="", help="Comma-separated mode list. If set, overrides --mode.")
     parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--limits", default="", help="Comma-separated limit list. If set, overrides --limit.")
+    parser.add_argument(
+        "--fail-threshold",
+        type=int,
+        default=0,
+        help="Exit with code 1 when a case has failed_checks greater than this threshold.",
+    )
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
     conn = db_connect(args.db_path)
     try:
-        summary_base = calc_summary_baseline(conn, args.mode)
-        quality_base = calc_quality_baseline(conn, args.mode)
-        top_base = calc_top_stabilizers_baseline(conn, args.mode, args.limit)
+        modes: Sequence[int] = parse_csv_ints(args.modes) if args.modes.strip() else [args.mode]
+        limits: Sequence[int] = parse_csv_ints(args.limits) if args.limits.strip() else [args.limit]
+        if not modes:
+            raise ValueError("No mode provided. Set --mode or --modes.")
+        if not limits:
+            raise ValueError("No limit provided. Set --limit or --limits.")
 
-        summary_api = api_get(args.base_url, "/charts/summary", {"mode": args.mode})
-        quality_api = api_get(args.base_url, "/charts/quality", {"mode": args.mode})
-        top_api = api_get(args.base_url, "/charts/stabilizers/top", {"mode": args.mode, "limit": args.limit})
+        cases: List[Dict[str, Any]] = []
+        for mode in modes:
+            for limit in limits:
+                cases.append(run_consistency_case(conn, args.base_url, mode=mode, limit=limit))
 
         report = {
             "generated_at": datetime.now().isoformat(),
-            "params": {"mode": args.mode, "limit": args.limit, "base_url": args.base_url, "db_path": args.db_path},
-            "checks": [],
+            "params": {
+                "mode": args.mode,
+                "modes": list(modes),
+                "limit": args.limit,
+                "limits": list(limits),
+                "base_url": args.base_url,
+                "db_path": args.db_path,
+                "fail_threshold": args.fail_threshold,
+            },
+            "cases": cases,
+            "summary": {
+                "total_cases": len(cases),
+                "failed_cases": sum(1 for case in cases if case["summary"]["failed_checks"] > 0),
+                "max_failed_checks": max((case["summary"]["failed_checks"] for case in cases), default=0),
+            },
         }
-
-        report["checks"].append(compare_values("summary.total_charts", summary_base["total_charts"], summary_api.get("total_charts")))
-        report["checks"].append(compare_values("summary.unique_songs", summary_base["unique_songs"], summary_api.get("unique_songs")))
-        report["checks"].append(compare_values("summary.unique_creators", summary_base["unique_creators"], summary_api.get("unique_creators")))
-        report["checks"].append(
-            compare_values("quality.total_charts_checked", quality_base["total_charts_checked"], quality_api.get("total_charts_checked"))
-        )
-        for key, val in quality_base["issues"].items():
-            api_count = (quality_api.get("issues", {}).get(key) or {}).get("count")
-            report["checks"].append(compare_values(f"quality.issues.{key}.count", val, api_count))
-
-        baseline_top_pairs = [(x["stabilizer_name"], x["stable_count"]) for x in top_base]
-        api_top_pairs = [(x.get("stabilizer_name"), x.get("stable_count")) for x in top_api]
-        report["checks"].append(compare_values("top_stabilizers.rank_pairs", baseline_top_pairs, api_top_pairs))
-
-        failed = [x for x in report["checks"] if not x["equal"]]
-        report["summary"] = {"total_checks": len(report["checks"]), "failed_checks": len(failed)}
 
         output_path = args.output.strip()
         if not output_path:
@@ -159,11 +208,24 @@ def main():
         out = Path(output_path)
         out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Report written: {out.resolve()}")
-        print(f"Checks: {report['summary']['total_checks']}, failed: {report['summary']['failed_checks']}")
-        if failed:
-            print("Failed items:")
-            for item in failed:
-                print(f"- {item['name']}")
+        print(
+            "Cases: "
+            f"{report['summary']['total_cases']}, "
+            f"failed cases: {report['summary']['failed_cases']}, "
+            f"max failed checks: {report['summary']['max_failed_checks']}"
+        )
+        for case in cases:
+            if case["summary"]["failed_checks"] > 0:
+                print(f"[mode={case['mode']} limit={case['limit']}] failed: {case['summary']['failed_checks']}")
+                for item in case["failed_items"]:
+                    print(f"- {item}")
+
+        if report["summary"]["max_failed_checks"] > args.fail_threshold:
+            print(
+                f"Consistency gate failed: max_failed_checks={report['summary']['max_failed_checks']} "
+                f"> threshold={args.fail_threshold}"
+            )
+            sys.exit(1)
     finally:
         conn.close()
 
