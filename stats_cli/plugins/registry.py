@@ -5,6 +5,7 @@ from stats_cli.plugins import (
     help_plugin,
     optimize_plugin,
     player_plugin,
+    profile_plugin,
     repair_plugin,
     select_plugin,
     top_plugin,
@@ -75,4 +76,10 @@ def install_plugins(
         colors=colors,
         db_safe_operation=db_safe_operation,
         get_separator=get_separator,
+    )
+    profile_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
     )
