@@ -11,6 +11,7 @@ from stats_cli.plugins import (
     repair_plugin,
     search_plugin,
     select_plugin,
+    stb_stats_plugin,
     top_plugin,
     top_chart_plugin,
     trend_plugin,
@@ -89,6 +90,13 @@ def install_plugins(
         get_separator=get_separator,
     )
     search_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
+        get_separator=get_separator,
+    )
+    stb_stats_plugin.install(
         cls,
         colorize=colorize,
         colors=colors,
