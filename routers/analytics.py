@@ -62,7 +62,7 @@ async def analyze_player_trends(
 
 @router.get("/chart-trends", response_model=APIResponse)
 async def get_chart_trends(
-    mode: int = Query(..., description="游戏模式"),
+    mode: int = Query(..., ge=0, le=9, description="游戏模式"),
     period: str = Query("months", description="时间段: days, months"),
     creators: Optional[str] = Query(None, description="创作者筛选，逗号分隔"),
     difficulties: Optional[str] = Query(None, description="难度范围，如5-10"),
@@ -94,7 +94,7 @@ async def get_chart_trends(
                 pass
         
         if period not in ["days", "months"]:
-            period = "months"
+            raise HTTPException(status_code=400, detail="period 仅支持 days 或 months")
         
         trend_data = analysis_service.get_chart_trends(selector, period)
         
@@ -105,6 +105,8 @@ async def get_chart_trends(
             timestamp=datetime.now()
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         return APIResponse(
             success=False,
@@ -154,7 +156,7 @@ async def compare_modes(
 @router.get("/player-compare", response_model=APIResponse)
 async def compare_players(
     players: str = Query(..., description="要比较的玩家（UID/别名/当前名），逗号分隔"),
-    mode: int = Query(..., description="游戏模式"),
+    mode: int = Query(..., ge=0, le=9, description="游戏模式"),
     days: int = Query(30, description="时间窗口天数", ge=1, le=365)
 ):
     """比较多个玩家在一段时间内的排名变化"""
@@ -162,6 +164,8 @@ async def compare_players(
         player_list = [item.strip() for item in players.split(",") if item.strip()]
         if len(player_list) < 1:
             raise HTTPException(status_code=400, detail="players 参数不能为空")
+        if len(player_list) > 20:
+            raise HTTPException(status_code=400, detail="players 最多支持 20 个")
 
         data = analysis_service.compare_players(
             player_identifiers=player_list,

@@ -19,7 +19,8 @@ def create_chart_selector_from_query(
     modes: Optional[str] = None,
     difficulties: Optional[str] = None,
     time_range: Optional[str] = None,
-    statuses: Optional[str] = None
+    statuses: Optional[str] = None,
+    strict: bool = False
 ) -> MCSelector:
     """从查询参数创建谱面选择器"""
     selector = MCSelector()
@@ -32,7 +33,8 @@ def create_chart_selector_from_query(
             mode_list = [int(m.strip()) for m in modes.split(',')]
             selector.set_filters(modes=mode_list)
         except ValueError:
-            pass
+            if strict:
+                raise HTTPException(status_code=400, detail="modes 参数格式无效，应为逗号分隔整数")
     
     if difficulties:
         try:
@@ -42,21 +44,31 @@ def create_chart_selector_from_query(
             else:
                 selector.set_filters(difficulties=[float(difficulties.strip())])
         except ValueError:
-            pass
+            if strict:
+                raise HTTPException(status_code=400, detail="difficulties 参数格式无效，示例: 5-10 或 9")
     
     if statuses:
         try:
             status_list = [int(s.strip()) for s in statuses.split(',')]
+            invalid_status = [s for s in status_list if s not in [0, 1, 2]]
+            if invalid_status:
+                raise HTTPException(status_code=400, detail=f"无效状态值: {','.join(map(str, invalid_status))}")
             selector.set_filters(statuses=status_list)
         except ValueError:
-            pass
+            if strict:
+                raise HTTPException(status_code=400, detail="statuses 参数格式无效，应为逗号分隔整数")
     
     if time_range:
-        selector.set_filters(time_range=parse_time_range(time_range))
+        parsed = parse_time_range(time_range)
+        if parsed is None:
+            if strict:
+                raise HTTPException(status_code=400, detail="time_range 格式无效，示例: 7d/30d/8w/6m/2026-01-01")
+        else:
+            selector.set_filters(time_range=parsed)
     
     return selector
 
-def parse_time_range(time_range: str) -> dict:
+def parse_time_range(time_range: str) -> Optional[dict]:
     """解析时间范围参数"""
     from datetime import datetime, timedelta
     now = datetime.now()
@@ -78,7 +90,7 @@ def parse_time_range(time_range: str) -> dict:
             target_date = datetime.strptime(time_range, '%Y-%m-%d')
             return {'start': target_date, 'end': now}
     except (ValueError, TypeError):
-        return {'start': now - timedelta(days=30), 'end': now}
+        return None
 
 
 def parse_last_time_window(last: str) -> Optional[dict]:
@@ -260,13 +272,20 @@ async def get_chart_summary(
             modes=str(mode) if mode is not None else None,
             difficulties=difficulties,
             time_range=time_range,
-            statuses=statuses
+            statuses=statuses,
+            strict=True
         )
         if mode is not None:
+            if mode < 0 or mode > 9:
+                raise HTTPException(status_code=400, detail="mode 应在 0-9 范围内")
             selector.current_mode = mode
-        level = detail_level if detail_level in ["basic", "detailed"] else "basic"
+        if detail_level not in ["basic", "detailed"]:
+            raise HTTPException(status_code=400, detail="detail_level 仅支持 basic 或 detailed")
+        level = detail_level
         summary = chart_service.get_chart_summary(selector, level)
         return APIResponse(success=True, data=summary, timestamp=datetime.now())
+    except HTTPException:
+        raise
     except Exception as e:
         return APIResponse(success=False, error=str(e), timestamp=datetime.now())
 
@@ -286,19 +305,24 @@ async def get_chart_quality(
             modes=str(mode) if mode is not None else None,
             difficulties=difficulties,
             time_range=time_range,
-            statuses=statuses
+            statuses=statuses,
+            strict=True
         )
         if mode is not None:
+            if mode < 0 or mode > 9:
+                raise HTTPException(status_code=400, detail="mode 应在 0-9 范围内")
             selector.current_mode = mode
         data = chart_service.get_chart_quality(selector)
         return APIResponse(success=True, data=data, timestamp=datetime.now())
+    except HTTPException:
+        raise
     except Exception as e:
         return APIResponse(success=False, error=str(e), timestamp=datetime.now())
 
 
 @router.get("/stabilizers/top", response_model=APIResponse)
 async def get_top_stabilizers(
-    mode: int = Query(-1, description="模式，-1 表示全部模式"),
+    mode: int = Query(-1, ge=-1, le=9, description="模式，-1 表示全部模式"),
     limit: int = Query(20, description="返回数量", ge=1, le=100)
 ):
     """获取顶级稳定者排行榜"""
@@ -317,8 +341,8 @@ async def get_top_stabilizers(
 @router.get("/creators/{creator_name}/details", response_model=APIResponse)
 async def get_creator_details(
     creator_name: str,
-    mode: int = Query(-1, description="模式，-1 表示全部模式"),
-    status: Optional[int] = Query(None, description="状态筛选：0/1/2"),
+    mode: int = Query(-1, ge=-1, le=9, description="模式，-1 表示全部模式"),
+    status: Optional[int] = Query(None, ge=0, le=2, description="状态筛选：0/1/2"),
     limit: int = Query(100, description="谱面列表上限", ge=1, le=500)
 ):
     """获取创作者详情及谱面列表"""
@@ -338,16 +362,20 @@ async def get_creator_details(
 async def get_creator_trends(
     creator_name: str,
     period: str = Query("months", description="周期: days, months"),
-    mode: int = Query(-1, description="模式，-1 表示全部模式"),
-    status: Optional[int] = Query(None, description="状态筛选：0/1/2"),
+    mode: int = Query(-1, ge=-1, le=9, description="模式，-1 表示全部模式"),
+    status: Optional[int] = Query(None, ge=0, le=2, description="状态筛选：0/1/2"),
     since: Optional[str] = Query(None, description="起始时间 YYYY-MM-DD"),
     last: Optional[str] = Query(None, description="相对时间窗口，如 90d/6m")
 ):
     """获取创作者谱面更新趋势"""
     try:
-        p = period if period in ["days", "months"] else "months"
+        if period not in ["days", "months"]:
+            raise HTTPException(status_code=400, detail="period 仅支持 days 或 months")
+        p = period
         start_date = None
         end_date = datetime.now()
+        if since and last:
+            raise HTTPException(status_code=400, detail="since 与 last 不能同时使用")
 
         if since:
             try:
@@ -383,6 +411,8 @@ async def get_creator_trends(
             message=f"找到 {len(data)} 个时间段的数据",
             timestamp=datetime.now()
         )
+    except HTTPException:
+        raise
     except Exception as e:
         return APIResponse(success=False, error=str(e), timestamp=datetime.now())
 
