@@ -19,3 +19,4 @@ class TestStatsPlugins(TestCase):
         self.assertEqual(MalodyViz.do_alias.__module__, "stats_cli.plugins.alias_plugin")
         self.assertEqual(MalodyViz.do_help.__module__, "stats_cli.plugins.help_plugin")
         self.assertEqual(MalodyViz.do_select.__module__, "stats_cli.plugins.select_plugin")
+        self.assertEqual(MalodyViz.do_repair.__module__, "stats_cli.plugins.repair_plugin")

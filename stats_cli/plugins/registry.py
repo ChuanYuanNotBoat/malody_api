@@ -4,6 +4,7 @@ from stats_cli.plugins import (
     export_plugin,
     help_plugin,
     optimize_plugin,
+    repair_plugin,
     select_plugin,
     update_plugin,
     utility_plugin,
@@ -39,5 +40,12 @@ def install_plugins(cls, *, colorize, colors, db_safe_operation, get_separator, 
         cls,
         colorize=colorize,
         colors=colors,
+        get_separator=get_separator,
+    )
+    repair_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
         get_separator=get_separator,
     )
