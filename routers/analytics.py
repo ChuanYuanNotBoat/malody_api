@@ -149,3 +149,44 @@ async def compare_modes(
             error=str(e),
             timestamp=datetime.now()
         )
+
+
+@router.get("/player-compare", response_model=APIResponse)
+async def compare_players(
+    players: str = Query(..., description="要比较的玩家（UID/别名/当前名），逗号分隔"),
+    mode: int = Query(..., description="游戏模式"),
+    days: int = Query(30, description="时间窗口天数", ge=1, le=365)
+):
+    """比较多个玩家在一段时间内的排名变化"""
+    try:
+        player_list = [item.strip() for item in players.split(",") if item.strip()]
+        if len(player_list) < 1:
+            raise HTTPException(status_code=400, detail="players 参数不能为空")
+
+        data = analysis_service.compare_players(
+            player_identifiers=player_list,
+            mode=mode,
+            days=days
+        )
+
+        if data is None:
+            return APIResponse(
+                success=False,
+                error="玩家对比分析失败",
+                timestamp=datetime.now()
+            )
+
+        return APIResponse(
+            success=True,
+            data=data,
+            message=f"已对比 {len(data.get('players', []))} 位玩家",
+            timestamp=datetime.now()
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        return APIResponse(
+            success=False,
+            error=str(e),
+            timestamp=datetime.now()
+        )

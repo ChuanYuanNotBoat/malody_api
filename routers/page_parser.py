@@ -7,6 +7,7 @@ import json
 import os
 import re
 import asyncio
+import logging
 import aiohttp
 from bs4 import BeautifulSoup
 
@@ -15,6 +16,7 @@ from malody_api.core.models import APIResponse
 from malody_api.utils.crawler_manager import crawler_manager
 
 router = APIRouter(prefix="/page-parser", tags=["page-parser"])
+logger = logging.getLogger(__name__)
 
 # 冷却时间跟踪（内存中）
 crawler_cooldown = {}
@@ -46,9 +48,9 @@ try:
     mod_mapping_path = os.path.join(os.path.dirname(__file__), '..', 'mod_mapping.json')
     with open(mod_mapping_path, 'r', encoding='utf-8') as f:
         MOD_MAPPING = json.load(f)
-    print(f"✅ 成功加载Mod映射，共{len(MOD_MAPPING)}个Mod")
+    logger.info("Loaded mod mapping entries: %s", len(MOD_MAPPING))
 except Exception as e:
-    print(f"❌ 加载Mod映射失败: {e}，使用占位符映射")
+    logger.warning("Failed to load mod mapping: %s; using fallback mapping", e)
     # 创建占位符映射
     MOD_MAPPING = {f"g_mod_{i}": f"mod_{i}" for i in range(20)}
 
@@ -200,7 +202,7 @@ class PageParserService:
                 "hit_stats": hit_stats
             }
         except Exception as e:
-            print(f"解析排行榜项目失败: {e}")
+            logger.warning("Failed to parse ranking item: %s", e)
             return None
     
     def _parse_rank(self, item) -> Optional[int]:
@@ -478,6 +480,116 @@ async def search_songs(
             timestamp=datetime.now()
         )
 
+
+@router.get("/song/{sid}", response_model=APIResponse)
+async def get_song_details(
+    sid: int,
+    include_charts: bool = Query(True, description="是否返回谱面列表")
+):
+    """获取歌曲详情及其关联谱面统计（数据库）"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT s.sid, s.title, s.artist
+            FROM songs s
+            WHERE s.sid = ?
+            """,
+            (sid,)
+        )
+        song_row = cursor.fetchone()
+        if not song_row:
+            raise HTTPException(status_code=404, detail=f"未找到 SID={sid} 的歌曲")
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total_charts,
+                COUNT(CASE WHEN c.status = 2 THEN 1 END) AS stable_count,
+                COUNT(CASE WHEN c.status = 1 THEN 1 END) AS beta_count,
+                COUNT(CASE WHEN c.status = 0 THEN 1 END) AS alpha_count,
+                COUNT(DISTINCT c.mode) AS mode_count,
+                AVG(CASE WHEN c.level IS NOT NULL AND c.level != '' THEN CAST(c.level AS REAL) END) AS avg_level,
+                MAX(c.heat) AS max_heat,
+                MAX(c.last_updated) AS latest_update
+            FROM charts c
+            WHERE c.sid = ?
+            """,
+            (sid,)
+        )
+        stats_row = cursor.fetchone()
+
+        charts = []
+        if include_charts:
+            cursor.execute(
+                """
+                SELECT
+                    c.cid, c.mode, c.level, c.status, c.version,
+                    c.creator_name, c.stabled_by_name, c.heat,
+                    c.play_count, c.donate_count, c.last_updated
+                FROM charts c
+                WHERE c.sid = ?
+                ORDER BY c.mode ASC, c.status DESC, c.heat DESC, c.cid ASC
+                """,
+                (sid,)
+            )
+            chart_rows = cursor.fetchall()
+            charts = [
+                {
+                    "cid": row[0],
+                    "mode": row[1],
+                    "level": row[2],
+                    "status": row[3],
+                    "version": row[4],
+                    "creator_name": row[5],
+                    "stabled_by_name": row[6],
+                    "heat": row[7],
+                    "play_count": row[8],
+                    "donate_count": row[9],
+                    "last_updated": row[10],
+                }
+                for row in chart_rows
+            ]
+
+        data = {
+            "song": {
+                "sid": song_row[0],
+                "title": song_row[1],
+                "artist": song_row[2],
+            },
+            "stats": {
+                "total_charts": stats_row[0] or 0,
+                "stable_count": stats_row[1] or 0,
+                "beta_count": stats_row[2] or 0,
+                "alpha_count": stats_row[3] or 0,
+                "mode_count": stats_row[4] or 0,
+                "avg_level": float(stats_row[5]) if stats_row[5] is not None else None,
+                "max_heat": stats_row[6],
+                "latest_update": stats_row[7],
+            },
+            "charts": charts if include_charts else None,
+        }
+
+        return APIResponse(
+            success=True,
+            data=data,
+            timestamp=datetime.now()
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        return APIResponse(
+            success=False,
+            error=str(e),
+            timestamp=datetime.now()
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
 async def trigger_sid_update(sid: int) -> Dict[str, Any]:
     """触发SID更新"""
     try:
@@ -497,7 +609,7 @@ async def trigger_sid_update(sid: int) -> Dict[str, Any]:
             "--skip-test"
         ]
         
-        print(f"🚀 执行爬虫命令: {' '.join(cmd)}")
+        logger.info("Running crawler command: %s", " ".join(cmd))
         
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -523,15 +635,15 @@ async def trigger_sid_update(sid: int) -> Dict[str, Any]:
         }
         
         if result["success"]:
-            print(f"✅ SID {sid} 爬取成功")
+            logger.info("SID %s crawler finished successfully", sid)
         else:
-            print(f"❌ SID {sid} 爬取失败: {result['stderr'][:200]}")
+            logger.warning("SID %s crawler failed: %s", sid, result["stderr"][:200])
         
         return result
         
     except Exception as e:
-        error_msg = f"执行爬虫时发生错误: {str(e)}"
-        print(f"❌ {error_msg}")
+        error_msg = f"Failed to execute crawler: {str(e)}"
+        logger.exception(error_msg)
         return {
             "success": False,
             "error": error_msg

@@ -303,3 +303,92 @@ class AnalysisService:
             
         finally:
             conn.close()
+
+    @db_safe_operation
+    def compare_players(self, player_identifiers: List[str], mode: int, days: int = 30) -> Dict[str, Any]:
+        """比较多个玩家的排名变化"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+
+            players_data: List[Dict[str, Any]] = []
+            not_found: List[str] = []
+
+            for identifier in player_identifiers:
+                identifier = identifier.strip()
+                if not identifier:
+                    continue
+
+                player_id = None
+                if identifier.isdigit():
+                    cursor.execute("SELECT player_id FROM player_identity WHERE uid = ?", (identifier,))
+                    row = cursor.fetchone()
+                    if row:
+                        player_id = row[0]
+                else:
+                    cursor.execute("SELECT player_id FROM player_aliases WHERE alias = ?", (identifier,))
+                    row = cursor.fetchone()
+                    if row:
+                        player_id = row[0]
+                    else:
+                        cursor.execute("SELECT player_id FROM player_identity WHERE current_name = ?", (identifier,))
+                        row = cursor.fetchone()
+                        if row:
+                            player_id = row[0]
+
+                if not player_id:
+                    not_found.append(identifier)
+                    continue
+
+                cursor.execute(
+                    """
+                    SELECT pr.rank, pr.crawl_time, pr.name
+                    FROM player_rankings pr
+                    WHERE pr.player_id = ? AND pr.mode = ? AND pr.crawl_time >= ?
+                    ORDER BY pr.crawl_time
+                    """,
+                    (player_id, mode, start_date)
+                )
+                history_rows = cursor.fetchall()
+
+                if not history_rows:
+                    players_data.append({
+                        "identifier": identifier,
+                        "player_id": player_id,
+                        "name": identifier,
+                        "history": [],
+                        "summary": None
+                    })
+                    continue
+
+                history = [{"date": row[1], "rank": row[0]} for row in history_rows]
+                first_rank = history_rows[0][0]
+                last_rank = history_rows[-1][0]
+                display_name = history_rows[-1][2] or identifier
+
+                players_data.append({
+                    "identifier": identifier,
+                    "player_id": player_id,
+                    "name": display_name,
+                    "history": history,
+                    "summary": {
+                        "start_rank": first_rank,
+                        "end_rank": last_rank,
+                        "rank_change": last_rank - first_rank,
+                        "points": len(history)
+                    }
+                })
+
+            return {
+                "mode": mode,
+                "days": days,
+                "start_date": start_date,
+                "end_date": end_date,
+                "players": players_data,
+                "not_found": not_found
+            }
+        finally:
+            conn.close()
