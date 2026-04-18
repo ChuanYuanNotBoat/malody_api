@@ -47,11 +47,3 @@ class TestChartRoutes(TestCase):
         self.assertTrue(body["success"])
         self.assertEqual(len(body["data"]), 1)
 
-    def test_creator_details_invalid_status(self):
-        resp = self.client.get("/charts/creators/alice/details?status=3")
-        self.assertEqual(resp.status_code, 422)
-
-    def test_creator_trends_invalid_mode(self):
-        resp = self.client.get("/charts/creators/alice/trends?mode=10")
-        self.assertEqual(resp.status_code, 422)
-

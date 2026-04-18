@@ -1,7 +1,7 @@
 # TODO（按子系统分块）
 
 ## 0. 全局状态
-- 分支：`main`
+- 分支：`feat/todo-full-implementation`
 - 总体结论：核心 API/CLI/测试链路已打通，可用性从“功能缺口期”进入“稳定化期”
 - 当前主要风险：官网结构/API 变动导致爬虫数据源阶段性不可用（已知问题，后续单独修复）
 
@@ -20,7 +20,7 @@
 - [x] `/crawler/status` 统一状态摘要结构
 
 ### 下一步
-- [x] 为 `player-compare` 和 `creator*` 增加更多边界参数校验（空值、异常区间）
+- [ ] 为 `player-compare` 和 `creator*` 增加更多边界参数校验（空值、异常区间）
 - [ ] 统一错误码语义（400/404/422）并补充错误响应文档
 
 ---
@@ -83,5 +83,5 @@
 - [x] `python -m unittest discover -s tests -p "test_*.py" -v`
 - [x] `python -m compileall -q`（关键文件）
 - [ ] （可选）本地启动 API 后执行一次 `scripts/check_stats_api_consistency.py`
-- [x] 合并到 `main`
+- [ ] 合并到 `main`
 - [ ] 打标签/发布说明（按需）
