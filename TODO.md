@@ -35,13 +35,13 @@
 - [x] 统一参数校验策略（`mode/status/limit/date`）
 - [x] 统一错误码语义（400 参数错误 / 404 数据不存在 / 422 校验失败）
 - [x] 补全边界测试：空参数、越界参数、组合冲突参数
-- [ ] 对关键新增接口补“错误响应示例”
+- [x] 对关键新增接口补“错误响应示例”
 
 ### 涉及接口
 - [x] `/analytics/player-compare`
 - [x] `/charts/creators/{creator_name}/details`
 - [x] `/charts/creators/{creator_name}/trends`
-- [ ] `/crawler/run`
+- [x] `/crawler/run`
 
 ---
 

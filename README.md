@@ -148,6 +148,35 @@ GET /charts/stabilizers/top?mode=-1&limit=20
 GET /page-parser/song/12345?include_charts=true
 ```
 
+### 错误响应示例
+
+- 参数语义错误（400）：
+```json
+{
+  "detail": "period 仅支持 days 或 months"
+}
+```
+
+- 参数校验错误（422）：
+```json
+{
+  "detail": [
+    {
+      "type": "less_than_equal",
+      "loc": ["query", "mode"],
+      "msg": "Input should be less than or equal to 9"
+    }
+  ]
+}
+```
+
+- 服务配置错误（500）：
+```json
+{
+  "detail": "爬虫脚本不存在: <absolute_script_path>"
+}
+```
+
 ## 配置说明
 
 ### 环境变量
