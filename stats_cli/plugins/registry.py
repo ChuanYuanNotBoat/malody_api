@@ -14,6 +14,7 @@ from stats_cli.plugins import (
     search_plugin,
     stb_recent_plugin,
     stb_quality_plugin,
+    stb_compare_plugin,
     stb_summary_plugin,
     stb_trends_plugin,
     select_plugin,
@@ -144,6 +145,13 @@ def install_plugins(
         get_separator=get_separator,
     )
     stb_trends_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
+        get_separator=get_separator,
+    )
+    stb_compare_plugin.install(
         cls,
         colorize=colorize,
         colors=colors,
