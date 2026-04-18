@@ -298,7 +298,7 @@ async def get_chart_quality(
 
 @router.get("/stabilizers/top", response_model=APIResponse)
 async def get_top_stabilizers(
-    mode: int = Query(-1, description="模式，-1 表示全部模式"),
+    mode: int = Query(-1, ge=-1, le=9, description="模式，-1 表示全部模式"),
     limit: int = Query(20, description="返回数量", ge=1, le=100)
 ):
     """获取顶级稳定者排行榜"""
@@ -317,12 +317,14 @@ async def get_top_stabilizers(
 @router.get("/creators/{creator_name}/details", response_model=APIResponse)
 async def get_creator_details(
     creator_name: str,
-    mode: int = Query(-1, description="模式，-1 表示全部模式"),
-    status: Optional[int] = Query(None, description="状态筛选：0/1/2"),
+    mode: int = Query(-1, ge=-1, le=9, description="模式，-1 表示全部模式"),
+    status: Optional[int] = Query(None, ge=0, le=2, description="状态筛选：0/1/2"),
     limit: int = Query(100, description="谱面列表上限", ge=1, le=500)
 ):
     """获取创作者详情及谱面列表"""
     try:
+        if not creator_name.strip():
+            raise HTTPException(status_code=400, detail="creator_name 不能为空")
         data = chart_service.get_creator_details(
             creator_name=creator_name,
             mode=mode,
@@ -338,13 +340,15 @@ async def get_creator_details(
 async def get_creator_trends(
     creator_name: str,
     period: str = Query("months", description="周期: days, months"),
-    mode: int = Query(-1, description="模式，-1 表示全部模式"),
-    status: Optional[int] = Query(None, description="状态筛选：0/1/2"),
+    mode: int = Query(-1, ge=-1, le=9, description="模式，-1 表示全部模式"),
+    status: Optional[int] = Query(None, ge=0, le=2, description="状态筛选：0/1/2"),
     since: Optional[str] = Query(None, description="起始时间 YYYY-MM-DD"),
     last: Optional[str] = Query(None, description="相对时间窗口，如 90d/6m")
 ):
     """获取创作者谱面更新趋势"""
     try:
+        if not creator_name.strip():
+            raise HTTPException(status_code=400, detail="creator_name 不能为空")
         p = period if period in ["days", "months"] else "months"
         start_date = None
         end_date = datetime.now()
