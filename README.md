@@ -67,9 +67,14 @@ python run.py
 
 #### 谱面数据
 - `GET /charts/stats` - 获取谱面统计信息
+- `GET /charts/summary` - 获取谱面综合统计摘要
+- `GET /charts/quality` - 获取谱面数据质量检查结果
 - `GET /charts/hot` - 获取热门谱面
 - `GET /charts/recent` - 获取最近更新的谱面
 - `GET /charts/stable-creators` - 获取 Stable 谱面创作者排行榜
+- `GET /charts/stabilizers/top` - 获取稳定者排行榜
+- `GET /charts/creators/{creator_name}/details` - 获取创作者详情及谱面列表
+- `GET /charts/creators/{creator_name}/trends` - 获取创作者谱面更新趋势
 - `GET /charts/{cid}` - 获取单个谱面的详细信息（包含歌曲数据）
 - `GET /charts/stabilizers/{player_name}/stats` - 获取稳定者的统计信息
 - `GET /charts/stabilizers/{player_name}/charts` - 获取稳定者审核的谱面列表
@@ -81,12 +86,13 @@ python run.py
 - `GET /page-parser/chart/{cid}` - 解析谱面页面（包含谱面信息和排行榜）
 - `GET /page-parser/chart/{cid}/ranking` - 仅获取谱面排行榜数据
 - `GET /page-parser/song/search` - 搜索歌曲（从数据库）
-- `GET /page-parser/song/{sid}` - 获取歌曲详细信息（待实现）
+- `GET /page-parser/song/{sid}` - 获取歌曲详细信息（歌曲 + 谱面 + 统计）
 
 #### 数据分析
 - `GET /analytics/player-trends` - 分析玩家数据变化趋势
 - `GET /analytics/chart-trends` - 获取谱面更新趋势
 - `GET /analytics/mode-comparison` - 比较不同模式的谱面数据
+- `GET /analytics/player-compare` - 比较多个玩家在时间窗口内的排名变化
 
 #### 高级查询
 - `POST /query/execute` - 执行高级数据库查询
@@ -113,6 +119,33 @@ python run.py
     "error": null,
     "timestamp": "2024-01-01T00:00:00Z"
 }
+```
+
+### 新增接口示例
+
+- 玩家对比：
+```bash
+GET /analytics/player-compare?players=Alice,Bob&mode=0&days=30
+```
+
+- 谱面综合统计：
+```bash
+GET /charts/summary?mode=0&detail_level=detailed&time_range=90d
+```
+
+- 谱面质量检查：
+```bash
+GET /charts/quality?mode=0
+```
+
+- 稳定者排行榜（默认 `limit=20`，上限 `100`）：
+```bash
+GET /charts/stabilizers/top?mode=-1&limit=20
+```
+
+- 歌曲详情：
+```bash
+GET /page-parser/song/12345?include_charts=true
 ```
 
 ## 配置说明
