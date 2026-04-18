@@ -6,12 +6,23 @@ from stats_cli.plugins import (
     optimize_plugin,
     repair_plugin,
     select_plugin,
+    top_plugin,
     update_plugin,
     utility_plugin,
 )
 
 
-def install_plugins(cls, *, colorize, colors, db_safe_operation, get_separator, get_subseparator, base_dir):
+def install_plugins(
+    cls,
+    *,
+    colorize,
+    colors,
+    db_safe_operation,
+    get_separator,
+    get_subseparator,
+    get_terminal_width,
+    base_dir,
+):
     update_plugin.install(cls, colorize=colorize, colors=colors, base_dir=base_dir)
     export_plugin.install(cls, colorize=colorize, colors=colors, db_safe_operation=db_safe_operation)
     optimize_plugin.install(cls, colorize=colorize, colors=colors, base_dir=base_dir)
@@ -48,4 +59,12 @@ def install_plugins(cls, *, colorize, colors, db_safe_operation, get_separator, 
         colors=colors,
         db_safe_operation=db_safe_operation,
         get_separator=get_separator,
+    )
+    top_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
+        get_separator=get_separator,
+        get_terminal_width=get_terminal_width,
     )
