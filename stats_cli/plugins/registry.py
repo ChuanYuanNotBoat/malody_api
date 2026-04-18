@@ -3,6 +3,7 @@ from stats_cli.plugins import (
     crawl_status_plugin,
     export_plugin,
     help_plugin,
+    history_plugin,
     optimize_plugin,
     player_plugin,
     profile_plugin,
@@ -82,4 +83,11 @@ def install_plugins(
         colorize=colorize,
         colors=colors,
         db_safe_operation=db_safe_operation,
+    )
+    history_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
+        get_separator=get_separator,
     )
