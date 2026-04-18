@@ -10,6 +10,7 @@ from stats_cli.plugins import (
     profile_plugin,
     repair_plugin,
     stb_pie_plugin,
+    stb_hot_plugin,
     search_plugin,
     stb_recent_plugin,
     select_plugin,
@@ -112,6 +113,13 @@ def install_plugins(
         db_safe_operation=db_safe_operation,
     )
     stb_recent_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
+        get_separator=get_separator,
+    )
+    stb_hot_plugin.install(
         cls,
         colorize=colorize,
         colors=colors,
