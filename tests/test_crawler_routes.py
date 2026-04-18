@@ -27,10 +27,9 @@ class TestCrawlerRoutes(TestCase):
     def test_run_leaderboard_rejects_player_params(self):
         with patch("malody_api.routers.crawler.os.path.exists", return_value=True):
             resp = self.client.post("/crawler/run?crawler_type=leaderboard&uid=1001")
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 400)
         body = resp.json()
-        self.assertFalse(body["success"])
-        self.assertIn("leaderboard 不支持参数", body["error"])
+        self.assertIn("leaderboard 不支持参数", body["detail"])
 
     def test_run_stb_command_mapping(self):
         with patch("malody_api.routers.crawler.os.path.exists", return_value=True), patch(
@@ -47,4 +46,9 @@ class TestCrawlerRoutes(TestCase):
         self.assertIn("--start-cid", cmd)
         self.assertIn("--end-cid", cmd)
         self.assertIn("--no-resume", cmd)
+
+    def test_run_invalid_crawler_type(self):
+        with patch("malody_api.routers.crawler.os.path.exists", return_value=True):
+            resp = self.client.post("/crawler/run?crawler_type=unknown")
+        self.assertEqual(resp.status_code, 422)
 

@@ -1,11 +1,11 @@
 # malody_api/routers/crawler.py
-from fastapi import APIRouter, BackgroundTasks, Query, Depends
+from fastapi import APIRouter, BackgroundTasks, Query, Depends, HTTPException
 import subprocess
 import os
 import sys
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Literal
 
 # 改为绝对导入
 from malody_api.core.models import APIResponse
@@ -44,7 +44,7 @@ def _file_meta(path: str) -> Dict[str, Any]:
 @router.post("/run", response_model=APIResponse)
 async def run_crawler(
     background_tasks: BackgroundTasks,
-    crawler_type: str = Query("leaderboard", description="爬虫类型: leaderboard, player, stb"),
+    crawler_type: Literal["leaderboard", "player", "stb"] = Query("leaderboard", description="爬虫类型: leaderboard, player, stb"),
     once: bool = Query(True, description="是否只运行一次"),
     limit: Optional[int] = Query(None, description="最大爬取数量（对player和stb有效）"),
     rpm: Optional[int] = Query(None, description="每分钟请求数限制"),
@@ -67,13 +67,10 @@ async def run_crawler(
         "player": "player_profile_crawler.py",
         "stb": "stb_crawler.py"
     }
-    if crawler_type not in script_map:
-        return APIResponse(success=False, error="无效的爬虫类型", timestamp=datetime.now())
-
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     script = os.path.join(base_dir, script_map[crawler_type])
     if not os.path.exists(script):
-        return APIResponse(success=False, error=f"爬虫脚本不存在: {script}", timestamp=datetime.now())
+        raise HTTPException(status_code=500, detail=f"爬虫脚本不存在: {script}")
 
     cmd = [sys.executable, script]
 
@@ -85,7 +82,7 @@ async def run_crawler(
         if any([uid, uid_range, from_db, max_workers, days_since_update, source, cid_crawl, sid_crawl, retry_failed, start is not None, end is not None, resume is not True]):
             unsupported.append("player/stb-only parameters")
         if unsupported:
-            return APIResponse(success=False, error=f"leaderboard 不支持参数: {', '.join(unsupported)}", timestamp=datetime.now())
+            raise HTTPException(status_code=400, detail=f"leaderboard 不支持参数: {', '.join(unsupported)}")
 
     elif crawler_type == "player":
         # player_profile_crawler.py 不支持 --once
@@ -101,17 +98,17 @@ async def run_crawler(
             cmd.extend(["--limit", str(limit)])
         if max_workers is not None:
             if max_workers <= 0:
-                return APIResponse(success=False, error="max_workers 必须大于 0", timestamp=datetime.now())
+                raise HTTPException(status_code=400, detail="max_workers 必须大于 0")
             cmd.extend(["--max-workers", str(max_workers)])
         if days_since_update is not None:
             if days_since_update <= 0:
-                return APIResponse(success=False, error="days_since_update 必须大于 0", timestamp=datetime.now())
+                raise HTTPException(status_code=400, detail="days_since_update 必须大于 0")
             cmd.extend(["--days-since-update", str(days_since_update)])
         if rpm is not None:
             cmd.extend(["--rpm", str(rpm)])
 
         if any([source, cid_crawl, sid_crawl, retry_failed, start is not None, end is not None, resume is not True]):
-            return APIResponse(success=False, error="player 不支持 stb 参数", timestamp=datetime.now())
+            raise HTTPException(status_code=400, detail="player 不支持 stb 参数")
 
     else:  # stb
         if once:
@@ -122,7 +119,7 @@ async def run_crawler(
             cmd.extend(["--rpm", str(rpm)])
         if source:
             if source not in {"all", "home", "latest", "api"}:
-                return APIResponse(success=False, error="source 仅支持 all/home/latest/api", timestamp=datetime.now())
+                raise HTTPException(status_code=400, detail="source 仅支持 all/home/latest/api")
             cmd.extend(["--source", source])
         if cid_crawl:
             cmd.append("--cid-crawl")
@@ -132,14 +129,14 @@ async def run_crawler(
             cmd.append("--retry-failed")
         if start is not None:
             if start <= 0:
-                return APIResponse(success=False, error="start 必须大于 0", timestamp=datetime.now())
+                raise HTTPException(status_code=400, detail="start 必须大于 0")
             if cid_crawl or (not sid_crawl):
                 cmd.extend(["--start-cid", str(start)])
             if sid_crawl:
                 cmd.extend(["--start-sid", str(start)])
         if end is not None:
             if end <= 0:
-                return APIResponse(success=False, error="end 必须大于 0", timestamp=datetime.now())
+                raise HTTPException(status_code=400, detail="end 必须大于 0")
             if cid_crawl or (not sid_crawl):
                 cmd.extend(["--end-cid", str(end)])
             if sid_crawl:
@@ -148,7 +145,7 @@ async def run_crawler(
             cmd.append("--no-resume")
 
         if any([uid, uid_range, from_db, max_workers, days_since_update]):
-            return APIResponse(success=False, error="stb 不支持 player 参数", timestamp=datetime.now())
+            raise HTTPException(status_code=400, detail="stb 不支持 player 参数")
 
     background_tasks.add_task(run_subprocess, cmd)
     return APIResponse(
