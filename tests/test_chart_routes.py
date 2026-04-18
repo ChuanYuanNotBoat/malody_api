@@ -47,3 +47,26 @@ class TestChartRoutes(TestCase):
         self.assertTrue(body["success"])
         self.assertEqual(len(body["data"]), 1)
 
+    def test_creator_details_invalid_status(self):
+        resp = self.client.get("/charts/creators/alice/details?status=3")
+        self.assertEqual(resp.status_code, 422)
+
+    def test_creator_trends_invalid_mode(self):
+        resp = self.client.get("/charts/creators/alice/trends?mode=10")
+        self.assertEqual(resp.status_code, 422)
+
+    def test_summary_invalid_detail_level(self):
+        resp = self.client.get("/charts/summary?detail_level=full")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail_level", resp.json()["detail"])
+
+    def test_quality_invalid_time_range(self):
+        resp = self.client.get("/charts/quality?time_range=bad-format")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("time_range", resp.json()["detail"])
+
+    def test_creator_trends_since_last_conflict(self):
+        resp = self.client.get("/charts/creators/alice/trends?since=2026-01-01&last=30d")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("不能同时使用", resp.json()["detail"])
+
