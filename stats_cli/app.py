@@ -23,6 +23,7 @@ import copy                     # 新增导入，用于深拷贝选择器
 from selector import global_selector, MCSelector
 from utils.stats_export_runner import parse_export_request, run_export
 from utils.stats_update_runner import build_update_command, run_streaming_command, split_cli_args
+from stats_cli.plugins.registry import install_plugins
 
 # 修复matplotlib中文字体问题
 def setup_chinese_font():
@@ -4353,153 +4354,6 @@ class MalodyViz(cmd.Cmd):
             return None
 
     # 增强 do_update 命令
-    def do_update(self, arg):
-        """
-        ??????????????
-
-        ??: update [--leaderboard|--player|--stb] [??...]
-        ??:
-          - ???? leaderboard
-          - ?????????????????????
-        """
-        tokens = split_cli_args(arg, colorize, Colors.RED)
-        if tokens is None:
-            return
-
-        cmd = build_update_command(
-            tokens=tokens,
-            base_dir=os.path.dirname(os.path.abspath(__file__)),
-            python_executable=sys.executable,
-            colorize=colorize,
-            red=Colors.RED,
-            yellow=Colors.YELLOW,
-        )
-        if cmd is None:
-            return
-
-        run_streaming_command(
-            cmd=cmd,
-            colorize=colorize,
-            cyan=Colors.CYAN,
-            green=Colors.GREEN,
-            red=Colors.RED,
-        )
-
-    def do_optimize(self, arg):
-        """
-        优化数据库：清理冗余记录并压缩数据库
-
-        用法: optimize
-        """
-        print(colorize("正在优化数据库，请稍候...", Colors.CYAN))
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "malody_rankings.py")
-        cmd = [sys.executable, script, "--optimize-db"]
-        try:
-            subprocess.run(cmd, check=True)
-            print(colorize("数据库优化完成。", Colors.GREEN))
-        except subprocess.CalledProcessError as e:
-            print(colorize(f"优化失败: {e}", Colors.RED))
-
-    # 新增 crawl_status 命令
-    def do_crawl_status(self, arg):
-        """
-        查看各爬虫的进度状态
-
-        用法: crawl_status
-        """
-        print(colorize("\n爬虫进度状态", Colors.CYAN))
-        print(get_separator())
-
-        # 检查 CID 进度文件
-        cid_progress = "cid_progress.json"
-        if os.path.exists(cid_progress):
-            try:
-                with open(cid_progress, 'r') as f:
-                    data = json.load(f)
-                current = data.get('current_cid', 'N/A')
-                success = data.get('total_success', 0)
-                errors = data.get('total_errors', 0)
-                retry = len(data.get('retry_queue', []))
-                print(f"CID爬虫: 当前CID={current}, 成功={success}, 错误={errors}, 待重试={retry}")
-            except:
-                print(f"CID爬虫: 无法解析进度文件")
-        else:
-            print("CID爬虫: 无进度文件")
-
-        # SID 进度文件
-        sid_progress = "sid_progress.json"
-        if os.path.exists(sid_progress):
-            try:
-                with open(sid_progress, 'r') as f:
-                    data = json.load(f)
-                current = data.get('current_sid', 'N/A')
-                songs = data.get('total_songs', 0)
-                charts = data.get('total_charts', 0)
-                empty = len(data.get('empty_songs', []))
-                print(f"SID爬虫: 当前SID={current}, 歌曲={songs}, 谱面={charts}, 空歌曲={empty}")
-            except:
-                print("SID爬虫: 无法解析进度文件")
-        else:
-            print("SID爬虫: 无进度文件")
-
-        # 向后SID进度
-        sid_back = "sid_backwards_progress.json"
-        if os.path.exists(sid_back):
-            try:
-                with open(sid_back, 'r') as f:
-                    data = json.load(f)
-                current = data.get('current_sid', 'N/A')
-                last_valid = data.get('last_valid_sid', 'N/A')
-                songs = data.get('total_songs', 0)
-                charts = data.get('total_charts', 0)
-                print(f"向后SID爬虫: 当前SID={current}, 最后有效={last_valid}, 歌曲={songs}, 谱面={charts}")
-            except:
-                print("向后SID爬虫: 无法解析进度文件")
-        else:
-            print("向后SID爬虫: 无进度文件")
-
-        # 全局进度
-        global_prog = "global_progress.bin"
-        if os.path.exists(global_prog):
-            size = os.path.getsize(global_prog)
-            print(f"全局进度文件: 存在 ({size} bytes)")
-        else:
-            print("全局进度文件: 不存在")
-
-    # 增强 do_export 支持导出谱面、歌曲、玩家资料
-    @db_safe_operation
-    def do_export(self, arg):
-        """
-        ????? CSV ???????????
-
-        ??: export <??> [--mode ??] [--limit ??] [--players ????] ...
-        ??: top(????), history(????), chart(??), song(??), profile(????)
-
-        ??:
-        export top --limit 100
-        export chart --mode 0 --limit 500
-        export profile --players Zani
-        """
-        request = parse_export_request(
-            arg=arg,
-            parse_time_range=self._parse_time_range_string,
-            colorize=colorize,
-            red=Colors.RED,
-        )
-        if request is None:
-            return
-
-        run_export(
-            request=request,
-            conn=self.conn,
-            selector=self.selector,
-            output_dir=self.output_dir,
-            unique_filename=self.get_unique_filename,
-            colorize=colorize,
-            green=Colors.GREEN,
-            yellow=Colors.YELLOW,
-            red=Colors.RED,
-        )
 
     @db_safe_operation
     def do_alias(self, arg):
@@ -4588,6 +4442,16 @@ class MalodyViz(cmd.Cmd):
                 self.stdout.write(colorize("%s\n" % str(self.ruler * len(header)), Colors.CYAN))
             self.columnize(cmds, maxcol-1)
             self.stdout.write("\n")
+
+
+install_plugins(
+    MalodyViz,
+    colorize=colorize,
+    colors=Colors,
+    db_safe_operation=db_safe_operation,
+    get_separator=get_separator,
+    base_dir=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
 
 def main() -> int:
     if not os.path.exists("malody_rankings.db"):

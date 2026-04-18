@@ -11,7 +11,7 @@ ROOT_PARENT = Path(__file__).resolve().parents[2]
 if str(ROOT_PARENT) not in sys.path:
     sys.path.insert(0, str(ROOT_PARENT))
 
-from malody_api.routers.analytics import router as analytics_router  # noqa: E402
+from routers.analytics import router as analytics_router  # noqa: E402
 
 
 class TestAnalyticsRoutes(TestCase):
@@ -22,7 +22,7 @@ class TestAnalyticsRoutes(TestCase):
 
     def test_player_compare_route(self):
         fake_data = {"players": [{"name": "alice"}], "not_found": []}
-        with patch("malody_api.routers.analytics.analysis_service.compare_players", return_value=fake_data):
+        with patch("routers.analytics.analysis_service.compare_players", return_value=fake_data):
             resp = self.client.get("/analytics/player-compare?players=alice,bob&mode=0&days=30")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
