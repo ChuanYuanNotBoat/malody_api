@@ -1,87 +1,95 @@
-# TODO（按子系统分块）
+# TODO（当前阶段：稳定化 + 渐进重构）
 
-## 0. 全局状态
-- 分支：`feat/todo-full-implementation`
-- 总体结论：核心 API/CLI/测试链路已打通，可用性从“功能缺口期”进入“稳定化期”
-- 当前主要风险：官网结构/API 变动导致爬虫数据源阶段性不可用（已知问题，后续单独修复）
+## 当前分支
+- `feat_api_stabilization_phase1`
+
+## 0. 重构策略（先定原则）
+- [x] 明确策略：**不做一次性大重构**
+- [x] 采用方式：**小步重构 + 测试护航 + 分层替换**
+- [x] 当前主线：先修复数据源可用性，再做结构优化
 
 ---
 
-## 1. API 网关层（FastAPI Routers）
-### 状态：已完成主功能，进入稳定化
+## 1. 数据源与爬虫可用性（P0）（暂缓）
+### 目标
+恢复“可持续获取数据”的基础能力，避免业务层被外部变化持续拖垮。
+
+### 待办
+- [ ] 官网改版适配：建立页面解析版本层（v1/v2 解析器）
+- [ ] 为关键解析字段增加容错（缺失节点/结构变形）
+- [ ] 建立数据源健康检查（home/latest/api 各源可用性）
+- [ ] 爬虫失败分类（网络/结构变更/鉴权失效）与重试策略分离
+- [ ] 为 `/crawler/status` 增加“数据源健康状态”摘要
+
+### 验收
+- [ ] 连续 3 次全流程爬取可完成（允许部分源降级）
+- [ ] 出现页面结构变化时可在日志中快速定位失败点
+
+---
+
+## 2. API 稳定化（P0-P1）
+### 目标
+统一接口边界行为，让前端/调用方得到稳定、可预期响应。
+
+### 待办
+- [x] 统一参数校验策略（`mode/status/limit/date`）
+- [x] 统一错误码语义（400 参数错误 / 404 数据不存在 / 422 校验失败）
+- [x] 补全边界测试：空参数、越界参数、组合冲突参数
+- [ ] 对关键新增接口补“错误响应示例”
+
+### 涉及接口
 - [x] `/analytics/player-compare`
-- [x] `/charts/summary`
-- [x] `/charts/quality`
-- [x] `/charts/stabilizers/top`
 - [x] `/charts/creators/{creator_name}/details`
 - [x] `/charts/creators/{creator_name}/trends`
-- [x] `/page-parser/song/{sid}`
-- [x] `/crawler/run` 参数扩展与白名单映射
-- [x] `/crawler/status` 统一状态摘要结构
-
-### 下一步
-- [ ] 为 `player-compare` 和 `creator*` 增加更多边界参数校验（空值、异常区间）
-- [ ] 统一错误码语义（400/404/422）并补充错误响应文档
+- [ ] `/crawler/run`
 
 ---
 
-## 2. Stats CLI 子系统（`malody_stats.py`）
-### 状态：已完成能力补齐
-- [x] `export` 全类型落地：`top/history/chart/song/profile`
-- [x] `export chart` 支持 `limit/players/time_range`
-- [x] `update` 参数映射与脚本能力对齐（player/stb）
-- [x] 参数白名单与校验提示
+## 3. Stats CLI 渐进重构（P1）
+### 目标
+降低 `malody_stats.py` 维护成本，不影响现有可用命令。
 
-### 下一步
-- [ ] 将 `do_update` / `do_export` 的参数解析从手写逻辑升级为统一解析器（可维护性）
-- [ ] 增加 CLI 自测样例（命令输入 -> 预期 SQL/脚本命令）
+### 待办
+- [ ] 提取统一参数解析器（替换 `do_update`/`do_export` 手写解析）
+- [ ] 抽离命令到模块（解析/查询/导出/外部脚本调用）
+- [ ] 将脚本参数白名单配置化（避免散落硬编码）
+- [ ] 增加 CLI 回归样例（输入命令 -> 预期命令/SQL）
 
----
-
-## 3. 爬虫控制与调度子系统（API -> 脚本）
-### 状态：可用，关键路径已修复
-- [x] `/crawler/run` 支持 player/stb 扩展参数
-- [x] 参数透传已改为白名单映射
-- [x] `/crawler/status` 汇总 `cid/sid/sid_backwards/global`
-- [x] 修复脚本路径解析层级（`routers/crawler.py`）
-
-### 已知外部依赖问题（暂缓）
-- [ ] 官网变动导致 API 爬取不可用（待数据源适配）
-- [ ] 其他数据源半瘫痪（待逐源恢复）
-
-### 下一步
-- [ ] 为官网改版建立“解析器版本层”（兼容旧/新 DOM）
-- [ ] 为数据源失败增加熔断/降级标记，避免误判“系统正常但无数据”
+### 验收
+- [ ] `help export` 中类型全部可用（top/history/chart/song/profile）
+- [ ] `update` 参数与脚本真实支持完全一致
 
 ---
 
-## 4. 服务层与一致性校验子系统
-### 状态：已建立最小保障
-- [x] `ChartService` 关键方法测试覆盖：summary/quality/stabilizers/creator trends
-- [x] 路由集成测试覆盖关键新增端点
-- [x] 新增一致性脚本：`scripts/check_stats_api_consistency.py`
+## 4. 服务层与一致性保障（P1）
+### 目标
+确保“stats 与 API 结果一致”，防止重构期间悄悄漂移。
 
-### 下一步
-- [ ] 将一致性脚本接入定时任务（每日/每次发布后）
+### 待办
+- [ ] 将 `scripts/check_stats_api_consistency.py` 接入定时任务
 - [ ] 差异报告增加阈值规则（仅超阈值告警）
+- [ ] 扩展一致性对比维度（更多 mode/时间窗口/筛选组合）
+
+### 验收
+- [ ] 每次发布前自动产出差异报告
+- [ ] 差异超阈值时阻断发布或提示人工确认
 
 ---
 
-## 5. 文档与契约子系统
-### 状态：已同步
-- [x] README 已更新新增 API 列表
-- [x] README 已补充典型请求示例
-- [x] TODO 与当前实现状态一致
+## 5. 文档与运维说明（P2）
+### 目标
+让“可运行”和“可维护”信息对齐，降低后续接手成本。
 
-### 下一步
-- [ ] 在 README 增加“爬虫外部依赖异常”运行说明与故障排查
-- [ ] 增加 API 示例响应片段（不仅请求示例）
+### 待办
+- [ ] README 增加“外部数据源异常”排查章节
+- [ ] README 增加关键接口响应示例（成功/失败）
+- [ ] 补充本地部署清单（鉴权、cookie、路径、定时任务）
+- [ ] 补充回滚与应急处理步骤
 
 ---
 
-## 6. 回归与发布清单（合并前/发布前）
+## 6. 回归清单（持续执行）
 - [x] `python -m unittest discover -s tests -p "test_*.py" -v`
 - [x] `python -m compileall -q`（关键文件）
-- [ ] （可选）本地启动 API 后执行一次 `scripts/check_stats_api_consistency.py`
-- [ ] 合并到 `main`
-- [ ] 打标签/发布说明（按需）
+- [ ] 本地启动 API 后运行一次一致性脚本
+- [ ] 大改动后补齐对应测试再合并
