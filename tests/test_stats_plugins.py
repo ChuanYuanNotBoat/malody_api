@@ -25,3 +25,4 @@ class TestStatsPlugins(TestCase):
         self.assertEqual(MalodyViz.do_profile.__module__, "stats_cli.plugins.profile_plugin")
         self.assertEqual(MalodyViz.do_history.__module__, "stats_cli.plugins.history_plugin")
         self.assertEqual(MalodyViz.do_compare.__module__, "stats_cli.plugins.compare_plugin")
+        self.assertEqual(MalodyViz.do_top_chart.__module__, "stats_cli.plugins.top_chart_plugin")

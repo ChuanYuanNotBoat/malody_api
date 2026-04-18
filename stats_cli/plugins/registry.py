@@ -11,6 +11,7 @@ from stats_cli.plugins import (
     repair_plugin,
     select_plugin,
     top_plugin,
+    top_chart_plugin,
     update_plugin,
     utility_plugin,
 )
@@ -71,6 +72,12 @@ def install_plugins(
         db_safe_operation=db_safe_operation,
         get_separator=get_separator,
         get_terminal_width=get_terminal_width,
+    )
+    top_chart_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
     )
     player_plugin.install(
         cls,
