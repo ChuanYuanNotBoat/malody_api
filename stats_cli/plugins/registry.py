@@ -9,6 +9,7 @@ from stats_cli.plugins import (
     player_plugin,
     profile_plugin,
     repair_plugin,
+    search_plugin,
     select_plugin,
     top_plugin,
     top_chart_plugin,
@@ -81,6 +82,13 @@ def install_plugins(
         db_safe_operation=db_safe_operation,
     )
     trend_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
+        get_separator=get_separator,
+    )
+    search_plugin.install(
         cls,
         colorize=colorize,
         colors=colors,
