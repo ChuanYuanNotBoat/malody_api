@@ -38,3 +38,4 @@ class TestStatsPlugins(TestCase):
         self.assertEqual(MalodyViz.do_stb_compare.__module__, "stats_cli.plugins.stb_compare_plugin")
         self.assertEqual(MalodyViz.do_stb_stabled_by.__module__, "stats_cli.plugins.stb_stabled_by_plugin")
         self.assertEqual(MalodyViz.do_stb_top_stabilizers.__module__, "stats_cli.plugins.stb_top_stabilizers_plugin")
+        self.assertEqual(MalodyViz.do_stb_creator_details.__module__, "stats_cli.plugins.stb_creator_details_plugin")
