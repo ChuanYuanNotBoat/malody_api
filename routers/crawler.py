@@ -70,7 +70,7 @@ async def run_crawler(
     if crawler_type not in script_map:
         return APIResponse(success=False, error="无效的爬虫类型", timestamp=datetime.now())
 
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     script = os.path.join(base_dir, script_map[crawler_type])
     if not os.path.exists(script):
         return APIResponse(success=False, error=f"爬虫脚本不存在: {script}", timestamp=datetime.now())
@@ -161,7 +161,7 @@ async def run_crawler(
 @router.get("/status", response_model=APIResponse)
 async def get_crawler_status():
     """获取各爬虫进度状态"""
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cid_path = os.path.join(base_dir, "cid_progress.json")
     sid_path = os.path.join(base_dir, "sid_progress.json")
     sid_back_path = os.path.join(base_dir, "sid_backwards_progress.json")
