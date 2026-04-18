@@ -1,5 +1,6 @@
 from stats_cli.plugins import (
     alias_plugin,
+    compare_plugin,
     crawl_status_plugin,
     export_plugin,
     help_plugin,
@@ -85,6 +86,13 @@ def install_plugins(
         db_safe_operation=db_safe_operation,
     )
     history_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
+        get_separator=get_separator,
+    )
+    compare_plugin.install(
         cls,
         colorize=colorize,
         colors=colors,
