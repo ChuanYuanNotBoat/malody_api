@@ -4351,6 +4351,42 @@ class MalodyViz(cmd.Cmd):
         except:
             return None
 
+    def _split_cli_args(self, text):
+        """统一解析命令参数字符串（支持引号）"""
+        try:
+            return shlex.split(text) if text else []
+        except ValueError as e:
+            print(colorize(f"参数解析失败: {e}", Colors.RED))
+            return None
+
+    def _parse_cli_options(self, tokens):
+        """将 token 列表解析为 --key value / --flag 形式字典"""
+        options = {}
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if not token.startswith("--"):
+                print(colorize(f"无效参数: {token}", Colors.RED))
+                return None
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                options[token] = tokens[i + 1]
+                i += 2
+            else:
+                options[token] = True
+                i += 1
+        return options
+
+    def _parse_positive_int_arg(self, name, value):
+        """解析正整数参数，失败时输出统一错误消息"""
+        try:
+            iv = int(value)
+            if iv <= 0:
+                raise ValueError()
+            return iv
+        except Exception:
+            print(colorize(f"参数 {name} 必须是正整数: {value}", Colors.RED))
+            return None
+
     # 增强 do_update 命令
     def do_update(self, arg):
         """
@@ -4361,40 +4397,7 @@ class MalodyViz(cmd.Cmd):
           - 默认更新 leaderboard
           - 参数采用白名单映射，避免传入脚本不支持参数
         """
-        def parse_tokens(text):
-            try:
-                return shlex.split(text) if text else []
-            except ValueError as e:
-                print(colorize(f"参数解析失败: {e}", Colors.RED))
-                return None
-
-        def parse_options(tokens):
-            options = {}
-            i = 0
-            while i < len(tokens):
-                token = tokens[i]
-                if not token.startswith("--"):
-                    print(colorize(f"无效参数: {token}", Colors.RED))
-                    return None
-                if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
-                    options[token] = tokens[i + 1]
-                    i += 2
-                else:
-                    options[token] = True
-                    i += 1
-            return options
-
-        def parse_positive_int(name, value):
-            try:
-                iv = int(value)
-                if iv <= 0:
-                    raise ValueError()
-                return iv
-            except Exception:
-                print(colorize(f"参数 {name} 必须是正整数: {value}", Colors.RED))
-                return None
-
-        tokens = parse_tokens(arg)
+        tokens = self._split_cli_args(arg)
         if tokens is None:
             return
 
@@ -4405,7 +4408,7 @@ class MalodyViz(cmd.Cmd):
             return
         crawler_type = selected[0] if selected else "--leaderboard"
         filtered_tokens = [t for t in tokens if t not in crawler_flags]
-        options = parse_options(filtered_tokens)
+        options = self._parse_cli_options(filtered_tokens)
         if options is None:
             return
 
@@ -4451,7 +4454,7 @@ class MalodyViz(cmd.Cmd):
             for f in int_flags:
                 v = options.get(f)
                 if isinstance(v, str):
-                    iv = parse_positive_int(f, v)
+                    iv = self._parse_positive_int_arg(f, v)
                     if iv is None:
                         return
                     cmd.extend([f, str(iv)])
@@ -4486,19 +4489,19 @@ class MalodyViz(cmd.Cmd):
                 cmd.extend(["--source", source])
 
             if isinstance(options.get("--limit"), str):
-                iv = parse_positive_int("--limit", options["--limit"])
+                iv = self._parse_positive_int_arg("--limit", options["--limit"])
                 if iv is None:
                     return
                 cmd.extend(["--max-charts", str(iv)])
 
             if isinstance(options.get("--rpm"), str):
-                iv = parse_positive_int("--rpm", options["--rpm"])
+                iv = self._parse_positive_int_arg("--rpm", options["--rpm"])
                 if iv is None:
                     return
                 cmd.extend(["--rpm", str(iv)])
 
             if isinstance(options.get("--max-retries"), str):
-                iv = parse_positive_int("--max-retries", options["--max-retries"])
+                iv = self._parse_positive_int_arg("--max-retries", options["--max-retries"])
                 if iv is None:
                     return
                 cmd.extend(["--max-retries", str(iv)])
@@ -4516,7 +4519,7 @@ class MalodyViz(cmd.Cmd):
             start_value = options.get("--start")
             end_value = options.get("--end")
             if isinstance(start_value, str):
-                sv = parse_positive_int("--start", start_value)
+                sv = self._parse_positive_int_arg("--start", start_value)
                 if sv is None:
                     return
                 if cid_crawl or (not sid_crawl):
@@ -4524,7 +4527,7 @@ class MalodyViz(cmd.Cmd):
                 if sid_crawl:
                     cmd.extend(["--start-sid", str(sv)])
             if isinstance(end_value, str):
-                ev = parse_positive_int("--end", end_value)
+                ev = self._parse_positive_int_arg("--end", end_value)
                 if ev is None:
                     return
                 if cid_crawl or (not sid_crawl):
@@ -4668,25 +4671,17 @@ class MalodyViz(cmd.Cmd):
         export chart --mode 0 --limit 500
         export profile --players Zani
         """
-        args = shlex.split(arg) if arg else []
+        args = self._split_cli_args(arg)
+        if args is None:
+            return
         if not args:
             print(colorize("错误: 请指定导出类型", Colors.RED))
             return
 
         export_type = args[0].lower()
-        opts = {}
-        i = 1
-        while i < len(args):
-            key = args[i]
-            if not key.startswith("--"):
-                print(colorize(f"无效参数: {key}", Colors.RED))
-                return
-            if i + 1 < len(args) and not args[i + 1].startswith("--"):
-                opts[key] = args[i + 1]
-                i += 2
-            else:
-                opts[key] = True
-                i += 1
+        opts = self._parse_cli_options(args[1:])
+        if opts is None:
+            return
 
         mode = None
         if "--mode" in opts and isinstance(opts["--mode"], str):
@@ -4698,12 +4693,8 @@ class MalodyViz(cmd.Cmd):
 
         limit = 1000
         if "--limit" in opts and isinstance(opts["--limit"], str):
-            try:
-                limit = int(opts["--limit"])
-                if limit <= 0:
-                    raise ValueError()
-            except Exception:
-                print(colorize("--limit 必须是正整数", Colors.RED))
+            limit = self._parse_positive_int_arg("--limit", opts["--limit"])
+            if limit is None:
                 return
 
         players = []
