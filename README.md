@@ -259,3 +259,17 @@ malody_api/
 ## 联系方式
 
 如有问题，请通过 GitHub Issues 提交。
+
+## Root Directory Cleanup (2026-04-18)
+
+To keep the project root cleaner while preserving current manual deployment behavior:
+
+- Security guide moved to `docs/SECURITY_SETUP.md`
+- Example config moved to `examples/config.yaml.example`
+- Example cookies moved to `examples/cookies.local.example.json`
+
+Runtime files still expected in root for now:
+
+- `config.yaml`
+- `cookies.local.json`
+- `malody_rankings.db`
