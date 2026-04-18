@@ -30,3 +30,4 @@ class TestStatsPlugins(TestCase):
         self.assertEqual(MalodyViz.do_search.__module__, "stats_cli.plugins.search_plugin")
         self.assertEqual(MalodyViz.do_stb_stats.__module__, "stats_cli.plugins.stb_stats_plugin")
         self.assertEqual(MalodyViz.do_stb_pie.__module__, "stats_cli.plugins.stb_pie_plugin")
+        self.assertEqual(MalodyViz.do_stb_recent.__module__, "stats_cli.plugins.stb_recent_plugin")

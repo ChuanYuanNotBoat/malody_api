@@ -11,6 +11,7 @@ from stats_cli.plugins import (
     repair_plugin,
     stb_pie_plugin,
     search_plugin,
+    stb_recent_plugin,
     select_plugin,
     stb_stats_plugin,
     top_plugin,
@@ -109,6 +110,13 @@ def install_plugins(
         colorize=colorize,
         colors=colors,
         db_safe_operation=db_safe_operation,
+    )
+    stb_recent_plugin.install(
+        cls,
+        colorize=colorize,
+        colors=colors,
+        db_safe_operation=db_safe_operation,
+        get_separator=get_separator,
     )
     player_plugin.install(
         cls,
