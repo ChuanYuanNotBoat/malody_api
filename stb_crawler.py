@@ -155,12 +155,30 @@ class STBCrawler:
         
         # 失败重试队列
         self.retry_queue = deque()
-        self.max_retries = 5  # 最大重试次数
+        self.max_retries = 5
+        self.auth_required_detected = False
+        self.api_forbidden_detected = False
         
     def setup_crawler_logging(self):
         """为爬虫设置专门的日志记录器"""
         self.logger = logging.getLogger('STBCrawler')
-        
+
+    @staticmethod
+    def _is_login_required_page(html):
+        if not html:
+            return False
+        markers = (
+            'id="J_signin"',
+            'id="J_toplogin"',
+            'name="email"',
+            '<div class="g_title">Sign in</div>',
+        )
+        return any(marker in html for marker in markers)
+
+    @staticmethod
+    def _has_auth_cookies():
+        return bool(COOKIES.get("sessionid") and COOKIES.get("csrftoken"))
+
     def log_request_details(self, url, response, method="GET"):
         """记录请求的详细信息"""
         if response is not None:
@@ -282,7 +300,7 @@ class STBCrawler:
             response.raise_for_status()
             
             self.log_request_details(test_url, response)
-            self.logger.info("✓ 排行榜页面访问正常")
+            self.logger.info("[OK] 排行榜页面访问正常")
             
             # 测试访问主页
             self.logger.debug("测试主页: %s", HOMEPAGE_URL)
@@ -290,7 +308,17 @@ class STBCrawler:
             response.raise_for_status()
             
             self.log_request_details(HOMEPAGE_URL, response)
-            self.logger.info("✓ 主页访问正常")
+            self.logger.info("[OK] 主页访问正常")
+
+            # 探测需要登录态的页面，便于给出明确提示
+            latest_probe_url = BASE_URL + "/page/latest"
+            latest_probe_resp = self.session.get(latest_probe_url, timeout=30)
+            if self._is_login_required_page(latest_probe_resp.text):
+                self.auth_required_detected = True
+                self.logger.warning(
+                    "检测到 %s 返回登录页。若需完整STB抓取，请配置 sessionid/csrftoken。",
+                    latest_probe_url
+                )
             
             self.logger.info("连接测试全部通过")
             return True
@@ -317,6 +345,11 @@ class STBCrawler:
 
     def search_charts(self, mode=None, status=2, count=18, page=0, key="", creator=""):
         """搜索谱面API"""
+        if not self._has_auth_cookies():
+            self.auth_required_detected = True
+            self.logger.warning("API搜索跳过：缺少 sessionid/csrftoken。")
+            return None
+
         params = {
             "status": status,
             "count": count,
@@ -366,14 +399,16 @@ class STBCrawler:
             
             if 'application/json' in content_type:
                 result = response.json()
-                self.logger.info("API搜索成功 - 获取到 %d 个谱面", len(result.get("list", [])))
-                return result
+                normalized = self._normalize_search_result(result)
+                self.logger.info("API搜索成功 - 获取到 %d 个谱面", len(normalized.get("list", [])))
+                return normalized
             else:
                 # 尝试解析非JSON响应
                 try:
                     result = response.json()
-                    self.logger.info("API搜索成功(非标准Content-Type) - 获取到 %d 个谱面", len(result.get("list", [])))
-                    return result
+                    normalized = self._normalize_search_result(result)
+                    self.logger.info("API搜索成功(非标准Content-Type) - 获取到 %d 个谱面", len(normalized.get("list", [])))
+                    return normalized
                 except:
                     self.logger.warning("API返回非JSON响应: %s", content_type)
                     self.logger.debug("响应内容前500字符: %s", response.text[:500])
@@ -382,8 +417,31 @@ class STBCrawler:
         except requests.exceptions.RequestException as e:
             self.logger.error("搜索谱面失败: %s", e)
             if hasattr(e, 'response') and e.response is not None:
+                if e.response.status_code == 403:
+                    self.api_forbidden_detected = True
+                    self.auth_required_detected = True
+                    self.logger.warning("API返回403，通常表示登录态无效或缺失。")
                 self.log_request_details(SEARCH_API_URL, e.response, "POST")
             return None
+
+    def _normalize_search_result(self, result):
+        """兼容旧版与新版搜索响应结构。"""
+        if not isinstance(result, dict):
+            return {"list": [], "total": 0}
+        # 旧结构: {"list":[...], "total":...}
+        if "list" in result:
+            return {
+                "list": result.get("list", []) or [],
+                "total": int(result.get("total", 0) or 0),
+            }
+        # 新结构: {"code":0, "data":{"list":[...], "total":...}}
+        data = result.get("data")
+        if isinstance(data, dict):
+            return {
+                "list": data.get("list", []) or [],
+                "total": int(data.get("total", 0) or 0),
+            }
+        return {"list": [], "total": 0}
     
     def parse_chart_page(self, html, cid):
         """增强的谱面页面解析，确保能提取SID"""
@@ -421,7 +479,7 @@ class STBCrawler:
         
         try:
             # 方法1: 从JavaScript变量中提取SID
-            script_text = soup.find('script', string=re.compile('window\.malody'))
+            script_text = soup.find('script', string=re.compile(r'window\.malody'))
             if script_text:
                 # 查找sid
                 sid_match = re.search(r'sid\s*:\s*(\d+)', script_text.string)
@@ -891,7 +949,7 @@ class STBCrawler:
                 chart_data["last_updated"], crawl_time, chart_hash
             ))
             
-            self.logger.info("✓ 保存/更新谱面: %s - %s", chart_data["cid"], song_data["title"])
+            self.logger.info("[OK] 保存/更新谱面: %s - %s", chart_data["cid"], song_data["title"])
             self.db_manager.get_connection().commit()
             return True
             
@@ -947,6 +1005,11 @@ class STBCrawler:
             self.log_request_details(HOMEPAGE_URL, response)
             
             soup = BeautifulSoup(response.text, "html.parser")
+
+            if self._is_login_required_page(response.text):
+                self.auth_required_detected = True
+                self.logger.warning("主页返回登录页，跳过主页数据源。")
+                return -1
             
             # 查找新谱上架区域
             new_map_section = soup.find('div', id='newMap')
@@ -956,6 +1019,23 @@ class STBCrawler:
                 with open("logs/debug_homepage.html", 'w', encoding='utf-8') as f:
                     f.write(response.text)
                 self.logger.info("已保存主页内容到 logs/debug_homepage.html")
+                # 兼容新页面：尝试从整页文本中回退提取CID
+                fallback_cids = []
+                for cid_text in re.findall(r'/chart/(\d+)', response.text):
+                    cid = int(cid_text)
+                    if cid not in self.processed_charts:
+                        fallback_cids.append(cid)
+                fallback_cids = fallback_cids[:max_charts]
+                if fallback_cids:
+                    self.logger.info("主页回退提取到 %d 个CID", len(fallback_cids))
+                    success_count = 0
+                    for cid in fallback_cids:
+                        if stop_requested:
+                            break
+                        if self.crawl_chart_detail(cid):
+                            success_count += 1
+                        time.sleep(1)
+                    return success_count
                 return 0
             
             # 查找所有谱面卡片
@@ -1026,9 +1106,9 @@ class STBCrawler:
                         
                         if self.crawl_chart_detail(cid):
                             success_count += 1
-                            self.logger.info("✓ 成功爬取谱面 %s (进度: %d/%d)", cid, success_count, max_charts)
+                            self.logger.info("[OK] 成功爬取谱面 %s (进度: %d/%d)", cid, success_count, max_charts)
                         else:
-                            self.logger.warning("✗ 爬取谱面 %s 失败", cid)
+                            self.logger.warning("[FAIL] 爬取谱面 %s 失败", cid)
                         
                         time.sleep(1)
                 else:
@@ -1103,6 +1183,11 @@ class STBCrawler:
             response.raise_for_status()
             
             self.log_request_details(latest_url, response)
+
+            if self._is_login_required_page(response.text):
+                self.auth_required_detected = True
+                self.logger.warning("最近变动页需要登录态，跳过该数据源。")
+                return -1
             
             soup = BeautifulSoup(response.text, "html.parser")
             
@@ -1140,9 +1225,9 @@ class STBCrawler:
                 
                 if self.crawl_chart_detail(cid):
                     success_count += 1
-                    self.logger.info("✓ 成功爬取谱面 %s (进度: %d/%d)", cid, success_count, len(cids_to_crawl))
+                    self.logger.info("[OK] 成功爬取谱面 %s (进度: %d/%d)", cid, success_count, len(cids_to_crawl))
                 else:
-                    self.logger.warning("✗ 爬取谱面 %s 失败", cid)
+                    self.logger.warning("[FAIL] 爬取谱面 %s 失败", cid)
                 
                 time.sleep(1)  # 避免请求过于频繁
             
@@ -1156,6 +1241,11 @@ class STBCrawler:
     def crawl_from_api_search(self, modes=None, statuses=None, max_charts=50):
         """通过API搜索爬取谱面"""
         self.logger.info("=== 开始方式3: 通过API搜索爬取 ===")
+
+        if not self._has_auth_cookies():
+            self.auth_required_detected = True
+            self.logger.warning("未配置 sessionid/csrftoken，跳过 API 搜索数据源。")
+            return -1
         
         if modes is None:
             modes = [0]  # 默认Key模式
@@ -1182,6 +1272,9 @@ class STBCrawler:
                 
                 while has_more and not stop_requested and success_count < max_charts:
                     result = self.search_charts(mode=mode, status=status, page=page)
+                    if self.api_forbidden_detected:
+                        self.logger.warning("API数据源被403拒绝，停止该数据源。")
+                        return -1
                     if not result or "list" not in result:
                         self.logger.warning("模式 %d 状态 %d 第 %d 页无数据或请求失败", mode, status, page)
                         break
@@ -1210,9 +1303,9 @@ class STBCrawler:
                         # 爬取谱面详情
                         if self.crawl_chart_detail(cid):
                             success_count += 1
-                            self.logger.info("✓ 成功爬取谱面 %s (进度: %d/%d)", cid, success_count, max_charts)
+                            self.logger.info("[OK] 成功爬取谱面 %s (进度: %d/%d)", cid, success_count, max_charts)
                         else:
-                            self.logger.warning("✗ 爬取谱面 %s 失败", cid)
+                            self.logger.warning("[FAIL] 爬取谱面 %s 失败", cid)
                         
                         # 避免请求过于频繁
                         time.sleep(1)
@@ -1262,6 +1355,10 @@ class STBCrawler:
                         success_count = crawl_func(max_charts=max_charts_per_source)
                     else:  # API搜索
                         success_count = crawl_func(max_charts=max_charts_per_source)
+
+                    if success_count < 0:
+                        self.logger.warning("数据源 %s 因认证限制被跳过，不再重试。", source_name)
+                        break
                     
                     if success_count > 0:
                         self.logger.info("数据源 %s 成功爬取 %d 个谱面", source_name, success_count)
@@ -1377,7 +1474,7 @@ class STBCrawler:
                 if result is True:  # 成功
                     total_success += 1
                     consecutive_errors = 0
-                    self.logger.info("✓ CID %d 成功 (总计: %d)", current_cid, total_success)
+                    self.logger.info("[OK] CID %d 成功 (总计: %d)", current_cid, total_success)
                 elif result is None:  # 明确不存在（404）
                     permanent_fails.add(current_cid)
                     consecutive_errors = 0
@@ -1591,7 +1688,7 @@ class STBCrawler:
                             song_success_count += 1
                             total_charts += 1
                             consecutive_errors = 0
-                            self.logger.info("✓ CID %d 成功 (SID %d: %d/%d)", 
+                            self.logger.info("[OK] CID %d 成功 (SID %d: %d/%d)", 
                                            cid, current_sid, song_success_count, len(cids))
                         elif result is None:  # 明确不存在
                             self.logger.debug("CID %d 不存在", cid)
@@ -1605,7 +1702,7 @@ class STBCrawler:
                     
                     if song_success_count > 0:
                         total_songs += 1
-                        self.logger.info("✓ SID %d 完成: %d/%d 个谱面成功", 
+                        self.logger.info("[OK] SID %d 完成: %d/%d 个谱面成功", 
                                        current_sid, song_success_count, len(cids))
                     else:
                         self.logger.warning("SID %d 没有成功爬取任何谱面", current_sid)
@@ -1805,7 +1902,7 @@ class STBCrawler:
                         if result is True:  # 成功
                             song_success_count += 1
                             total_charts += 1
-                            self.logger.info("✓ CID %d 成功 (SID %d: %d/%d)", 
+                            self.logger.info("[OK] CID %d 成功 (SID %d: %d/%d)", 
                                            cid, current_sid, song_success_count, len(cids))
                         elif result is None:  # 明确不存在
                             self.logger.debug("CID %d 不存在", cid)
@@ -1818,7 +1915,7 @@ class STBCrawler:
                     
                     if song_success_count > 0:
                         total_songs += 1
-                        self.logger.info("✓ SID %d 完成: %d/%d 个谱面成功", 
+                        self.logger.info("[OK] SID %d 完成: %d/%d 个谱面成功", 
                                        current_sid, song_success_count, len(cids))
                     else:
                         self.logger.info("SID %d 没有新谱面需要爬取", current_sid)
@@ -2021,13 +2118,13 @@ class STBCrawler:
             
             if result:
                 success_count += 1
-                self.logger.info("✓ 重新爬取 %s %d 成功", item_type.upper(), item_id)
+                self.logger.info("[OK] 重新爬取 %s %d 成功", item_type.upper(), item_id)
                 
                 # 从失败列表中移除成功的项目
                 if remove_successful:
                     self._remove_from_failed_lists(progress_data, item_type, item_id)
             else:
-                self.logger.warning("✗ 重新爬取 %s %d 失败", item_type.upper(), item_id)
+                self.logger.warning("[FAIL] 重新爬取 %s %d 失败", item_type.upper(), item_id)
             
             # 请求间隔
             time.sleep(request_interval)
@@ -2314,3 +2411,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
