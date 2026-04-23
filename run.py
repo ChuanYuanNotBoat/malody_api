@@ -83,6 +83,7 @@ def register_routers(app):
         from routers.query import router as query_router
         from routers.page_parser import router as page_parser_router
         from routers.crawler import router as crawler_router   # 新增爬虫控制路由
+        from routers.official_api import router as official_api_router
         
         # 注册路由
         app.include_router(players_router)
@@ -92,6 +93,7 @@ def register_routers(app):
         app.include_router(query_router)
         app.include_router(page_parser_router)
         app.include_router(crawler_router)                     # 新增
+        app.include_router(official_api_router)
         
         print("All routers registered successfully.")
         
@@ -158,7 +160,8 @@ def setup_routes(app):
                 "system": "/system/",
                 "query": "/query/",
                 "page_parser": "/page-parser/",
-                "crawler": "/crawler/"
+                "crawler": "/crawler/",
+                "official_api": "/official-api/"
             }
         }
     
