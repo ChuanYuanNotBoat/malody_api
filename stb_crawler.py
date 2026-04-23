@@ -18,6 +18,7 @@ from logging.handlers import RotatingFileHandler
 from collections import deque
 import random
 from urllib.parse import urlparse
+from typing import Any, Dict, List
 
 # 复用现有的数据库管理器和配置
 from malody_rankings import DatabaseManager, init_database, stop_requested, stop_lock, COOKIES, HEADERS
@@ -89,6 +90,9 @@ SEARCH_API_URL = BASE_URL + "/page/chart/filter"
 CHART_URL = BASE_URL + "/chart/{cid}"
 SONG_URL = BASE_URL + "/song/{sid}"
 NEW_API_BASE_URL = "https://api.mugzone.net/api"
+TALK_LIST_URL = BASE_URL + "/plugin/talk/list"
+TALK_FETCH_MAX_PAGES = 20
+TALK_FETCH_MAX_ITEMS = 500
 
 # 谱面状态映射
 STATUS_MAP = {
@@ -246,12 +250,30 @@ class STBCrawler:
             status INTEGER NOT NULL,
             heat INTEGER DEFAULT 0,
             love_count INTEGER DEFAULT 0,
+            recommend_count INTEGER DEFAULT 0,
+            comment_count INTEGER DEFAULT 0,
             donate_count INTEGER DEFAULT 0,
             play_count INTEGER DEFAULT 0,
             last_updated TIMESTAMP,
             crawl_time TIMESTAMP NOT NULL,
             data_hash TEXT,
             FOREIGN KEY (sid) REFERENCES songs (sid)
+        )
+        ''')
+
+        # 谱面评论/推荐流水（来源: /plugin/talk/list）
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS chart_comments (
+            tid INTEGER PRIMARY KEY,
+            cid INTEGER NOT NULL,
+            uid INTEGER,
+            name TEXT,
+            content TEXT,
+            talk_type INTEGER,
+            is_recommend INTEGER DEFAULT 0,
+            talk_time TIMESTAMP,
+            crawl_time TIMESTAMP NOT NULL,
+            FOREIGN KEY (cid) REFERENCES charts (cid)
         )
         ''')
         
@@ -269,6 +291,8 @@ class STBCrawler:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_mode ON charts(mode)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_status ON charts(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_last_updated ON charts(last_updated)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_comments_cid ON chart_comments(cid)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_comments_time ON chart_comments(talk_time)')
         
         # 检查并添加缺失的列
         self._check_and_add_missing_columns()
@@ -277,29 +301,47 @@ class STBCrawler:
         self.logger.info("STB谱面数据库表初始化完成")
 
     def _check_and_add_missing_columns(self):
-        """检查并添加缺失的列"""
+        """Check and add missing columns/tables for backward compatibility."""
         cursor = self.db_manager.get_connection().cursor()
-        
+
         try:
-            # 检查songs表是否有data_hash列
             cursor.execute("PRAGMA table_info(songs)")
-            columns = [column[1] for column in cursor.fetchall()]
-            
-            if 'data_hash' not in columns:
-                # 先尝试添加不带UNIQUE约束的列
+            song_columns = [column[1] for column in cursor.fetchall()]
+            if 'data_hash' not in song_columns:
                 cursor.execute('ALTER TABLE songs ADD COLUMN data_hash TEXT')
-                self.logger.info("已添加data_hash列到songs表")
-            
-            # 检查charts表是否有data_hash列
+                self.logger.info("Added data_hash column to songs")
+
             cursor.execute("PRAGMA table_info(charts)")
-            columns = [column[1] for column in cursor.fetchall()]
-            
-            if 'data_hash' not in columns:
+            chart_columns = [column[1] for column in cursor.fetchall()]
+            if 'data_hash' not in chart_columns:
                 cursor.execute('ALTER TABLE charts ADD COLUMN data_hash TEXT')
-                self.logger.info("已添加data_hash列到charts表")
-                
+                self.logger.info("Added data_hash column to charts")
+            if 'recommend_count' not in chart_columns:
+                cursor.execute('ALTER TABLE charts ADD COLUMN recommend_count INTEGER DEFAULT 0')
+                self.logger.info("Added recommend_count column to charts")
+            if 'comment_count' not in chart_columns:
+                cursor.execute('ALTER TABLE charts ADD COLUMN comment_count INTEGER DEFAULT 0')
+                self.logger.info("Added comment_count column to charts")
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chart_comments (
+                tid INTEGER PRIMARY KEY,
+                cid INTEGER NOT NULL,
+                uid INTEGER,
+                name TEXT,
+                content TEXT,
+                talk_type INTEGER,
+                is_recommend INTEGER DEFAULT 0,
+                talk_time TIMESTAMP,
+                crawl_time TIMESTAMP NOT NULL,
+                FOREIGN KEY (cid) REFERENCES charts (cid)
+            )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_comments_cid ON chart_comments(cid)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_comments_time ON chart_comments(talk_time)')
+
         except Exception as e:
-            self.logger.warning("检查表结构时出错: %s", e)
+            self.logger.warning("Schema compatibility check failed: %s", e)
 
     def test_connection(self):
         """测试连接和认证 - 使用与主爬虫相同的方式"""
@@ -516,6 +558,133 @@ class STBCrawler:
             return self._new_api_get(path, params=params, use_store_key=use_store_key, retry_on_auth=False)
         return data
 
+    def _is_recommend_talk_item(self, item: Dict[str, Any]) -> bool:
+        talk_type = item.get("type")
+        if talk_type == 1 or str(talk_type) == "1":
+            return True
+        content = str(item.get("content") or "").strip().lower()
+        return content.startswith("recommend")
+
+    def _fetch_chart_talk_items(
+        self,
+        cid: int,
+        max_pages: int = TALK_FETCH_MAX_PAGES,
+        max_items: int = TALK_FETCH_MAX_ITEMS,
+    ) -> List[Dict[str, Any]]:
+        key = f"chart_{cid}"
+        params: Dict[str, Any] = {"key": key, "order": -1}
+        items: List[Dict[str, Any]] = []
+        seen_tids = set()
+        last_start = None
+
+        for _ in range(max_pages):
+            try:
+                talk_headers = {
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": CHART_URL.format(cid=cid),
+                }
+                resp = self.session.get(TALK_LIST_URL, params=params, headers=talk_headers, timeout=30)
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as e:
+                self.logger.debug("拉取谱面 talk 失败 cid=%s: %s", cid, e)
+                break
+
+            if payload.get("code") != 0:
+                break
+
+            data = payload.get("data") or {}
+            talk_list = data.get("list") or []
+            if not talk_list:
+                break
+
+            next_start = None
+            for item in talk_list:
+                tid = item.get("tid")
+                if tid in seen_tids:
+                    continue
+                seen_tids.add(tid)
+                items.append(item)
+                next_start = item.get("time")
+                if len(items) >= max_items:
+                    return items
+
+            if not data.get("next"):
+                break
+            if next_start is None:
+                break
+
+            next_start = int(next_start)
+            if last_start is not None and next_start >= last_start:
+                break
+            last_start = next_start
+            params["start"] = next_start - 1
+
+        return items
+
+    def _build_chart_social_data(self, cid: int):
+        talk_items = self._fetch_chart_talk_items(cid)
+        recommend_count = 0
+        comment_count = 0
+        normalized_items = []
+
+        for item in talk_items:
+            is_recommend = self._is_recommend_talk_item(item)
+            if is_recommend:
+                recommend_count += 1
+            else:
+                comment_count += 1
+
+            talk_time = item.get("time")
+            talk_time_dt = None
+            if talk_time:
+                try:
+                    talk_time_dt = datetime.fromtimestamp(int(talk_time))
+                except Exception:
+                    talk_time_dt = None
+
+            normalized_items.append(
+                {
+                    "tid": item.get("tid"),
+                    "cid": cid,
+                    "uid": item.get("uid"),
+                    "name": item.get("name"),
+                    "content": item.get("content"),
+                    "talk_type": item.get("type"),
+                    "is_recommend": 1 if is_recommend else 0,
+                    "talk_time": talk_time_dt,
+                }
+            )
+
+        return recommend_count, comment_count, normalized_items
+
+    def _save_chart_comments(self, cursor, cid: int, comment_items: List[Dict[str, Any]], crawl_time: datetime):
+        cursor.execute("DELETE FROM chart_comments WHERE cid = ?", (cid,))
+        if not comment_items:
+            return
+        cursor.executemany(
+            '''
+            INSERT OR REPLACE INTO chart_comments
+            (tid, cid, uid, name, content, talk_type, is_recommend, talk_time, crawl_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            [
+                (
+                    item.get("tid"),
+                    cid,
+                    item.get("uid"),
+                    item.get("name"),
+                    item.get("content"),
+                    item.get("talk_type"),
+                    item.get("is_recommend", 0),
+                    item.get("talk_time"),
+                    crawl_time,
+                )
+                for item in comment_items
+                if item.get("tid") is not None
+            ],
+        )
+
     def _save_chart_data_from_new_api(self, chart_info, song_info, chart_hint=None):
         chart_hint = chart_hint or {}
         sid = int(chart_info.get("sid") or song_info.get("sid") or 0)
@@ -555,6 +724,8 @@ class STBCrawler:
             "status": int(chart_info.get("type") if chart_info.get("type") is not None else chart_hint.get("type", 0)),
             "heat": int(chart_hint.get("hot", 0) or 0),
             "love_count": 0,
+            "recommend_count": 0,
+            "comment_count": 0,
             "donate_count": 0,
             "play_count": 0,
             "last_updated": last_updated,
@@ -569,7 +740,11 @@ class STBCrawler:
             "cover_url": cover_url,
         }
 
-        success = self.save_chart_data(chart_data, song_data)
+        rec_count, cmt_count, talk_items = self._build_chart_social_data(cid)
+        chart_data["recommend_count"] = rec_count
+        chart_data["comment_count"] = cmt_count
+
+        success = self.save_chart_data(chart_data, song_data, talk_items=talk_items)
         if success:
             self.processed_charts.add(cid)
             self.processed_songs.add(sid)
@@ -692,6 +867,8 @@ class STBCrawler:
             "status": 0,
             "heat": 0,
             "love_count": 0,
+            "recommend_count": 0,
+            "comment_count": 0,
             "donate_count": 0,
             "play_count": 0,
             "last_updated": None
@@ -1011,7 +1188,10 @@ class STBCrawler:
             chart_data, song_data = self.parse_chart_page(response.text, cid)
             if chart_data and song_data:
                 self.logger.info("解析成功，准备保存数据: cid=%s", cid)
-                success = self.save_chart_data(chart_data, song_data)
+                rec_count, cmt_count, talk_items = self._build_chart_social_data(cid)
+                chart_data["recommend_count"] = rec_count
+                chart_data["comment_count"] = cmt_count
+                success = self.save_chart_data(chart_data, song_data, talk_items=talk_items)
                 if success:
                     self.processed_charts.add(cid)
                     if song_data["sid"]:
@@ -1057,7 +1237,10 @@ class STBCrawler:
             
             chart_data, song_data = self.parse_chart_page(response.text, cid)
             if chart_data and song_data:
-                success = self.save_chart_data(chart_data, song_data)
+                rec_count, cmt_count, talk_items = self._build_chart_social_data(cid)
+                chart_data["recommend_count"] = rec_count
+                chart_data["comment_count"] = cmt_count
+                success = self.save_chart_data(chart_data, song_data, talk_items=talk_items)
                 if success:
                     self.processed_charts.add(cid)
                     if song_data["sid"]:
@@ -1119,7 +1302,7 @@ class STBCrawler:
         data_str = json.dumps(data, sort_keys=True, default=str)
         return hashlib.md5(data_str.encode('utf-8')).hexdigest()
 
-    def save_chart_data(self, chart_data, song_data):
+    def save_chart_data(self, chart_data, song_data, talk_items=None):
         """保存谱面数据到数据库 - 覆盖更新模式，如果封面缺失则保留原来的封面"""
         cursor = self.db_manager.get_connection().cursor()
         crawl_time = datetime.now()
@@ -1165,18 +1348,27 @@ class STBCrawler:
             cursor.execute('''
             INSERT OR REPLACE INTO charts 
             (cid, sid, version, creator_uid, creator_name, stabled_by_uid, stabled_by_name,
-             level, mode, chart_length, status, heat, love_count, donate_count, play_count,
+             level, mode, chart_length, status, heat, love_count, recommend_count, comment_count, donate_count, play_count,
              last_updated, crawl_time, data_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 chart_data["cid"], song_data["sid"], chart_data["version"],
                 chart_data["creator_uid"], chart_data["creator_name"],
                 chart_data["stabled_by_uid"], chart_data["stabled_by_name"],
                 chart_data["level"], chart_data["mode"], chart_data["chart_length"],
                 chart_data["status"], chart_data["heat"], chart_data["love_count"],
+                int(chart_data.get("recommend_count", 0) or 0),
+                int(chart_data.get("comment_count", 0) or 0),
                 chart_data["donate_count"], chart_data["play_count"],
                 chart_data["last_updated"], crawl_time, chart_hash
             ))
+
+            self._save_chart_comments(
+                cursor=cursor,
+                cid=chart_data["cid"],
+                comment_items=talk_items or [],
+                crawl_time=crawl_time,
+            )
             
             self.logger.info("[OK] 保存/更新谱面: %s - %s", chart_data["cid"], song_data["title"])
             self.db_manager.get_connection().commit()

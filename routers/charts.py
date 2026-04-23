@@ -429,6 +429,31 @@ async def get_chart_detail(cid: int):
     except Exception as e:
         return APIResponse(success=False, error=str(e), timestamp=datetime.now())
 
+
+@router.get("/{cid}/comments", response_model=APIResponse)
+async def get_chart_comments(
+    cid: int,
+    limit: int = Query(50, description="返回数量", ge=1, le=500),
+    offset: int = Query(0, description="偏移量", ge=0),
+    include_recommend: bool = Query(True, description="是否包含推荐记录(type=1)")
+):
+    """获取谱面的评论/推荐流水"""
+    try:
+        comments = chart_service.get_chart_comments(
+            cid=cid,
+            limit=limit,
+            offset=offset,
+            include_recommend=include_recommend,
+        )
+        return APIResponse(
+            success=True,
+            data=comments,
+            message=f"找到 {len(comments)} 条记录",
+            timestamp=datetime.now(),
+        )
+    except Exception as e:
+        return APIResponse(success=False, error=str(e), timestamp=datetime.now())
+
 @router.get("/stabilizers/{player_name}/stats", response_model=APIResponse)
 async def get_stabilizer_stats(player_name: str):
     """获取稳定者的统计信息"""

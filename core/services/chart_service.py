@@ -543,6 +543,46 @@ class ChartService:
         data = dict(zip(cols, row))
         conn.close()
         return data
+
+    @db_safe_operation
+    def get_chart_comments(
+        self,
+        cid: int,
+        limit: int = 50,
+        offset: int = 0,
+        include_recommend: bool = True,
+    ) -> List[Dict[str, Any]]:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if include_recommend:
+            cursor.execute(
+                """
+                SELECT tid, cid, uid, name, content, talk_type, is_recommend, talk_time, crawl_time
+                FROM chart_comments
+                WHERE cid = ?
+                ORDER BY talk_time DESC
+                LIMIT ? OFFSET ?
+                """,
+                (cid, limit, offset),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT tid, cid, uid, name, content, talk_type, is_recommend, talk_time, crawl_time
+                FROM chart_comments
+                WHERE cid = ? AND is_recommend = 0
+                ORDER BY talk_time DESC
+                LIMIT ? OFFSET ?
+                """,
+                (cid, limit, offset),
+            )
+
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        result = [dict(zip(cols, row)) for row in rows]
+        conn.close()
+        return result
     
     @db_safe_operation
     def get_stabilizer_stats(self, player_name: str) -> Dict[str, Any]:

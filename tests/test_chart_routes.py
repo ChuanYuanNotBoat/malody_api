@@ -70,3 +70,41 @@ class TestChartRoutes(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("不能同时使用", resp.json()["detail"])
 
+
+    def test_chart_comments_route(self):
+        fake_items = [
+            {
+                "tid": 1,
+                "cid": 123,
+                "uid": 456,
+                "name": "tester",
+                "content": "hello",
+                "talk_type": 0,
+                "is_recommend": 0,
+                "talk_time": 1770000000,
+                "crawl_time": "2026-04-24 00:00:00",
+            }
+        ]
+        with patch("malody_api.routers.charts.chart_service.get_chart_comments", return_value=fake_items):
+            resp = self.client.get("/charts/123/comments?limit=10&offset=0")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(len(body["data"]), 1)
+        self.assertEqual(body["data"][0]["tid"], 1)
+
+    def test_chart_comments_exclude_recommend(self):
+        with patch(
+            "malody_api.routers.charts.chart_service.get_chart_comments",
+            return_value=[],
+        ) as mocked:
+            resp = self.client.get("/charts/123/comments?include_recommend=false&limit=5&offset=2")
+
+        self.assertEqual(resp.status_code, 200)
+        mocked.assert_called_once_with(
+            cid=123,
+            limit=5,
+            offset=2,
+            include_recommend=False,
+        )
