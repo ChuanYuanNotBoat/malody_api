@@ -430,6 +430,29 @@ async def get_chart_detail(cid: int):
         return APIResponse(success=False, error=str(e), timestamp=datetime.now())
 
 
+@router.get("/{cid}/recommenders", response_model=APIResponse)
+async def get_chart_recommenders(
+    cid: int,
+    limit: int = Query(100, description="返回数量", ge=1, le=1000),
+    offset: int = Query(0, description="偏移量", ge=0),
+):
+    """获取谱面推荐玩家 UID 列表（按最近推荐时间降序）"""
+    try:
+        data = chart_service.get_chart_recommenders(
+            cid=cid,
+            limit=limit,
+            offset=offset,
+        )
+        return APIResponse(
+            success=True,
+            data=data,
+            message=f"找到 {len(data)} 条推荐玩家记录",
+            timestamp=datetime.now(),
+        )
+    except Exception as e:
+        return APIResponse(success=False, error=str(e), timestamp=datetime.now())
+
+
 @router.get("/{cid}/comments", response_model=APIResponse)
 async def get_chart_comments(
     cid: int,

@@ -108,3 +108,39 @@ class TestChartRoutes(TestCase):
             offset=2,
             include_recommend=False,
         )
+
+    def test_chart_recommenders_route(self):
+        fake_rows = [
+            {
+                "uid": 1661270,
+                "name": "Rai1guN_",
+                "recommend_records": 1,
+                "first_recommend_time": "2026-04-24 00:02:27",
+                "last_recommend_time": "2026-04-24 00:02:27",
+            }
+        ]
+        with patch(
+            "malody_api.routers.charts.chart_service.get_chart_recommenders",
+            return_value=fake_rows,
+        ):
+            resp = self.client.get("/charts/155861/recommenders?limit=20&offset=0")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(len(body["data"]), 1)
+        self.assertEqual(body["data"][0]["uid"], 1661270)
+
+    def test_chart_recommenders_route_args(self):
+        with patch(
+            "malody_api.routers.charts.chart_service.get_chart_recommenders",
+            return_value=[],
+        ) as mocked:
+            resp = self.client.get("/charts/99/recommenders?limit=5&offset=3")
+
+        self.assertEqual(resp.status_code, 200)
+        mocked.assert_called_once_with(
+            cid=99,
+            limit=5,
+            offset=3,
+        )

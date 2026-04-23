@@ -590,10 +590,13 @@ class STBCrawler:
                 self.logger.debug("拉取谱面 talk 失败 cid=%s: %s", cid, e)
                 break
 
-            if payload.get("code") != 0:
+            # Compatible with both legacy payload shapes:
+            # 1) {"code":0,"data":{"list":[...],"next":...}}
+            # 2) {"list":[...],"next":...}
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+            if isinstance(payload, dict) and "code" in payload and payload.get("code") not in (0, None):
                 break
 
-            data = payload.get("data") or {}
             talk_list = data.get("list") or []
             if not talk_list:
                 break
@@ -711,6 +714,9 @@ class STBCrawler:
         if cover_url.startswith("/"):
             cover_url = BASE_URL + cover_url
 
+        api_like_count = int(chart_info.get("like") or chart_hint.get("like") or 0)
+        api_hot_count = int(chart_info.get("hot") or chart_hint.get("hot") or 0)
+
         chart_data = {
             "cid": cid,
             "version": version,
@@ -722,9 +728,9 @@ class STBCrawler:
             "mode": int(chart_info.get("mode") if chart_info.get("mode") is not None else chart_hint.get("mode", 0)),
             "chart_length": int(chart_info.get("length") or chart_hint.get("length") or 0),
             "status": int(chart_info.get("type") if chart_info.get("type") is not None else chart_hint.get("type", 0)),
-            "heat": int(chart_hint.get("hot", 0) or 0),
-            "love_count": 0,
-            "recommend_count": 0,
+            "heat": api_hot_count,
+            "love_count": api_like_count,
+            "recommend_count": api_like_count,
             "comment_count": 0,
             "donate_count": 0,
             "play_count": 0,
@@ -741,7 +747,8 @@ class STBCrawler:
         }
 
         rec_count, cmt_count, talk_items = self._build_chart_social_data(cid)
-        chart_data["recommend_count"] = rec_count
+        # Primary source: official API like count; fallback/补充: talk stream recommend items.
+        chart_data["recommend_count"] = max(chart_data["recommend_count"], rec_count)
         chart_data["comment_count"] = cmt_count
 
         success = self.save_chart_data(chart_data, song_data, talk_items=talk_items)
@@ -1143,6 +1150,7 @@ class STBCrawler:
                             elif 'N/A' not in div_text and not any(keyword in div_text for keyword in ['Donation', 'Hot']):
                                 # 可能是爱心数量
                                 chart_data["love_count"] = value
+                                chart_data["recommend_count"] = value
                                 self.logger.debug("提取爱心数: %s", value)
                         except ValueError:
                             self.logger.debug("无法解析数字: %s", value_span.get_text().strip())

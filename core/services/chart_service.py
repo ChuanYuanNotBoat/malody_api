@@ -583,6 +583,38 @@ class ChartService:
         result = [dict(zip(cols, row)) for row in rows]
         conn.close()
         return result
+
+    @db_safe_operation
+    def get_chart_recommenders(
+        self,
+        cid: int,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Get recommender uid bindings for a chart from talk stream."""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                uid,
+                MAX(name) AS name,
+                COUNT(*) AS recommend_records,
+                MIN(talk_time) AS first_recommend_time,
+                MAX(talk_time) AS last_recommend_time
+            FROM chart_comments
+            WHERE cid = ? AND is_recommend = 1 AND uid IS NOT NULL
+            GROUP BY uid
+            ORDER BY last_recommend_time DESC
+            LIMIT ? OFFSET ?
+            """,
+            (cid, limit, offset),
+        )
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        result = [dict(zip(cols, row)) for row in rows]
+        conn.close()
+        return result
     
     @db_safe_operation
     def get_stabilizer_stats(self, player_name: str) -> Dict[str, Any]:
