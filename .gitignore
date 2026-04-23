@@ -57,3 +57,8 @@ config.yaml
 cookies.local.json
 controller.log
 global_progress.bin
+
+# Temporary research/debug artifacts
+tmp/
+logs_*.html
+logs_*.js
