@@ -29,6 +29,7 @@ import random
 import pprint
 import pickle
 import struct
+from collections import deque
 
 # 复用现有的数据库管理器和配置
 from malody_rankings import DatabaseManager, init_database, stop_requested, stop_lock, COOKIES, HEADERS
@@ -112,6 +113,62 @@ PLAYER_PROFILE_URL = BASE_URL + "/accounts/user/{uid}"
 player_queue = queue.Queue()
 crawl_progress = {}
 progress_lock = Lock()
+
+MAX_SAFE_WORKERS = 8
+MAX_SAFE_RPM = 120
+DEFAULT_SAFE_RPM = 15
+BURST_WARN_THRESHOLD_PER_SEC = 30
+
+
+class GlobalRequestRateLimiter:
+    """Thread-safe global limiter shared by all worker threads."""
+
+    def __init__(self, requests_per_minute):
+        self._lock = Lock()
+        self._next_allowed_ts = 0.0
+        self._interval = 0.0
+        self._recent_request_ts = deque()
+        self._last_burst_warn_ts = 0.0
+        self.set_rate(requests_per_minute)
+
+    def set_rate(self, requests_per_minute):
+        rpm = float(requests_per_minute or 0)
+        self._interval = (60.0 / rpm) if rpm > 0 else 0.0
+
+    def wait_for_slot(self):
+        if self._interval <= 0:
+            return
+
+        sleep_seconds = 0.0
+        now = time.monotonic()
+        with self._lock:
+            if now < self._next_allowed_ts:
+                sleep_seconds = self._next_allowed_ts - now
+                self._next_allowed_ts += self._interval
+            else:
+                self._next_allowed_ts = now + self._interval
+
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    def record_request(self, logger):
+        now = time.monotonic()
+        with self._lock:
+            self._recent_request_ts.append(now)
+            one_sec_ago = now - 1.0
+            while self._recent_request_ts and self._recent_request_ts[0] < one_sec_ago:
+                self._recent_request_ts.popleft()
+
+            recent_qps = len(self._recent_request_ts)
+            if (
+                recent_qps >= BURST_WARN_THRESHOLD_PER_SEC
+                and now - self._last_burst_warn_ts >= 10.0
+            ):
+                self._last_burst_warn_ts = now
+                logger.warning(
+                    "检测到瞬时请求峰值: 近1秒请求数=%d，已启用全局限速器。",
+                    recent_qps,
+                )
 
 class ProgressTracker:
     """
@@ -377,7 +434,37 @@ class PlayerProfileCrawler:
         
         # 用于跟踪已处理的玩家（仅用于去重，与恢复逻辑分开）
         self.processed_uids = set()
+        self.rate_limiter = GlobalRequestRateLimiter(DEFAULT_SAFE_RPM)
             
+    def _sanitize_crawl_limits(self, max_workers, requests_per_minute):
+        safe_workers = max(1, int(max_workers or 1))
+        safe_rpm = int(requests_per_minute or 0)
+
+        if safe_workers > MAX_SAFE_WORKERS:
+            self.logger.warning(
+                "max_workers=%d 超过安全阈值，已自动下调到 %d",
+                safe_workers,
+                MAX_SAFE_WORKERS,
+            )
+            safe_workers = MAX_SAFE_WORKERS
+
+        if safe_rpm <= 0:
+            self.logger.warning(
+                "rpm=%d 非法或未配置，已自动回退到安全默认值 %d",
+                safe_rpm,
+                DEFAULT_SAFE_RPM,
+            )
+            safe_rpm = DEFAULT_SAFE_RPM
+        elif safe_rpm > MAX_SAFE_RPM:
+            self.logger.warning(
+                "rpm=%d 超过安全阈值，已自动下调到 %d",
+                safe_rpm,
+                MAX_SAFE_RPM,
+            )
+            safe_rpm = MAX_SAFE_RPM
+
+        return safe_workers, safe_rpm
+
     def init_database(self):
         """初始化玩家资料相关的数据库表"""
         cursor = self.db_manager.get_connection().cursor()
@@ -667,7 +754,9 @@ class PlayerProfileCrawler:
         
         try:
             self.logger.debug("请求玩家主页: %s", url)
+            self.rate_limiter.wait_for_slot()
             response = self.session.get(url, timeout=30)
+            self.rate_limiter.record_request(self.logger)
             
             # 检查状态码
             if response.status_code == 404:
@@ -1071,6 +1160,11 @@ class PlayerProfileCrawler:
         self.logger.info("全局范围爬取: %d - %d (共 %d 个)", start_uid, end_uid, end_uid - start_uid + 1)
 
         # 加载全局进度
+        max_workers, requests_per_minute = self._sanitize_crawl_limits(
+            max_workers, requests_per_minute
+        )
+        self.rate_limiter.set_rate(requests_per_minute)
+        self.logger.info("已应用安全限速: workers=%d, rpm=%d", max_workers, requests_per_minute)
         progress = GlobalBitmapProgress(resume_file)
         total = end_uid - start_uid + 1
 
@@ -1138,8 +1232,7 @@ class PlayerProfileCrawler:
                     task_queue.task_done()
 
                 # 速率限制
-                if requests_per_minute > 0:
-                    time.sleep(60 / requests_per_minute / max_workers)
+                # 请求频率由 fetch_player_profile 内部全局限速器控制
 
         # 启动生产者线程
         producer_thread = Thread(target=producer, daemon=True)
@@ -1397,6 +1490,23 @@ def main():
     setup_detailed_logging(log_level=log_level, log_file=args.log_file)
     
     logger = logging.getLogger(__name__)
+    if args.max_workers < 1:
+        logger.warning("max_workers=%d 非法，已重置为 1", args.max_workers)
+        args.max_workers = 1
+    elif args.max_workers > MAX_SAFE_WORKERS:
+        logger.warning(
+            "max_workers=%d 超过安全阈值，已下调为 %d",
+            args.max_workers,
+            MAX_SAFE_WORKERS,
+        )
+        args.max_workers = MAX_SAFE_WORKERS
+
+    if args.rpm <= 0:
+        logger.warning("rpm=%d 非法，已重置为 %d", args.rpm, DEFAULT_SAFE_RPM)
+        args.rpm = DEFAULT_SAFE_RPM
+    elif args.rpm > MAX_SAFE_RPM:
+        logger.warning("rpm=%d 超过安全阈值，已下调为 %d", args.rpm, MAX_SAFE_RPM)
+        args.rpm = MAX_SAFE_RPM
     logger.info("玩家个人主页爬虫启动，参数: %s", vars(args))
     
     # 初始化数据库（如果需要保存的话）

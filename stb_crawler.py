@@ -17,6 +17,7 @@ import hashlib
 from logging.handlers import RotatingFileHandler
 from collections import deque
 import random
+from urllib.parse import urlparse
 
 # 复用现有的数据库管理器和配置
 from malody_rankings import DatabaseManager, init_database, stop_requested, stop_lock, COOKIES, HEADERS
@@ -78,12 +79,16 @@ def setup_detailed_logging(log_level=logging.INFO, log_file=None):
     
     return logger
 
-# Malody API配置
+# Malody server configuration
+# NOTE:
+# - https://malody.mugzone.net is the new SPA frontend shell.
+# - Data endpoints and server-rendered chart/song pages are currently on m.mugzone.net.
 BASE_URL = "https://m.mugzone.net"
-HOMEPAGE_URL = BASE_URL + "/index"  # 主页URL
+HOMEPAGE_URL = BASE_URL + "/index"  # legacy homepage endpoint used for source-1 probing
 SEARCH_API_URL = BASE_URL + "/page/chart/filter"
 CHART_URL = BASE_URL + "/chart/{cid}"
 SONG_URL = BASE_URL + "/song/{sid}"
+NEW_API_BASE_URL = "https://api.mugzone.net/api"
 
 # 谱面状态映射
 STATUS_MAP = {
@@ -158,6 +163,8 @@ class STBCrawler:
         self.max_retries = 5
         self.auth_required_detected = False
         self.api_forbidden_detected = False
+        self.home_source_unavailable = False
+        self.new_api_auth = None
         
     def setup_crawler_logging(self):
         """为爬虫设置专门的日志记录器"""
@@ -178,6 +185,12 @@ class STBCrawler:
     @staticmethod
     def _has_auth_cookies():
         return bool(COOKIES.get("sessionid") and COOKIES.get("csrftoken"))
+
+    @staticmethod
+    def _is_spa_shell_page(html):
+        if not html:
+            return False
+        return '<div id="root"></div>' in html and '/assets/index-' in html
 
     def log_request_details(self, url, response, method="GET"):
         """记录请求的详细信息"""
@@ -308,7 +321,18 @@ class STBCrawler:
             response.raise_for_status()
             
             self.log_request_details(HOMEPAGE_URL, response)
-            self.logger.info("[OK] 主页访问正常")
+            redirected_host = urlparse(response.url).netloc.lower() if response.url else ""
+            if redirected_host and redirected_host != urlparse(HOMEPAGE_URL).netloc.lower():
+                self.home_source_unavailable = True
+                self.logger.warning(
+                    "主页请求被重定向到 %s，主页源将被跳过。",
+                    redirected_host
+                )
+            elif self._is_spa_shell_page(response.text):
+                self.home_source_unavailable = True
+                self.logger.warning("主页返回SPA壳页面，主页源将被跳过。")
+            else:
+                self.logger.info("[OK] 主页访问正常")
 
             # 探测需要登录态的页面，便于给出明确提示
             latest_probe_url = BASE_URL + "/page/latest"
@@ -442,6 +466,211 @@ class STBCrawler:
                 "total": int(data.get("total", 0) or 0),
             }
         return {"list": [], "total": 0}
+
+    def _new_api_headers(self):
+        return {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://malody.mugzone.net",
+            "Referer": "https://malody.mugzone.net/",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }
+
+    def _new_api_ensure_guest_auth(self, force_refresh=False):
+        if self.new_api_auth and not force_refresh:
+            return self.new_api_auth
+
+        url = NEW_API_BASE_URL + "/web/auth/guest/wt"
+        resp = self.session.get(url, headers=self._new_api_headers(), timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"guest auth failed: code={data.get('code')}")
+
+        key = data.get("key") or data.get("token")
+        if not key:
+            raise RuntimeError("guest auth failed: missing key/token")
+
+        self.new_api_auth = {
+            "uid": int(data.get("uid", 1)),
+            "key": key,
+            "store_key": data.get("storeKey") or data.get("tokenStore") or key,
+        }
+        return self.new_api_auth
+
+    def _new_api_get(self, path, params=None, use_store_key=False, retry_on_auth=True):
+        auth = self._new_api_ensure_guest_auth()
+        request_params = dict(params or {})
+        request_params.setdefault("uid", auth["uid"])
+        request_params.setdefault("key", auth["store_key"] if use_store_key else auth["key"])
+
+        url = NEW_API_BASE_URL + (path if path.startswith("/") else f"/{path}")
+        resp = self.session.get(url, params=request_params, headers=self._new_api_headers(), timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Token expired / invalid, refresh once.
+        if data.get("code") == -1000 and retry_on_auth:
+            self._new_api_ensure_guest_auth(force_refresh=True)
+            return self._new_api_get(path, params=params, use_store_key=use_store_key, retry_on_auth=False)
+        return data
+
+    def _save_chart_data_from_new_api(self, chart_info, song_info, chart_hint=None):
+        chart_hint = chart_hint or {}
+        sid = int(chart_info.get("sid") or song_info.get("sid") or 0)
+        cid = int(chart_info.get("cid") or chart_hint.get("cid") or 0)
+        if not sid or not cid:
+            return False
+
+        version = chart_info.get("version") or chart_hint.get("version") or ""
+        level = chart_hint.get("level")
+        if level is None or level == "":
+            level_match = re.search(r'Lv\.?\s*(\d+)', version)
+            level = level_match.group(1) if level_match else ""
+        level = str(level) if level is not None else ""
+
+        ts = chart_hint.get("time") or chart_info.get("time")
+        last_updated = None
+        if ts:
+            try:
+                last_updated = datetime.fromtimestamp(int(ts))
+            except Exception:
+                last_updated = None
+
+        cover_url = song_info.get("cover") or ""
+        if cover_url.startswith("/"):
+            cover_url = BASE_URL + cover_url
+
+        chart_data = {
+            "cid": cid,
+            "version": version,
+            "creator_uid": chart_info.get("uid") or chart_hint.get("uid"),
+            "creator_name": chart_info.get("creator") or chart_hint.get("creator") or "",
+            "stabled_by_uid": chart_info.get("publisherId"),
+            "stabled_by_name": chart_info.get("publisher") or "",
+            "level": level,
+            "mode": int(chart_info.get("mode") if chart_info.get("mode") is not None else chart_hint.get("mode", 0)),
+            "chart_length": int(chart_info.get("length") or chart_hint.get("length") or 0),
+            "status": int(chart_info.get("type") if chart_info.get("type") is not None else chart_hint.get("type", 0)),
+            "heat": int(chart_hint.get("hot", 0) or 0),
+            "love_count": 0,
+            "donate_count": 0,
+            "play_count": 0,
+            "last_updated": last_updated,
+        }
+
+        song_data = {
+            "sid": sid,
+            "title": song_info.get("title") or chart_info.get("title") or "",
+            "artist": song_info.get("artist") or chart_info.get("artist") or "",
+            "bpm": float(song_info.get("bpm") or 0),
+            "length": int(song_info.get("length") or chart_info.get("length") or 0),
+            "cover_url": cover_url,
+        }
+
+        success = self.save_chart_data(chart_data, song_data)
+        if success:
+            self.processed_charts.add(cid)
+            self.processed_songs.add(sid)
+        return success
+
+    def crawl_from_new_api(self, max_charts=100, max_songs=600):
+        """通过新官网 API 抓取谱面（不依赖旧官网页面结构）。"""
+        self.logger.info("=== 开始方式4: 通过新官网API抓取 ===")
+        self.logger.info("目标: 最多 %d 个谱面, 最多扫描 %d 首歌曲", max_charts, max_songs)
+
+        try:
+            self._new_api_ensure_guest_auth()
+        except Exception as e:
+            self.logger.warning("新官网API鉴权失败，跳过该数据源: %s", e)
+            return -1
+
+        success_count = 0
+        sid_count = 0
+        from_offset = 0
+        seen_sids = set()
+        song_info_cache = {}
+
+        while not stop_requested and success_count < max_charts and sid_count < max_songs:
+            try:
+                songs_resp = self._new_api_get("/store/list2", {"from": from_offset, "type": 0}, use_store_key=True)
+            except Exception as e:
+                self.logger.warning("新官网API读取歌曲列表失败: %s", e)
+                break
+
+            if songs_resp.get("code") != 0:
+                self.logger.warning("新官网API歌曲列表返回异常 code=%s", songs_resp.get("code"))
+                break
+
+            songs = songs_resp.get("data") or []
+            if not songs:
+                break
+
+            for song in songs:
+                if stop_requested or success_count >= max_charts or sid_count >= max_songs:
+                    break
+
+                sid = song.get("sid")
+                if not sid:
+                    continue
+                sid = int(sid)
+                if sid in seen_sids:
+                    continue
+                seen_sids.add(sid)
+                sid_count += 1
+
+                try:
+                    charts_resp = self._new_api_get("/community/song/charts", {"sid": sid})
+                except Exception as e:
+                    self.logger.debug("新官网API读取SID %s 谱面失败: %s", sid, e)
+                    continue
+
+                if charts_resp.get("code") != 0:
+                    continue
+                chart_list = charts_resp.get("data") or []
+                if not chart_list:
+                    continue
+
+                if sid not in song_info_cache:
+                    song_info_resp = self._new_api_get("/community/song/info", {"sid": sid})
+                    song_info_cache[sid] = song_info_resp if song_info_resp.get("code") == 0 else None
+                song_info = song_info_cache.get(sid)
+                if not song_info:
+                    continue
+
+                for chart_hint in chart_list:
+                    if stop_requested or success_count >= max_charts:
+                        break
+                    cid = chart_hint.get("cid")
+                    if not cid:
+                        continue
+                    cid = int(cid)
+                    if cid in self.processed_charts:
+                        continue
+
+                    chart_info_resp = self._new_api_get("/community/chart/info", {"cid": cid})
+                    if chart_info_resp.get("code") != 0:
+                        continue
+
+                    if self._save_chart_data_from_new_api(chart_info_resp, song_info, chart_hint):
+                        success_count += 1
+                        self.logger.info("[OK] 新官网API抓取谱面成功 cid=%s (进度 %d/%d)", cid, success_count, max_charts)
+                    else:
+                        self.logger.warning("[FAIL] 新官网API保存谱面失败 cid=%s", cid)
+                    time.sleep(0.2)
+
+            next_offset = songs_resp.get("next")
+            has_more = bool(songs_resp.get("hasMore"))
+            if not has_more:
+                break
+            if isinstance(next_offset, int) and next_offset > from_offset:
+                from_offset = next_offset
+            else:
+                from_offset += len(songs)
+
+        self.logger.info("方式4完成: 成功 %d/%d 个谱面", success_count, max_charts)
+        return success_count
     
     def parse_chart_page(self, html, cid):
         """增强的谱面页面解析，确保能提取SID"""
@@ -1006,6 +1235,20 @@ class STBCrawler:
             
             soup = BeautifulSoup(response.text, "html.parser")
 
+            # New frontend shell page detection: no server-rendered chart blocks.
+            redirected_host = urlparse(response.url).netloc.lower() if response.url else ""
+            if redirected_host and redirected_host != urlparse(HOMEPAGE_URL).netloc.lower():
+                self.home_source_unavailable = True
+                self.logger.warning("主页请求重定向到 %s，跳过主页数据源。", redirected_host)
+                return -1
+
+            if self._is_spa_shell_page(response.text):
+                self.home_source_unavailable = True
+                self.logger.warning(
+                    "检测到新版SPA主页壳（malody.mugzone.net 风格），主页源已失效，建议使用 API 搜索源。"
+                )
+                return -1
+
             if self._is_login_required_page(response.text):
                 self.auth_required_detected = True
                 self.logger.warning("主页返回登录页，跳过主页数据源。")
@@ -1330,6 +1573,7 @@ class STBCrawler:
         
         total_success = 0
         sources = [
+            ("新官网API", self.crawl_from_new_api),
             ("主页爬取", self.crawl_from_homepage),
             ("最近变动", self.crawl_from_latest_page),
             ("API搜索", self.crawl_from_api_search)
@@ -1339,6 +1583,10 @@ class STBCrawler:
             if stop_requested:
                 self.logger.info("爬取被中断")
                 break
+
+            if source_name == "主页爬取" and self.home_source_unavailable:
+                self.logger.warning("主页源已判定不可用，直接跳过。")
+                continue
                 
             self.logger.info("=" * 60)
             self.logger.info("尝试数据源: %s", source_name)
@@ -2202,7 +2450,7 @@ def main():
     parser.add_argument('--test', action='store_true', help='只测试连接')
     parser.add_argument('--test-api', action='store_true', help='测试API访问')
     parser.add_argument('--no-api', action='store_true', help='不使用API搜索，使用其他数据源')
-    parser.add_argument('--source', choices=['all', 'home', 'latest', 'api'], default='all',
+    parser.add_argument('--source', choices=['all', 'home', 'latest', 'api', 'newapi'], default='all',
                        help='选择数据源: all=全部, home=主页, latest=最近变动, api=API搜索')
     parser.add_argument('--max-charts', type=int, default=256, help='每个数据源最大爬取数量（默认256）')
     parser.add_argument('--max-retries', type=int, default=3, help='每个数据源最大重试次数（默认3）')
@@ -2404,6 +2652,8 @@ def main():
                 statuses = [int(status.strip()) for status in args.statuses.split(',')]
             
             crawler.crawl_from_api_search(modes=modes, statuses=statuses, max_charts=args.max_charts)
+        elif args.source == 'newapi':
+            crawler.crawl_from_new_api(max_charts=args.max_charts)
     
     # 更新爬取状态
     crawler.update_crawl_state()

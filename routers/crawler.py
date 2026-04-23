@@ -18,6 +18,9 @@ router = APIRouter(
     dependencies=[Depends(require_api_key)],
 )
 
+MAX_SAFE_PLAYER_WORKERS = 8
+MAX_SAFE_RPM = 120
+
 def run_subprocess(cmd):
     """后台运行子进程"""
     subprocess.run(cmd, capture_output=True)
@@ -53,7 +56,7 @@ async def run_crawler(
     from_db: bool = Query(False, description="player: 从数据库筛选待更新玩家"),
     max_workers: Optional[int] = Query(None, description="player: 最大并发线程"),
     days_since_update: Optional[int] = Query(None, description="player: 未更新时间阈值（天）"),
-    source: Optional[str] = Query(None, description="stb: 数据源 all/home/latest/api"),
+    source: Optional[str] = Query(None, description="stb: 数据源 all/home/latest/api/newapi"),
     cid_crawl: bool = Query(False, description="stb: 启用CID模式"),
     sid_crawl: bool = Query(False, description="stb: 启用SID模式"),
     retry_failed: bool = Query(False, description="stb: 重试失败队列"),
@@ -99,12 +102,24 @@ async def run_crawler(
         if max_workers is not None:
             if max_workers <= 0:
                 raise HTTPException(status_code=400, detail="max_workers 必须大于 0")
+            if max_workers > MAX_SAFE_PLAYER_WORKERS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"max_workers 不能超过 {MAX_SAFE_PLAYER_WORKERS}"
+                )
             cmd.extend(["--max-workers", str(max_workers)])
         if days_since_update is not None:
             if days_since_update <= 0:
                 raise HTTPException(status_code=400, detail="days_since_update 必须大于 0")
             cmd.extend(["--days-since-update", str(days_since_update)])
         if rpm is not None:
+            if rpm <= 0:
+                raise HTTPException(status_code=400, detail="rpm must be > 0")
+            if rpm > MAX_SAFE_RPM:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"rpm must be <= {MAX_SAFE_RPM}"
+                )
             cmd.extend(["--rpm", str(rpm)])
 
         if any([source, cid_crawl, sid_crawl, retry_failed, start is not None, end is not None, resume is not True]):
@@ -116,10 +131,17 @@ async def run_crawler(
         if limit is not None:
             cmd.extend(["--max-charts", str(limit)])
         if rpm is not None:
+            if rpm <= 0:
+                raise HTTPException(status_code=400, detail="rpm must be > 0")
+            if rpm > MAX_SAFE_RPM:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"rpm must be <= {MAX_SAFE_RPM}"
+                )
             cmd.extend(["--rpm", str(rpm)])
         if source:
-            if source not in {"all", "home", "latest", "api"}:
-                raise HTTPException(status_code=400, detail="source 仅支持 all/home/latest/api")
+            if source not in {"all", "home", "latest", "api", "newapi"}:
+                raise HTTPException(status_code=400, detail="source must be one of: all/home/latest/api/newapi")
             cmd.extend(["--source", source])
         if cid_crawl:
             cmd.append("--cid-crawl")
