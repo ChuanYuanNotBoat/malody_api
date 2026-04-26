@@ -4,9 +4,12 @@ from utils.stats_export_runner import parse_export_request, run_export
 def install(cls, *, colorize, colors, db_safe_operation):
     def do_export(self, arg):
         """
-        导出数据为 CSV 文件（支持选择器筛选）
+        导出数据文件（支持 CSV / XLSX）。
 
-        用法: export <类型> [--mode 模式] [--limit 数量] [--players 玩家列表] ...
+        用法:
+          export <类型> [--mode 模式] [--limit 数量] [--players 玩家列表]
+                        [--time-range 30d/8w/6m/1y/2025-01-01]
+                        [--format csv|xlsx] [--with-summary] [--with-metadata]
         """
         request = parse_export_request(
             arg=arg,
@@ -30,4 +33,3 @@ def install(cls, *, colorize, colors, db_safe_operation):
         )
 
     setattr(cls, "do_export", db_safe_operation(do_export))
-

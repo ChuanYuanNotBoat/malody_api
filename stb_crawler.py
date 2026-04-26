@@ -367,7 +367,7 @@ class STBCrawler:
             if redirected_host and redirected_host != urlparse(HOMEPAGE_URL).netloc.lower():
                 self.home_source_unavailable = True
                 self.logger.warning(
-                    "主页请求被重定向到 %s，主页源将被跳过。",
+                    "主页请求被重定向到 %s，主页源将被跳过。建议使用 --source newapi（不依赖旧首页结构）。",
                     redirected_host
                 )
             elif self._is_spa_shell_page(response.text):
@@ -379,11 +379,22 @@ class STBCrawler:
             # 探测需要登录态的页面，便于给出明确提示
             latest_probe_url = BASE_URL + "/page/latest"
             latest_probe_resp = self.session.get(latest_probe_url, timeout=30)
-            if self._is_login_required_page(latest_probe_resp.text):
+            if latest_probe_resp.status_code == 403:
                 self.auth_required_detected = True
                 self.logger.warning(
-                    "检测到 %s 返回登录页。若需完整STB抓取，请配置 sessionid/csrftoken。",
+                    "检测到 %s 返回 403（可能是风控/WAF拦截，而非本地未配置cookie）。建议优先使用 --source newapi。",
                     latest_probe_url
+                )
+            elif self._is_login_required_page(latest_probe_resp.text):
+                self.auth_required_detected = True
+                has_local_cookies = self._has_auth_cookies()
+                self.logger.warning(
+                    "检测到 %s 返回登录页。%s若仅抓新接口可直接使用 --source newapi。",
+                    latest_probe_url
+                    ,
+                    "已检测到本地存在 sessionid/csrftoken，但登录态可能失效或被风控拦截；"
+                    if has_local_cookies
+                    else "若需完整旧站STB抓取，请配置 sessionid/csrftoken；"
                 )
             
             self.logger.info("连接测试全部通过")
@@ -2733,7 +2744,6 @@ def main():
     
     # 测试连接（除非跳过）
     if not args.skip_test:
-        logger.info("开始连接测试...")
         if not crawler.test_connection():
             logger.error("连接测试失败，请检查网络或认证信息")
             logger.info("可以使用 --skip-test 跳过连接测试")

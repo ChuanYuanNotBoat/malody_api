@@ -1,4 +1,5 @@
 # malody_stats.py
+import argparse
 import sqlite3
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -442,14 +443,65 @@ install_plugins(
     base_dir=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 )
 
-def main() -> int:
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="malody_stats",
+        add_help=True,
+        description="Malody stats CLI",
+    )
+    parser.add_argument(
+        "-c",
+        "--command",
+        action="append",
+        default=[],
+        help="Execute a command and exit. Can be used multiple times.",
+    )
+    parser.add_argument(
+        "command_args",
+        nargs=argparse.REMAINDER,
+        help="Command tokens to execute directly, e.g. malody_stats mode 3",
+    )
+    return parser
+
+
+def _execute_commands(shell: "MalodyViz", commands: list[str]) -> int:
+    setattr(shell, "_non_interactive", True)
+    for command_text in commands:
+        cmd_text = command_text.strip()
+        if not cmd_text:
+            continue
+        try:
+            stop = shell.onecmd(cmd_text)
+            if stop:
+                break
+        except Exception as e:
+            print(colorize(f"Command failed '{cmd_text}': {e}", Colors.RED))
+            return 1
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
     if not os.path.exists("malody_rankings.db"):
         print(colorize("Error: database file 'malody_rankings.db' not found", Colors.RED))
         print(colorize("Please place the database file in the project root directory", Colors.YELLOW))
         return 1
 
     try:
-        MalodyViz().cmdloop()
+        parser = _build_cli_parser()
+        args = parser.parse_args(argv)
+        app = MalodyViz()
+
+        commands = list(args.command or [])
+        if args.command_args:
+            direct_command = " ".join(args.command_args).strip()
+            if direct_command:
+                commands.append(direct_command)
+
+        if commands:
+            return _execute_commands(app, commands)
+
+        app.cmdloop()
         return 0
     except KeyboardInterrupt:
         print(colorize("\nInterrupted by user", Colors.YELLOW))

@@ -5,12 +5,18 @@ from typing import Callable, Optional
 
 import pandas as pd
 
+from utils.stats_xlsx_formatter import (
+    apply_change_conditional_formatting,
+    autosize_openpyxl_sheet,
+)
 from utils.stats_update_runner import parse_cli_options, split_cli_args
 
 
 ColorizeFn = Callable[[str, str], str]
 TimeRangeParserFn = Callable[[str], Optional[dict]]
 FilenameFn = Callable[[str, str], str]
+
+SUPPORTED_EXPORT_FORMATS = {"csv", "xlsx"}
 
 
 @dataclass
@@ -20,6 +26,17 @@ class ExportRequest:
     limit: int
     players: list[str]
     time_range: Optional[dict]
+    output_format: str = "csv"
+    with_summary: bool = False
+    with_metadata: bool = False
+
+
+@dataclass
+class ExportPayload:
+    dataframe: pd.DataFrame
+    base_filename: str
+    sheet_name: str
+    metadata: dict[str, object]
 
 
 def parse_export_request(
@@ -69,26 +86,36 @@ def parse_export_request(
             print(colorize("Error: invalid --time-range, expected 30d/8w/6m/1y/2025-01-01", red))
             return None
 
+    output_format = "csv"
+    if "--format" in opts and isinstance(opts["--format"], str):
+        output_format = opts["--format"].strip().lower()
+        if output_format not in SUPPORTED_EXPORT_FORMATS:
+            print(colorize("Error: --format must be csv or xlsx", red))
+            return None
+
+    with_summary = bool(opts.get("--with-summary", False))
+    with_metadata = bool(opts.get("--with-metadata", False))
+
     return ExportRequest(
         export_type=export_type,
         mode=mode,
         limit=limit,
         players=players,
         time_range=time_range,
+        output_format=output_format,
+        with_summary=with_summary,
+        with_metadata=with_metadata,
     )
 
 
-def run_export(
+def _build_export_payload(
     request: ExportRequest,
     conn,
     selector,
-    output_dir: str,
-    unique_filename: FilenameFn,
     colorize: ColorizeFn,
-    green: str,
-    yellow: str,
     red: str,
-) -> bool:
+    yellow: str,
+) -> Optional[ExportPayload]:
     export_type = request.export_type
     mode = request.mode
     limit = request.limit
@@ -117,7 +144,8 @@ def run_export(
         LIMIT ?
         """
         df = pd.read_sql_query(query, conn, params=params + [limit])
-        filename = unique_filename("charts_export.csv", "csv")
+        base_filename = "charts_export"
+        sheet_name = "charts"
 
     elif export_type == "top":
         use_mode = mode if mode is not None else selector.current_mode
@@ -142,7 +170,8 @@ def run_export(
         """
         params.append(limit)
         df = pd.read_sql_query(query, conn, params=params)
-        filename = unique_filename("players_top_export.csv", "csv")
+        base_filename = "players_top_export"
+        sheet_name = "top_players"
 
     elif export_type == "history":
         use_mode = mode if mode is not None else selector.current_mode
@@ -173,7 +202,8 @@ def run_export(
         """
         params.append(limit)
         df = pd.read_sql_query(query, conn, params=params)
-        filename = unique_filename("players_history_export.csv", "csv")
+        base_filename = "players_history_export"
+        sheet_name = "history"
 
     elif export_type == "song":
         params = []
@@ -197,7 +227,8 @@ def run_export(
         """
         params.append(limit)
         df = pd.read_sql_query(query, conn, params=params)
-        filename = unique_filename("songs_export.csv", "csv")
+        base_filename = "songs_export"
+        sheet_name = "songs"
 
     elif export_type == "profile":
         cursor = conn.cursor()
@@ -205,7 +236,7 @@ def run_export(
         profile_columns = [row[1] for row in cursor.fetchall()]
         if not profile_columns:
             print(colorize("Error: player_profiles table not found; cannot export profile", red))
-            return False
+            return None
 
         preferred = [
             "player_id",
@@ -242,13 +273,136 @@ def run_export(
         """
         params.append(limit)
         df = pd.read_sql_query(query, conn, params=params)
-        filename = unique_filename("profiles_export.csv", "csv")
+        base_filename = "profiles_export"
+        sheet_name = "profiles"
 
     else:
         print(colorize(f"Export type '{export_type}' is not implemented", yellow))
+        return None
+
+    metadata = {
+        "export_type": export_type,
+        "format": request.output_format,
+        "row_count": len(df),
+        "generated_at": pd.Timestamp.now().isoformat(),
+        "mode": mode if mode is not None else "",
+        "players": ",".join(players) if players else "",
+        "time_range": str(time_range) if time_range else "",
+        "limit": limit,
+    }
+    return ExportPayload(
+        dataframe=df,
+        base_filename=base_filename,
+        sheet_name=sheet_name,
+        metadata=metadata,
+    )
+
+
+def _build_summary_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for col in df.columns:
+        series = df[col]
+        row: dict[str, object] = {
+            "column": col,
+            "dtype": str(series.dtype),
+            "non_null": int(series.notna().sum()),
+            "null_count": int(series.isna().sum()),
+            "unique_count": int(series.nunique(dropna=True)),
+        }
+        if pd.api.types.is_numeric_dtype(series):
+            row.update(
+                {
+                    "min": float(series.min()) if row["non_null"] else None,
+                    "max": float(series.max()) if row["non_null"] else None,
+                    "mean": float(series.mean()) if row["non_null"] else None,
+                }
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _write_xlsx_file(filepath: str, payload: ExportPayload, request: ExportRequest) -> None:
+    last_error: Optional[Exception] = None
+    for engine in ("openpyxl", "xlsxwriter", None):
+        try:
+            with pd.ExcelWriter(filepath, engine=engine) as writer:
+                payload.dataframe.to_excel(writer, sheet_name=payload.sheet_name, index=False)
+
+                if request.with_metadata:
+                    meta_df = pd.DataFrame(
+                        [{"key": key, "value": value} for key, value in payload.metadata.items()]
+                    )
+                    meta_df.to_excel(writer, sheet_name="metadata", index=False)
+
+                if request.with_summary:
+                    summary_df = _build_summary_dataframe(payload.dataframe)
+                    summary_df.to_excel(writer, sheet_name="summary", index=False)
+
+                main_sheet = writer.sheets.get(payload.sheet_name)
+                if main_sheet is not None:
+                    apply_change_conditional_formatting(main_sheet, payload.dataframe)
+
+                for worksheet in writer.sheets.values():
+                    freeze_attr = getattr(worksheet, "freeze_panes", None)
+                    if callable(freeze_attr):
+                        try:
+                            freeze_attr(1, 0)
+                        except Exception:
+                            pass
+                    elif freeze_attr is not None:
+                        try:
+                            worksheet.freeze_panes = "A2"
+                        except Exception:
+                            pass
+                    autosize_openpyxl_sheet(worksheet)
+            return
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    raise RuntimeError(
+        "Unable to write xlsx file. Please install openpyxl or xlsxwriter."
+    ) from last_error
+
+
+def run_export(
+    request: ExportRequest,
+    conn,
+    selector,
+    output_dir: str,
+    unique_filename: FilenameFn,
+    colorize: ColorizeFn,
+    green: str,
+    yellow: str,
+    red: str,
+) -> bool:
+    payload = _build_export_payload(
+        request=request,
+        conn=conn,
+        selector=selector,
+        colorize=colorize,
+        red=red,
+        yellow=yellow,
+    )
+    if payload is None:
         return False
 
+    if request.output_format not in SUPPORTED_EXPORT_FORMATS:
+        print(colorize(f"Error: unsupported format '{request.output_format}'", red))
+        return False
+
+    ext = request.output_format
+    filename = unique_filename(f"{payload.base_filename}.{ext}", ext)
     filepath = os.path.join(output_dir, filename)
-    df.to_csv(filepath, index=False, encoding="utf-8-sig")
-    print(colorize(f"Exported {export_type} data to: {filepath}", green))
+
+    try:
+        if request.output_format == "csv":
+            payload.dataframe.to_csv(filepath, index=False, encoding="utf-8-sig")
+        else:
+            _write_xlsx_file(filepath, payload, request)
+    except Exception as exc:
+        print(colorize(f"Error: failed to export {request.output_format}: {exc}", red))
+        return False
+
+    print(colorize(f"Exported {request.export_type} data to: {filepath}", green))
     return True

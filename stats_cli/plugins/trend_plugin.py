@@ -1,3 +1,40 @@
+import os
+import shutil
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+
+def _safe_input(prompt: str, default: str = "") -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        return default
+
+
+def get_terminal_width():
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
+
+
+def format_number(number):
+    if number is None:
+        return "N/A"
+    return f"{number:,}"
+
+
+def format_change(change_value, reverse=False, is_percent=False):
+    if change_value is None:
+        return "N/A"
+    if change_value == 0:
+        return "0"
+    if is_percent:
+        return f"{change_value:+.2f}%"
+    return f"{change_value:+d}"
+
+
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
     def do_trend(self, arg):
@@ -18,7 +55,6 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             trend 2024-01-01 --mode 0 --fields rank,exp,acc
         """
         import re
-        from datetime import timedelta
 
         # 合法字段列表
         valid_fields = ["rank", "lv", "exp", "acc", "combo", "pc"]
@@ -509,14 +545,52 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
         print(colorize(f"统计: 总计 {total_players} 名玩家 | 一直在榜: {stayed} | 掉出榜: {dropped} | 新上榜: {new}", Colors.YELLOW))
 
-        # 导出选项
-        export_choice = input(colorize("\n是否导出为CSV文件? (y/N): ", Colors.CYAN)).lower()
-        if export_choice == 'y':
-            self.export_trend_data(trend_data, display_fields, mode, start_date, end_point)
+        # 导出选项：支持格式/编号/Y(询问格式)/N(skip)
+        if getattr(self, "_non_interactive", False):
+            export_choice = "n"
+        else:
+            export_choice = _safe_input(
+                colorize("\n导出: 输入格式(csv/xlsx)/编号(1/2)/Y(询问格式)/N(skip) [N]: ", Colors.CYAN),
+                default="n",
+            ).strip().lower()
+        export_format = self._resolve_trend_export_format(export_choice)
+        if export_format:
+            self.export_trend_data(
+                trend_data,
+                display_fields,
+                mode,
+                start_date,
+                end_point,
+                export_format=export_format,
+            )
 
-    # 注意：export_trend_data 方法需要更新以接受 start_date 和 end_point
-    def export_trend_data(self, trend_data, display_fields, mode, start_date, end_point):
-        """导出趋势数据为CSV文件"""
+    def _resolve_trend_export_format(self, raw_choice):
+        """解析导出输入，返回 csv/xlsx 或 None（跳过）"""
+        choice = (raw_choice or "").strip().lower()
+        format_map = {
+            "1": "csv",
+            "2": "xlsx",
+            "csv": "csv",
+            "xlsx": "xlsx",
+        }
+        if choice in ("", "n", "no"):
+            return None
+        if choice in format_map:
+            return format_map[choice]
+        if choice in ("y", "yes"):
+            followup = _safe_input(
+                colorize("请选择导出格式：csv/xlsx 或 1/2 [csv]: ", Colors.CYAN),
+                default="csv",
+            ).strip().lower()
+            if not followup:
+                return "csv"
+            return format_map.get(followup)
+
+        print(colorize("无效输入，已跳过导出。可输入 csv/xlsx/1/2/Y/N", Colors.YELLOW))
+        return None
+
+    def export_trend_data(self, trend_data, display_fields, mode, start_date, end_point, export_format="csv"):
+        """导出趋势数据为 CSV/XLSX 文件"""
         # 构建数据框
         data_dict = {}
         
@@ -559,14 +633,28 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         
         # 生成文件名
         mode_name = self.mode_names.get(mode, "未知")
-        base_filename = f"trend_mode{mode}_{start_date.strftime('%Y%m%d')}_{end_point.strftime('%Y%m%d')}.csv"
-        filename = self.get_unique_filename(base_filename, "csv")
+        ext = export_format if export_format in ("csv", "xlsx") else "csv"
+        base_filename = f"trend_mode{mode}_{start_date.strftime('%Y%m%d')}_{end_point.strftime('%Y%m%d')}.{ext}"
+        filename = self.get_unique_filename(base_filename, ext)
         filepath = os.path.join(self.output_dir, filename)
         
         # 保存文件
-        df.to_csv(filepath, index=False, encoding='utf-8-sig')
-        print(colorize(f"\n已导出趋势数据: {filepath}", Colors.GREEN))
+        if ext == "csv":
+            df.to_csv(filepath, index=False, encoding="utf-8-sig")
+        else:
+            from utils.stats_xlsx_formatter import apply_change_conditional_formatting, autosize_openpyxl_sheet
+
+            with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="trend", index=False)
+                ws = writer.sheets.get("trend")
+                if ws is not None:
+                    ws.freeze_panes = "A2"
+                    apply_change_conditional_formatting(ws, df)
+                    autosize_openpyxl_sheet(ws)
+        print(colorize(f"\n已导出趋势数据({ext.upper()}): {filepath}", Colors.GREEN))
     
 
     setattr(cls, "do_trend", db_safe_operation(do_trend))
+    setattr(cls, "_resolve_trend_export_format", _resolve_trend_export_format)
+    setattr(cls, "export_trend_data", export_trend_data)
 
