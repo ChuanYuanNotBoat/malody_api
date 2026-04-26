@@ -53,10 +53,25 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         
         cursor = self.conn.cursor()
         
-        cursor.execute(
-            "SELECT player_id FROM player_aliases WHERE alias = ?",
-            (player_name,)
-        )
+        if player_name.isdigit():
+            cursor.execute(
+                "SELECT player_id FROM player_identity WHERE uid = ?",
+                (player_name,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT pi.player_id
+                FROM player_identity pi
+                WHERE pi.current_name = ?
+                UNION
+                SELECT pa.player_id
+                FROM player_aliases pa
+                WHERE pa.alias = ?
+                LIMIT 1
+                """,
+                (player_name, player_name),
+            )
         result = cursor.fetchone()
         
         if not result:

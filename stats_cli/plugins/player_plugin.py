@@ -46,8 +46,17 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         else:
             # 名称查询
             cursor.execute(
-                "SELECT player_id FROM player_aliases WHERE alias = ?",
-                (identifier,)
+                """
+                SELECT pi.player_id
+                FROM player_identity pi
+                WHERE pi.current_name = ?
+                UNION
+                SELECT pa.player_id
+                FROM player_aliases pa
+                WHERE pa.alias = ?
+                LIMIT 1
+                """,
+                (identifier, identifier)
             )
         
         result = cursor.fetchone()

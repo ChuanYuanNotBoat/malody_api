@@ -1,3 +1,6 @@
+import copy
+
+
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
 
@@ -37,8 +40,20 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         else:
             print(colorize(f"错误: 不支持的搜索类型 '{search_type}'", Colors.RED))
 
+    def _build_player_where(self, mode):
+        selector = copy.deepcopy(self.selector)
+        if not selector.filters["modes"] and mode != -1:
+            selector.current_mode = mode
+        return selector.build_player_sql_where("pr")
+
+    def _build_chart_where(self, mode):
+        selector = copy.deepcopy(self.selector)
+        if not selector.filters["modes"] and mode != -1:
+            selector.current_mode = mode
+        return selector.build_chart_sql_where("c")
+
     def _search_players(self, cursor, keyword, mode):
-        where_clause, params = self.selector.build_player_sql_where("pr")
+        where_clause, params = self._build_player_where(mode)
 
         if keyword.isdigit():
             cursor.execute(
@@ -48,7 +63,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             result = cursor.fetchone()
             if result:
                 player_id, name, uid = result
-                player_where, player_params = self.selector.build_player_sql_where("pr")
+                player_where, player_params = self._build_player_where(mode)
                 player_where += " AND pr.player_id = ?"
                 player_params.append(player_id)
 
@@ -68,13 +83,27 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
                     print(get_separator())
                     print(f"排名: {rank}, 等级: {lv}, 准确率: {acc:.2f}%")
-                    print(f"连击: {combo}, 游玩次数: {pc}")
+                    print(f"连击: {combo}, 游戏次数: {pc}")
                     return
 
             print(colorize(f"未找到UID为 {keyword} 的玩家", Colors.YELLOW))
         else:
-            where_clause += " AND pr.name LIKE ?"
-            params.append(f"%{keyword}%")
+            where_clause += """
+             AND (
+                pr.name LIKE ?
+                OR pr.player_id IN (
+                    SELECT pa.player_id
+                    FROM player_aliases pa
+                    WHERE pa.alias LIKE ?
+                )
+                OR pr.player_id IN (
+                    SELECT pi.player_id
+                    FROM player_identity pi
+                    WHERE pi.current_name LIKE ?
+                )
+             )
+            """
+            params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
 
             cursor.execute(
                 f"""
@@ -87,7 +116,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             )
             results = cursor.fetchall()
             if results:
-                print(colorize(f"\n找到 {len(results)} 个匹配玩家:", Colors.CYAN))
+                print(colorize(f"\n找到 {len(results)} 个匹配玩家", Colors.CYAN))
                 print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
                 print(get_separator())
                 for name, rank, lv, acc, crawl_time in results:
@@ -96,7 +125,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 print(colorize(f"未找到包含 '{keyword}' 的玩家", Colors.YELLOW))
 
     def _search_charts(self, cursor, keyword, mode):
-        where_clause, params = self.selector.build_chart_sql_where("c")
+        where_clause, params = self._build_chart_where(mode)
         where_clause += " AND (s.title LIKE ? OR s.artist LIKE ?)"
         params.extend([f"%{keyword}%", f"%{keyword}%"])
 
@@ -113,7 +142,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         )
         results = cursor.fetchall()
         if results:
-            print(colorize(f"\n找到 {len(results)} 个匹配谱面:", Colors.CYAN))
+            print(colorize(f"\n找到 {len(results)} 个匹配谱面", Colors.CYAN))
             print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             print(get_separator())
             for cid, version, level, status, title, artist, creator, heat, donate, updated in results:
@@ -125,7 +154,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             print(colorize(f"未找到包含 '{keyword}' 的谱面", Colors.YELLOW))
 
     def _search_creators(self, cursor, keyword, mode):
-        where_clause, params = self.selector.build_chart_sql_where("c")
+        where_clause, params = self._build_chart_where(mode)
         where_clause += " AND c.creator_name LIKE ?"
         params.append(f"%{keyword}%")
 
@@ -142,7 +171,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         )
         results = cursor.fetchall()
         if results:
-            print(colorize(f"\n找到 {len(results)} 个匹配创作者:", Colors.CYAN))
+            print(colorize(f"\n找到 {len(results)} 个匹配创作者", Colors.CYAN))
             print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             print(get_separator())
             for creator, count, avg_heat, max_heat in results:
@@ -155,3 +184,5 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     setattr(cls, "_search_players", _search_players)
     setattr(cls, "_search_charts", _search_charts)
     setattr(cls, "_search_creators", _search_creators)
+    setattr(cls, "_build_player_where", _build_player_where)
+    setattr(cls, "_build_chart_where", _build_chart_where)

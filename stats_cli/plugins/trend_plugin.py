@@ -35,6 +35,10 @@ def format_change(change_value, reverse=False, is_percent=False):
     return f"{change_value:+d}"
 
 
+def _normalize_player_name(name):
+    return (name or "").strip().casefold()
+
+
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
     def do_trend(self, arg):
@@ -302,11 +306,78 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             # 对于一直在榜的玩家，起始和结束都在范围内
 
         # 分析变化
+        player_links = self._load_trend_player_links(cursor, set(start_players.keys()) | set(end_players.keys()))
+        renamed_matches = self._match_renamed_players(start_players, end_players, player_links)
+        processed_start_ids = set()
+        processed_end_ids = set()
         all_player_ids = set(start_players.keys()) | set(end_players.keys())
 
         trend_data = []
 
+        for start_player_id, end_player_id in renamed_matches.items():
+            start_data = start_players[start_player_id]
+            end_data = end_players[end_player_id]
+            start_name, start_rank, start_lv, start_exp, start_acc, start_combo, start_pc = start_data
+            end_name, end_rank, end_lv, end_exp, end_acc, end_combo, end_pc = end_data
+
+            field_has_changes = False
+            for field in display_fields:
+                if field == "rank" and start_rank != end_rank:
+                    field_has_changes = True
+                    break
+                elif field == "lv" and start_lv != end_lv:
+                    field_has_changes = True
+                    break
+                elif field == "exp" and start_exp != end_exp:
+                    field_has_changes = True
+                    break
+                elif field == "acc" and start_acc != end_acc:
+                    field_has_changes = True
+                    break
+                elif field == "combo" and start_combo != end_combo:
+                    field_has_changes = True
+                    break
+                elif field == "pc" and start_pc != end_pc:
+                    field_has_changes = True
+                    break
+
+            if not field_has_changes and start_name == end_name:
+                continue
+
+            trend_data.append({
+                'player_id': end_player_id,
+                'name': self._compose_trend_display_name(start_name, end_name),
+                'status': '=',
+                'start_rank': start_rank,
+                'end_rank': end_rank,
+                'rank_change': end_rank - start_rank,
+                'start_lv': start_lv,
+                'end_lv': end_lv,
+                'lv_change': end_lv - start_lv,
+                'start_exp': start_exp,
+                'end_exp': end_exp,
+                'exp_change': end_exp - start_exp,
+                'start_acc': start_acc,
+                'end_acc': end_acc,
+                'acc_change': end_acc - start_acc,
+                'start_combo': start_combo,
+                'end_combo': end_combo,
+                'combo_change': end_combo - start_combo,
+                'start_pc': start_pc,
+                'end_pc': end_pc,
+                'pc_change': end_pc - start_pc,
+                'has_changes': True,
+                'latest_time': latest_times.get(end_player_id),
+                'renamed': start_name != end_name,
+                'original_name': start_name,
+                'current_name': end_name,
+            })
+            processed_start_ids.add(start_player_id)
+            processed_end_ids.add(end_player_id)
+
         for player_id in all_player_ids:
+            if player_id in processed_start_ids or player_id in processed_end_ids:
+                continue
             in_start = player_id in start_players
             in_end = player_id in end_players
 
@@ -345,7 +416,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
                 trend_data.append({
                     'player_id': player_id,
-                    'name': current_name,
+                    'name': self._compose_trend_display_name(start_name, end_name),
                     'status': '=',
                     'start_rank': start_rank,
                     'end_rank': end_rank,
@@ -366,7 +437,10 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     'end_pc': end_pc,
                     'pc_change': end_pc - start_pc,
                     'has_changes': True,
-                    'latest_time': latest_times.get(player_id)
+                    'latest_time': latest_times.get(player_id),
+                    'renamed': start_name != end_name,
+                    'original_name': start_name,
+                    'current_name': end_name,
                 })
             elif in_start and not in_end:
                 # 掉出榜：起始玩家在范围内，但窗口内无记录
@@ -396,7 +470,10 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     'end_pc': None,
                     'pc_change': None,
                     'has_changes': True,
-                    'latest_time': None
+                    'latest_time': None,
+                    'renamed': False,
+                    'original_name': start_name,
+                    'current_name': start_name,
                 })
             elif not in_start and in_end:
                 # 新上榜：结束玩家在范围内
@@ -426,7 +503,10 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     'end_pc': end_pc,
                     'pc_change': None,
                     'has_changes': True,
-                    'latest_time': latest_times.get(player_id)
+                    'latest_time': latest_times.get(player_id),
+                    'renamed': False,
+                    'original_name': end_name,
+                    'current_name': end_name,
                 })
 
         if not trend_data:
@@ -650,11 +730,103 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 if ws is not None:
                     ws.freeze_panes = "A2"
                     apply_change_conditional_formatting(ws, df)
+                    self._highlight_trend_rename_cells(ws, trend_data, df)
                     autosize_openpyxl_sheet(ws)
         print(colorize(f"\n已导出趋势数据({ext.upper()}): {filepath}", Colors.GREEN))
     
 
+    def _load_trend_player_links(self, cursor, player_ids):
+        links = {
+            player_id: {"uids": set(), "names": set(), "aliases": set()}
+            for player_id in player_ids
+        }
+        if not player_ids:
+            return links
+
+        placeholders = ",".join(["?"] * len(player_ids))
+        cursor.execute(
+            f"SELECT player_id, uid, current_name FROM player_identity WHERE player_id IN ({placeholders})",
+            list(player_ids),
+        )
+        for player_id, uid, current_name in cursor.fetchall():
+            bucket = links.setdefault(player_id, {"uids": set(), "names": set(), "aliases": set()})
+            if uid is not None:
+                bucket["uids"].add(str(uid))
+            if current_name:
+                bucket["names"].add(_normalize_player_name(current_name))
+
+        cursor.execute(
+            f"SELECT player_id, alias FROM player_aliases WHERE player_id IN ({placeholders})",
+            list(player_ids),
+        )
+        for player_id, alias in cursor.fetchall():
+            bucket = links.setdefault(player_id, {"uids": set(), "names": set(), "aliases": set()})
+            if alias:
+                bucket["aliases"].add(_normalize_player_name(alias))
+        return links
+
+    def _match_renamed_players(self, start_players, end_players, player_links):
+        renamed_matches = {}
+        unmatched_end_ids = set(end_players.keys()) - set(start_players.keys())
+
+        for start_player_id in set(start_players.keys()) - set(end_players.keys()):
+            start_name = start_players[start_player_id][0]
+            start_link = player_links.get(start_player_id, {"uids": set(), "names": set(), "aliases": set()})
+            start_names = set(start_link.get("names", set())) | set(start_link.get("aliases", set()))
+            start_names.add(_normalize_player_name(start_name))
+
+            best_candidate = None
+            best_score = (-1, -1, -999999)
+            for end_player_id in unmatched_end_ids:
+                end_name = end_players[end_player_id][0]
+                end_link = player_links.get(end_player_id, {"uids": set(), "names": set(), "aliases": set()})
+                end_names = set(end_link.get("names", set())) | set(end_link.get("aliases", set()))
+                end_names.add(_normalize_player_name(end_name))
+
+                uid_overlap = start_link.get("uids", set()) & end_link.get("uids", set())
+                name_overlap = start_names & end_names
+                if not uid_overlap and not name_overlap:
+                    continue
+
+                score = (
+                    2 if uid_overlap else 1,
+                    len(name_overlap),
+                    -(end_players[end_player_id][1] or 999999),
+                )
+                if score > best_score:
+                    best_score = score
+                    best_candidate = end_player_id
+
+            if best_candidate is not None:
+                renamed_matches[start_player_id] = best_candidate
+                unmatched_end_ids.remove(best_candidate)
+
+        return renamed_matches
+
+    def _compose_trend_display_name(self, start_name, end_name):
+        if start_name and end_name and start_name != end_name:
+            return f"{end_name}（{start_name}）"
+        return end_name or start_name
+
+    def _highlight_trend_rename_cells(self, worksheet, trend_data, dataframe):
+        try:
+            from openpyxl.styles import PatternFill
+        except Exception:
+            return
+
+        if dataframe.empty:
+            return
+
+        blue_fill = PatternFill(fill_type="solid", start_color="FFDDEBF7", end_color="FFDDEBF7")
+        for row_idx, player in enumerate(trend_data, start=2):
+            if player.get("renamed"):
+                worksheet.cell(row=row_idx, column=2).fill = blue_fill
+
     setattr(cls, "do_trend", db_safe_operation(do_trend))
     setattr(cls, "_resolve_trend_export_format", _resolve_trend_export_format)
     setattr(cls, "export_trend_data", export_trend_data)
+    setattr(cls, "_load_trend_player_links", _load_trend_player_links)
+    setattr(cls, "_match_renamed_players", _match_renamed_players)
+    setattr(cls, "_compose_trend_display_name", _compose_trend_display_name)
+    setattr(cls, "_highlight_trend_rename_cells", _highlight_trend_rename_cells)
 

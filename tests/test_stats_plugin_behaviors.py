@@ -1,0 +1,231 @@
+import io
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import TestCase
+from unittest.mock import Mock, patch
+
+
+ROOT_PARENT = Path(__file__).resolve().parents[2]
+if str(ROOT_PARENT) not in sys.path:
+    sys.path.insert(0, str(ROOT_PARENT))
+
+from malody_api.stats_cli.plugins import export_plugin, help_plugin, update_plugin, utility_plugin  # noqa: E402
+
+
+def _colorize(text: str, _color: str) -> str:
+    return text
+
+
+def _separator() -> str:
+    return "----"
+
+
+def _db_safe_operation(func):
+    def wrapper(self, *args, **kwargs):
+        return func(self, *args, **kwargs)
+
+    wrapper.__doc__ = getattr(func, "__doc__", None)
+    return wrapper
+
+
+class _SelectorStub:
+    def __init__(self):
+        self.current_mode = -1
+        self.filters = {}
+
+    def get_current_selection(self):
+        return self.filters
+
+    def set_filters(self, **kwargs):
+        self.filters.update(kwargs)
+
+
+class _ShellStub:
+    def __init__(self):
+        self.conn = object()
+        self.selector = _SelectorStub()
+        self.output_dir = "tmp"
+        self.current_mode = -1
+        self.mode_names = {-1: "All", 0: "Key", 3: "Catch"}
+        self.cleaned = False
+
+    def _parse_time_range_string(self, raw):
+        return {"raw": raw}
+
+    def get_unique_filename(self, base, ext):
+        return f"{base}.{ext}"
+
+    def cleanup(self):
+        self.cleaned = True
+
+
+class TestStatsPluginBehaviors(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        colors = SimpleNamespace(RED="RED", YELLOW="YELLOW", GREEN="GREEN", CYAN="CYAN", BLUE="BLUE")
+        update_plugin.install(_ShellStub, colorize=_colorize, colors=colors, base_dir=".")
+        export_plugin.install(_ShellStub, colorize=_colorize, colors=colors, db_safe_operation=_db_safe_operation)
+        utility_plugin.install(
+            _ShellStub,
+            colorize=_colorize,
+            colors=colors,
+            get_separator=_separator,
+            db_safe_operation=_db_safe_operation,
+        )
+        help_plugin.install(
+            _ShellStub,
+            colorize=_colorize,
+            colors=colors,
+            get_separator=_separator,
+            get_subseparator=_separator,
+        )
+
+    def test_update_command_skips_when_split_fails(self):
+        shell = _ShellStub()
+        with patch("malody_api.stats_cli.plugins.update_plugin.split_cli_args", return_value=None), patch(
+            "malody_api.stats_cli.plugins.update_plugin.build_update_command"
+        ) as build_mock:
+            shell.do_update('bad "quote')
+
+        build_mock.assert_not_called()
+
+    def test_update_command_skips_when_command_build_fails(self):
+        shell = _ShellStub()
+        with patch("malody_api.stats_cli.plugins.update_plugin.split_cli_args", return_value=["--stb"]), patch(
+            "malody_api.stats_cli.plugins.update_plugin.build_update_command", return_value=None
+        ), patch("malody_api.stats_cli.plugins.update_plugin.run_streaming_command") as run_mock:
+            shell.do_update("--stb")
+
+        run_mock.assert_not_called()
+
+    def test_update_command_runs_streaming_command_on_success(self):
+        shell = _ShellStub()
+        command = ["python", "stb_crawler.py"]
+        with patch("malody_api.stats_cli.plugins.update_plugin.split_cli_args", return_value=["--stb"]), patch(
+            "malody_api.stats_cli.plugins.update_plugin.build_update_command", return_value=command
+        ) as build_mock, patch("malody_api.stats_cli.plugins.update_plugin.run_streaming_command") as run_mock:
+            shell.do_update("--stb")
+
+        build_mock.assert_called_once()
+        run_mock.assert_called_once()
+        self.assertEqual(run_mock.call_args.kwargs["cmd"], command)
+
+    def test_export_command_skips_when_request_parse_fails(self):
+        shell = _ShellStub()
+        with patch("malody_api.stats_cli.plugins.export_plugin.parse_export_request", return_value=None), patch(
+            "malody_api.stats_cli.plugins.export_plugin.run_export"
+        ) as run_mock:
+            shell.do_export("bad")
+
+        run_mock.assert_not_called()
+
+    def test_export_command_passes_shell_context_to_runner(self):
+        shell = _ShellStub()
+        request = object()
+        with patch("malody_api.stats_cli.plugins.export_plugin.parse_export_request", return_value=request), patch(
+            "malody_api.stats_cli.plugins.export_plugin.run_export"
+        ) as run_mock:
+            shell.do_export("top --mode 3")
+
+        run_mock.assert_called_once()
+        kwargs = run_mock.call_args.kwargs
+        self.assertIs(kwargs["request"], request)
+        self.assertIs(kwargs["conn"], shell.conn)
+        self.assertIs(kwargs["selector"], shell.selector)
+        self.assertEqual(kwargs["output_dir"], "tmp")
+
+    def test_ls_command_lists_existing_directory(self):
+        shell = _ShellStub()
+        with patch("malody_api.stats_cli.plugins.utility_plugin.os.path.exists", return_value=True), patch(
+            "malody_api.stats_cli.plugins.utility_plugin.os.listdir", return_value=["subdir", "file.txt"]
+        ), patch("malody_api.stats_cli.plugins.utility_plugin.os.path.isdir", side_effect=lambda p: p.endswith("subdir")), patch(
+            "malody_api.stats_cli.plugins.utility_plugin.os.path.getsize", return_value=12
+        ), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_ls(".")
+
+        output = stdout.getvalue()
+        self.assertIn("subdir", output)
+        self.assertIn("file.txt", output)
+
+    def test_ls_command_reports_missing_path(self):
+        shell = _ShellStub()
+        with patch("malody_api.stats_cli.plugins.utility_plugin.os.path.exists", return_value=False), patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as stdout:
+            shell.do_ls("missing")
+
+        self.assertIn("missing", stdout.getvalue())
+
+    def test_mode_command_reports_current_mode_without_argument(self):
+        shell = _ShellStub()
+        shell.current_mode = 3
+        shell.selector.current_mode = 3
+        shell.selector.filters = {"modes": [3]}
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_mode("")
+
+        output = stdout.getvalue()
+        self.assertIn("3", output)
+        self.assertIn("Catch", output)
+
+    def test_mode_command_switches_to_all_modes(self):
+        shell = _ShellStub()
+        shell.selector.filters = {"modes": [3]}
+
+        shell.do_mode("*")
+
+        self.assertEqual(shell.current_mode, -1)
+        self.assertEqual(shell.selector.current_mode, -1)
+        self.assertEqual(shell.selector.filters["modes"], [])
+
+    def test_mode_command_switches_to_specific_mode(self):
+        shell = _ShellStub()
+
+        shell.do_mode("3")
+
+        self.assertEqual(shell.current_mode, 3)
+        self.assertEqual(shell.selector.current_mode, 3)
+        self.assertEqual(shell.selector.filters["modes"], [3])
+
+    def test_mode_command_rejects_out_of_range_and_non_integer(self):
+        shell = _ShellStub()
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_mode("99")
+            shell.do_mode("abc")
+
+        output = stdout.getvalue()
+        self.assertIn("0-9", output)
+
+    def test_exit_and_quit_commands_cleanup_and_stop(self):
+        shell = _ShellStub()
+
+        exit_result = shell.do_exit("")
+        quit_result = shell.do_quit("")
+
+        self.assertTrue(exit_result)
+        self.assertTrue(quit_result)
+        self.assertTrue(shell.cleaned)
+
+    def test_help_command_shows_specific_command_doc(self):
+        shell = _ShellStub()
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_help("mode")
+
+        self.assertIn("mode", stdout.getvalue().lower())
+
+    def test_help_command_reports_unknown_command(self):
+        shell = _ShellStub()
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_help("does-not-exist")
+
+        self.assertIn("does-not-exist", stdout.getvalue())
+
+    def test_help_command_prints_command_index(self):
+        shell = _ShellStub()
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_help("")
+
+        output = stdout.getvalue().lower()
+        self.assertIn("export", output)
+        self.assertIn("update", output)

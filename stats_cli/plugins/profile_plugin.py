@@ -47,7 +47,19 @@ def install(cls, *, colorize, colors, db_safe_operation):
             if row:
                 player_id = row[0]
         else:
-            cursor.execute("SELECT player_id FROM player_aliases WHERE alias = ?", (player_name,))
+            cursor.execute(
+                """
+                SELECT pi.player_id
+                FROM player_identity pi
+                WHERE pi.current_name = ?
+                UNION
+                SELECT pa.player_id
+                FROM player_aliases pa
+                WHERE pa.alias = ?
+                LIMIT 1
+                """,
+                (player_name, player_name),
+            )
             row = cursor.fetchone()
             if row:
                 player_id = row[0]
@@ -107,7 +119,7 @@ def install(cls, *, colorize, colors, db_safe_operation):
 
         # 显示信息
         print(colorize(f"\n玩家详细资料: {player_name}", Colors.CYAN))
-        print(get_separator())
+        print("-" * 40)
 
         if profile:
             print(colorize("基本信息:", Colors.BOLD))

@@ -129,24 +129,69 @@ def install(cls, *, colorize, colors, db_safe_operation):
 
     def _parse_time_range_string(self, time_str):
         now = datetime.now()
+        raw = (time_str or "").strip()
+        if not raw:
+            return None
+
+        normalized = raw.lower().replace(" ", "")
         try:
-            if time_str.endswith("d"):
-                days = int(time_str[:-1])
+            if normalized.endswith(("days", "day")):
+                days = int(normalized[: -4] if normalized.endswith("days") else normalized[: -3])
                 return {"start": now - timedelta(days=days), "end": now}
-            if time_str.endswith("w"):
-                weeks = int(time_str[:-1])
+            if normalized.endswith("d"):
+                days = int(normalized[:-1])
+                return {"start": now - timedelta(days=days), "end": now}
+            if normalized.endswith(("weeks", "week")):
+                weeks = int(normalized[: -5] if normalized.endswith("weeks") else normalized[: -4])
                 return {"start": now - timedelta(weeks=weeks), "end": now}
-            if time_str.endswith("m"):
-                months = int(time_str[:-1])
+            if normalized.endswith("w"):
+                weeks = int(normalized[:-1])
+                return {"start": now - timedelta(weeks=weeks), "end": now}
+            if normalized.endswith(("months", "month")):
+                months = int(normalized[: -6] if normalized.endswith("months") else normalized[: -5])
                 return {"start": now - timedelta(days=months * 30), "end": now}
-            if time_str.endswith("y"):
-                years = int(time_str[:-1])
+            if normalized.endswith(("mos", "mo")):
+                months = int(normalized[:-3] if normalized.endswith("mos") else normalized[:-2])
+                return {"start": now - timedelta(days=months * 30), "end": now}
+            if normalized.endswith("m"):
+                months = int(normalized[:-1])
+                return {"start": now - timedelta(days=months * 30), "end": now}
+            if normalized.endswith(("years", "year")):
+                years = int(normalized[: -5] if normalized.endswith("years") else normalized[: -4])
+                return {"start": now - timedelta(days=years * 365), "end": now}
+            if normalized.endswith(("yrs", "yr")):
+                years = int(normalized[:-3] if normalized.endswith("yrs") else normalized[:-2])
+                return {"start": now - timedelta(days=years * 365), "end": now}
+            if normalized.endswith("y"):
+                years = int(normalized[:-1])
                 return {"start": now - timedelta(days=years * 365), "end": now}
 
-            start = datetime.strptime(time_str, "%Y-%m-%d")
-            return {"start": start, "end": now}
+            date_formats = [
+                "%Y-%m-%d",
+                "%Y/%m/%d",
+                "%Y.%m.%d",
+                "%Y%m%d",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y/%m/%d %H:%M",
+                "%Y/%m/%d %H:%M:%S",
+                "%Y.%m.%d %H:%M",
+                "%Y.%m.%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y/%m/%dT%H:%M",
+                "%Y/%m/%dT%H:%M:%S",
+            ]
+            for fmt in date_formats:
+                try:
+                    start = datetime.strptime(raw, fmt)
+                    return {"start": start, "end": now}
+                except ValueError:
+                    continue
         except Exception:
             return None
+
+        return None
 
     setattr(cls, "do_stb_creator_trends", db_safe_operation(do_stb_creator_trends))
     setattr(cls, "_parse_time_range_string", _parse_time_range_string)

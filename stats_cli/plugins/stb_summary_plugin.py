@@ -42,7 +42,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         where_clause, params = self.selector.build_chart_sql_where("c")
 
         if not self.selector.filters["modes"] and self.selector.current_mode != -1:
-            where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
+            where_clause += " AND c.mode = ?" if where_clause != "1=1" else " AND c.mode = ?"
             params.append(mode)
 
         cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)

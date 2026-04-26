@@ -19,6 +19,62 @@ FilenameFn = Callable[[str, str], str]
 SUPPORTED_EXPORT_FORMATS = {"csv", "xlsx"}
 
 
+def _build_player_lookup_filter(players: list[str], table_alias: str) -> tuple[str, list[object]]:
+    conditions: list[str] = []
+    params: list[object] = []
+
+    for player in players:
+        if player.isdigit():
+            conditions.append(
+                "("
+                f"{table_alias}.player_id IN (SELECT player_id FROM player_identity WHERE uid = ?)"
+                f" OR {table_alias}.name IN (SELECT current_name FROM player_identity WHERE uid = ?)"
+                f" OR {table_alias}.player_id IN ("
+                "SELECT pa.player_id FROM player_aliases pa "
+                "JOIN player_identity pi ON pa.player_id = pi.player_id "
+                "WHERE pi.uid = ?)"
+                ")"
+            )
+            params.extend([player, player, player])
+        else:
+            conditions.append(
+                "("
+                f"{table_alias}.name IN (SELECT current_name FROM player_identity WHERE current_name = ?)"
+                f" OR {table_alias}.name = ?"
+                f" OR {table_alias}.player_id IN (SELECT player_id FROM player_aliases WHERE alias = ?)"
+                ")"
+            )
+            params.extend([player, player, player])
+
+    return (" OR ".join(conditions), params)
+
+
+def _build_profile_lookup_filter(players: list[str]) -> tuple[str, list[object]]:
+    conditions: list[str] = []
+    params: list[object] = []
+
+    for player in players:
+        if player.isdigit():
+            conditions.append(
+                "("
+                "pi.uid = ?"
+                " OR pp.uid = ?"
+                " OR pp.player_id IN (SELECT player_id FROM player_identity WHERE uid = ?)"
+                ")"
+            )
+            params.extend([player, player, player])
+        else:
+            conditions.append(
+                "("
+                "pi.current_name = ?"
+                " OR pa.alias = ?"
+                ")"
+            )
+            params.extend([player, player])
+
+    return (" OR ".join(conditions), params)
+
+
 @dataclass
 class ExportRequest:
     export_type: str
@@ -152,9 +208,9 @@ def _build_export_payload(
         params = [use_mode, use_mode]
         player_filter = ""
         if players:
-            placeholders = ",".join(["?"] * len(players))
-            player_filter = f" AND pr.name IN ({placeholders})"
-            params.extend(players)
+            lookup_filter, lookup_params = _build_player_lookup_filter(players, "pr")
+            player_filter = f" AND ({lookup_filter})"
+            params.extend(lookup_params)
 
         query = f"""
         WITH latest AS (
@@ -178,13 +234,9 @@ def _build_export_payload(
         params = [use_mode]
         player_filter = ""
         if players:
-            placeholders = ",".join(["?"] * len(players))
-            player_filter = (
-                f" AND (pr.name IN ({placeholders}) "
-                f"OR pr.player_id IN (SELECT player_id FROM player_aliases WHERE alias IN ({placeholders})))"
-            )
-            params.extend(players)
-            params.extend(players)
+            lookup_filter, lookup_params = _build_player_lookup_filter(players, "pr")
+            player_filter = f" AND ({lookup_filter})"
+            params.extend(lookup_params)
 
         time_filter = ""
         if time_range:
@@ -256,10 +308,9 @@ def _build_export_payload(
         params = []
         player_filter = ""
         if players:
-            placeholders = ",".join(["?"] * len(players))
-            player_filter = f"WHERE pi.current_name IN ({placeholders}) OR pa.alias IN ({placeholders})"
-            params.extend(players)
-            params.extend(players)
+            lookup_filter, lookup_params = _build_profile_lookup_filter(players)
+            player_filter = f"WHERE {lookup_filter}"
+            params.extend(lookup_params)
 
         query = f"""
         SELECT pi.current_name, {selected_sql}
