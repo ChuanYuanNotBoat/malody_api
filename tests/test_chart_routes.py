@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 
+import pandas as pd
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -144,3 +145,44 @@ class TestChartRoutes(TestCase):
             limit=5,
             offset=3,
         )
+
+    def test_export_charts_csv_returns_attachment(self):
+        class _Conn:
+            def close(self):
+                return None
+
+        df = pd.DataFrame([{"cid": 1, "title": "Song A", "artist": "Artist A"}])
+        with patch("malody_api.core.database.get_db_connection", return_value=_Conn()), patch(
+            "malody_api.routers.charts.pd.read_sql_query", return_value=df
+        ):
+            resp = self.client.get("/charts/export/charts?format=csv")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/csv", resp.headers.get("content-type", ""))
+        self.assertIn("filename=charts.csv", resp.headers.get("content-disposition", ""))
+        self.assertIn("Song A", resp.text)
+
+    def test_export_charts_xlsx_returns_attachment(self):
+        class _Conn:
+            def close(self):
+                return None
+
+        df = pd.DataFrame([{"cid": 2, "title": "Song B", "artist": "Artist B"}])
+        with patch("malody_api.core.database.get_db_connection", return_value=_Conn()), patch(
+            "malody_api.routers.charts.pd.read_sql_query", return_value=df
+        ):
+            resp = self.client.get("/charts/export/charts?format=xlsx")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resp.headers.get("content-type", ""),
+        )
+        self.assertIn("filename=charts.xlsx", resp.headers.get("content-disposition", ""))
+        self.assertTrue(resp.content.startswith(b"PK"))
+
+    def test_export_charts_rejects_unknown_format(self):
+        resp = self.client.get("/charts/export/charts?format=json")
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("format must be csv or xlsx", resp.json().get("detail", ""))

@@ -1,6 +1,6 @@
 # malody_api/routers/players.py
 from fastapi import APIRouter, Query, HTTPException
-from typing import List, Optional
+from typing import List, Optional, Literal
 from datetime import datetime, timedelta
 import re
 
@@ -63,7 +63,8 @@ async def get_top_players(
     limit: int = Query(10, description="返回数量", ge=1, le=100),
     mode: Optional[int] = Query(None, description="游戏模式"),
     players: Optional[str] = Query(None, description="玩家筛选，逗号分隔"),
-    time_range: Optional[str] = Query(None, description="时间范围，如7d, 30d")
+    time_range: Optional[str] = Query(None, description="时间范围，如7d, 30d"),
+    rank_type: Literal["exp", "mm"] = Query("exp", description="排行榜类型")
 ):
     """获取顶级玩家排名"""
     try:
@@ -73,7 +74,7 @@ async def get_top_players(
             selector.set_filters(modes=[mode])
             selector.current_mode = mode
         
-        players_data = player_service.get_top_players(selector, limit)
+        players_data = player_service.get_top_players(selector, limit, rank_type=rank_type)
         
         return APIResponse(
             success=True,
@@ -92,7 +93,8 @@ async def get_top_players(
 @router.get("/{player_identifier}", response_model=APIResponse)
 async def get_player_info(
     player_identifier: str,
-    mode: Optional[int] = Query(None, description="游戏模式")
+    mode: Optional[int] = Query(None, description="游戏模式"),
+    rank_type: Literal["exp", "mm"] = Query("exp", description="排行榜类型")
 ):
     """获取玩家基本信息"""
     try:
@@ -101,7 +103,7 @@ async def get_player_info(
             selector.set_filters(modes=[mode])
             selector.current_mode = mode
         
-        player_info = player_service.get_player_info(player_identifier, selector)
+        player_info = player_service.get_player_info(player_identifier, selector, rank_type=rank_type)
         
         if "error" in player_info:
             raise HTTPException(status_code=404, detail=player_info["error"])
@@ -138,15 +140,18 @@ async def get_player_profile(identifier: str):
 async def get_player_history(
     player_name: str,
     days: int = Query(30, description="历史天数", ge=1, le=365),
-    mode: Optional[int] = Query(None, description="游戏模式")
+    mode: Optional[int] = Query(None, description="游戏模式"),
+    metric: Literal["exp_rank", "mm_rank", "mmr"] = Query("exp_rank", description="历史指标")
 ):
     """获取玩家历史排名"""
     try:
         selector = MCSelector()
         if mode is not None:
             selector.current_mode = mode
+        elif metric != "mmr":
+            selector.current_mode = 0
         
-        history_data = player_service.get_player_history(player_name, selector, days)
+        history_data = player_service.get_player_history(player_name, selector, days, metric=metric)
         
         return APIResponse(
             success=True,

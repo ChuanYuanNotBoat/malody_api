@@ -80,7 +80,7 @@ python run.py
 - `GET /charts/stabilizers/{player_name}/charts` - 获取稳定者审核的谱面列表
 - `GET /charts/search/{keyword}` - 搜索谱面
 - `GET /charts/creators/search/{keyword}` - 搜索创作者
-- `GET /charts/export/charts` - 导出谱面数据为 CSV 文件（支持筛选）
+- `GET /charts/export/charts` - 导出谱面数据为 CSV/XLSX 文件（支持筛选）
 
 #### 页面解析
 - `GET /page-parser/chart/{cid}` - 解析谱面页面（包含谱面信息和排行榜）

@@ -27,10 +27,12 @@ class Player(BaseModel):
     name: str = Field(..., description="玩家名")
     level: Optional[int] = Field(None, description="等级")
     exp: Optional[int] = Field(None, description="经验值")
+    mm_value: Optional[int] = Field(None, description="MM分值")
     accuracy: Optional[float] = Field(None, description="准确率")
     combo: Optional[int] = Field(None, description="最大连击")
     play_count: Optional[int] = Field(None, description="游玩次数")
     mode: Optional[int] = Field(None, description="游戏模式")
+    rank_type: Optional[str] = Field(None, description="排行榜类型(exp/mm)")
 
 class PlayerDetail(BaseModel):
     rank: int = Field(..., description="排名")

@@ -2,7 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 from openpyxl import load_workbook
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import os
 import gc
@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import re
 import argparse
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 颜色支持（仅在终端可用时启用）
 USE_COLOR = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
@@ -117,6 +118,10 @@ HEADERS = {
 BASE_URL = "https://m.mugzone.net/page/all/player?from=0&mode={mode}"
 PLAYER_PROFILE_URL = "https://m.mugzone.net/accounts/user/{player_id}"
 MODES = list(range(10))
+NEW_API_BASE_URL = "https://api.mugzone.net/api"
+NEW_API_MM_PAGE_SIZE = 40
+DEFAULT_MM_LIMIT = 200
+MM_RUN_LOCK_FILE = "tmp/mm_sync.lock"
 
 DB_FILE = "malody_rankings.db"
 GIT_REPO_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -135,6 +140,9 @@ _player_set_lock = Lock()
 player_crawl_lock = Lock()
 player_crawl_in_progress = False
 last_player_crawl_time = None
+
+_api_auth_lock = Lock()
+_api_auth_cache: Dict[str, Any] = {}
 
 def signal_handler(sig, frame):
     """处理终止信号"""
@@ -220,6 +228,197 @@ class DatabaseManager:
             raise e
 
 
+def _new_api_headers() -> Dict[str, str]:
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://malody.mugzone.net",
+        "Referer": "https://malody.mugzone.net/",
+        "User-Agent": HEADERS["User-Agent"],
+    }
+
+
+def _new_api_ensure_guest_auth(session: requests.Session, force_refresh: bool = False) -> Dict[str, Any]:
+    global _api_auth_cache
+    with _api_auth_lock:
+        if (
+            not force_refresh
+            and _api_auth_cache
+            and isinstance(_api_auth_cache.get("ts"), float)
+            and (time.time() - _api_auth_cache["ts"] < 1800)
+        ):
+            return _api_auth_cache
+
+        resp = session.get(
+            f"{NEW_API_BASE_URL}/web/auth/guest/wt",
+            headers=_new_api_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"guest auth failed: code={data.get('code')}")
+
+        key = data.get("key") or data.get("token")
+        if not key:
+            raise RuntimeError("guest auth failed: missing key/token")
+
+        _api_auth_cache = {
+            "uid": int(data.get("uid", 1)),
+            "key": key,
+            "store_key": data.get("storeKey") or data.get("tokenStore") or key,
+            "ts": time.time(),
+        }
+        return _api_auth_cache
+
+
+def _new_api_get(
+    session: requests.Session,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    use_store_key: bool = False,
+    retry_on_auth: bool = True,
+) -> Dict[str, Any]:
+    auth = _new_api_ensure_guest_auth(session)
+    request_params = dict(params or {})
+    request_params.setdefault("uid", auth["uid"])
+    request_params.setdefault("key", auth["store_key"] if use_store_key else auth["key"])
+
+    url = NEW_API_BASE_URL + (path if path.startswith("/") else f"/{path}")
+    resp = session.get(url, params=request_params, headers=_new_api_headers(), timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("code") == -1000 and retry_on_auth:
+        _new_api_ensure_guest_auth(session, force_refresh=True)
+        return _new_api_get(
+            session,
+            path=path,
+            params=params,
+            use_store_key=use_store_key,
+            retry_on_auth=False,
+        )
+
+    return data
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _acquire_mm_run_lock() -> bool:
+    os.makedirs(os.path.dirname(MM_RUN_LOCK_FILE), exist_ok=True)
+    try:
+        fd = os.open(MM_RUN_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\n{datetime.now().isoformat()}\n")
+        return True
+    except FileExistsError:
+        return False
+
+
+def _release_mm_run_lock():
+    try:
+        if os.path.exists(MM_RUN_LOCK_FILE):
+            os.remove(MM_RUN_LOCK_FILE)
+    except OSError:
+        logger.warning("failed to remove mm run lock: %s", MM_RUN_LOCK_FILE)
+
+
+def ensure_mm_schema(cursor: sqlite3.Cursor):
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_rankings_mm (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER,
+            uid TEXT NOT NULL,
+            mode INTEGER NOT NULL,
+            rank INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            mm_value INTEGER NOT NULL,
+            lv INTEGER,
+            acc REAL,
+            combo INTEGER,
+            pc INTEGER,
+            crawl_time TIMESTAMP NOT NULL,
+            source TEXT DEFAULT 'mm_global',
+            FOREIGN KEY (player_id) REFERENCES player_identity (player_id)
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_rankings_mm_uid ON player_rankings_mm(uid)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_rankings_mm_mode ON player_rankings_mm(mode)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_player_rankings_mm_player_mode ON player_rankings_mm(player_id, mode)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_mmr_samples (
+            sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER,
+            uid TEXT NOT NULL,
+            mode INTEGER NOT NULL,
+            mmr INTEGER NOT NULL,
+            mm_rank INTEGER,
+            name TEXT,
+            crawl_time TIMESTAMP NOT NULL,
+            source TEXT NOT NULL,
+            FOREIGN KEY (player_id) REFERENCES player_identity (player_id)
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_mmr_samples_uid ON player_mmr_samples(uid)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_mmr_samples_mode ON player_mmr_samples(mode)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_player_mmr_samples_uid_mode_time ON player_mmr_samples(uid, mode, crawl_time)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_mmr_daily (
+            uid TEXT NOT NULL,
+            mode INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            mmr INTEGER NOT NULL,
+            mm_rank INTEGER,
+            name TEXT,
+            sample_time TIMESTAMP NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (uid, mode, day)
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_mmr_daily_day ON player_mmr_daily(day)")
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mm_crawl_status (
+            task TEXT PRIMARY KEY,
+            last_crawled TIMESTAMP,
+            last_success TIMESTAMP,
+            crawl_count INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            last_error TEXT,
+            state_json TEXT
+        )
+        """
+    )
+
+
 def migrate_database():
     """迁移数据库：为各表添加 uid 字段（如果尚未添加）"""
     db_manager = DatabaseManager()
@@ -247,6 +446,9 @@ def migrate_database():
             cursor.execute('ALTER TABLE player_rankings ADD COLUMN uid TEXT')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
             logger.info("已添加 uid 字段到 player_rankings 表")
+
+        ensure_mm_schema(cursor)
+        logger.info("MM/MMR schema ensured")
 
         db_manager.get_connection().commit()
         # 记录变更到 markdown 文件
@@ -355,6 +557,7 @@ def init_database():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_aliases_uid ON player_aliases(uid)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
+        ensure_mm_schema(cursor)
 
         # 初始化 import_metadata
         for mode in MODES:
@@ -941,6 +1144,419 @@ def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, c
 
     conn.commit()
     return 'diff_insert'
+
+
+def save_player_ranking_mm_record(
+    player_id: int,
+    uid: str,
+    mode: int,
+    rank: int,
+    name: str,
+    mm_value: int,
+    lv: int,
+    acc: float,
+    combo: int,
+    pc: int,
+    crawl_time: datetime,
+    source: str,
+) -> str:
+    """
+    MM 排行区间模型保存。
+    """
+    db_manager = DatabaseManager()
+    conn = db_manager.get_connection()
+    cursor = conn.cursor()
+
+    current_core = (rank, name, mm_value, lv, acc, combo, pc)
+    cursor.execute(
+        """
+        SELECT id, rank, name, mm_value, lv, acc, combo, pc, crawl_time
+        FROM player_rankings_mm
+        WHERE player_id = ? AND mode = ?
+        ORDER BY crawl_time DESC
+        LIMIT 2
+        """,
+        (player_id, mode),
+    )
+    rows = cursor.fetchall()
+
+    if not rows:
+        cursor.execute(
+            """
+            INSERT INTO player_rankings_mm
+            (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source),
+        )
+        conn.commit()
+        return "new"
+
+    last = rows[0]
+    last_id = last[0]
+    last_core = (last[1], last[2], last[3], last[4], last[5], last[6], last[7])
+    has_two_same = False
+    if len(rows) == 2:
+        second = rows[1]
+        second_core = (second[1], second[2], second[3], second[4], second[5], second[6], second[7])
+        has_two_same = second_core == last_core
+
+    if last_core == current_core:
+        if not has_two_same:
+            cursor.execute(
+                """
+                INSERT INTO player_rankings_mm
+                (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source),
+            )
+            conn.commit()
+            return "same_insert"
+        cursor.execute("UPDATE player_rankings_mm SET crawl_time = ? WHERE id = ?", (crawl_time, last_id))
+        conn.commit()
+        return "update"
+
+    cursor.execute(
+        """
+        INSERT INTO player_rankings_mm
+        (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source),
+    )
+    conn.commit()
+    return "diff_insert"
+
+
+def save_player_mmr_sample(
+    player_id: Optional[int],
+    uid: str,
+    mode: int,
+    mmr: int,
+    mm_rank: Optional[int],
+    name: Optional[str],
+    crawl_time: datetime,
+    source: str,
+):
+    db_manager = DatabaseManager()
+    conn = db_manager.get_connection()
+    cursor = conn.cursor()
+    day = crawl_time.date().isoformat()
+    cursor.execute(
+        """
+        INSERT INTO player_mmr_samples
+        (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source),
+    )
+    cursor.execute(
+        """
+        INSERT INTO player_mmr_daily
+        (uid, mode, day, mmr, mm_rank, name, sample_time, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(uid, mode, day) DO UPDATE SET
+            mmr = excluded.mmr,
+            mm_rank = excluded.mm_rank,
+            name = excluded.name,
+            sample_time = excluded.sample_time,
+            source = excluded.source
+        WHERE excluded.sample_time >= player_mmr_daily.sample_time
+        """,
+        (uid, mode, day, mmr, mm_rank, name, crawl_time, source),
+    )
+    conn.commit()
+
+
+def update_mm_crawl_status(
+    task: str,
+    success: bool,
+    error: Optional[str] = None,
+    state: Optional[Dict[str, Any]] = None,
+):
+    db_manager = DatabaseManager()
+    conn = db_manager.get_connection()
+    cursor = conn.cursor()
+    now = datetime.now()
+    state_json = json.dumps(state or {}, ensure_ascii=False)
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO mm_crawl_status
+        (task, last_crawled, last_success, crawl_count, success_count, last_error, state_json)
+        VALUES (
+            ?,
+            ?,
+            CASE WHEN ? THEN ? ELSE (SELECT last_success FROM mm_crawl_status WHERE task = ?) END,
+            COALESCE((SELECT crawl_count FROM mm_crawl_status WHERE task = ?), 0) + 1,
+            COALESCE((SELECT success_count FROM mm_crawl_status WHERE task = ?), 0) + CASE WHEN ? THEN 1 ELSE 0 END,
+            ?,
+            ?
+        )
+        """,
+        (
+            task,
+            now,
+            1 if success else 0,
+            now,
+            task,
+            task,
+            task,
+            1 if success else 0,
+            None if success else error,
+            state_json,
+        ),
+    )
+    conn.commit()
+
+
+def fetch_mm_global_mode(
+    session: requests.Session,
+    mode: int,
+    limit: int = DEFAULT_MM_LIMIT,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    from_offset = 0
+    visited_offsets: Set[int] = set()
+    while len(rows) < max(limit, 0):
+        if from_offset in visited_offsets:
+            break
+        visited_offsets.add(from_offset)
+
+        payload = _new_api_get(
+            session,
+            "/ranking/global",
+            {"mode": mode, "from": from_offset, "mm": 1},
+        )
+        if payload.get("code") != 0:
+            raise RuntimeError(f"ranking/global failed: code={payload.get('code')}")
+        data = payload.get("data") or []
+        if not data:
+            break
+        for item in data:
+            rows.append(item)
+            if len(rows) >= limit:
+                break
+
+        if not payload.get("hasMore"):
+            break
+        next_offset = payload.get("next")
+        if isinstance(next_offset, int):
+            from_offset = next_offset
+        else:
+            from_offset += len(data)
+
+    return rows
+
+
+def fetch_player_mmr_from_api(session: requests.Session, uid: str) -> List[Dict[str, Any]]:
+    payload = _new_api_get(session, "/ranking/player/all", {"touid": _safe_int(uid, -1)})
+    if payload.get("code") != 0:
+        raise RuntimeError(f"ranking/player/all failed: code={payload.get('code')}")
+    data = payload.get("data") or []
+    rows: List[Dict[str, Any]] = []
+    for item in data:
+        mode = _safe_int(item.get("mode"), -1)
+        if mode < 0:
+            continue
+        mmr = _safe_int(item.get("grade"), -1)
+        if mmr < 0:
+            continue
+        rows.append(
+            {
+                "uid": str(uid),
+                "mode": mode,
+                "mmr": mmr,
+                "mm_rank": _safe_int(item.get("gradeRank"), 0) or None,
+                "rank": _safe_int(item.get("rank"), 0) or None,
+                "name": None,
+            }
+        )
+    return rows
+
+
+def fetch_player_mmr_from_page(session: requests.Session, uid: str) -> List[Dict[str, Any]]:
+    url = PLAYER_PROFILE_URL.format(player_id=uid)
+    response = session.get(url, timeout=30)
+    if response.status_code != 200:
+        return []
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows: List[Dict[str, Any]] = []
+    for item in soup.select("div.rank .item"):
+        img = item.select_one("img")
+        if not img or not img.has_attr("src"):
+            continue
+        mode_match = re.search(r"mode-(\d+)\.png", img["src"])
+        if not mode_match:
+            continue
+        mode = _safe_int(mode_match.group(1), -1)
+        if mode < 0:
+            continue
+        text = item.get_text(" ", strip=True)
+        mmr_match = re.search(r"(?:MMR|MM|Grade)[\s:：.]*([0-9,]+)", text, re.IGNORECASE)
+        rank_match = re.search(r"(?:MMRank|GradeRank)[\s:：.]*#?([0-9,]+)", text, re.IGNORECASE)
+        if not mmr_match:
+            continue
+        rows.append(
+            {
+                "uid": str(uid),
+                "mode": mode,
+                "mmr": _safe_int(mmr_match.group(1).replace(",", ""), -1),
+                "mm_rank": _safe_int(rank_match.group(1).replace(",", ""), 0) if rank_match else None,
+                "name": None,
+            }
+        )
+    return [row for row in rows if row["mmr"] >= 0]
+
+
+def get_recent_mm_tracked_uids(limit_per_mode: int = DEFAULT_MM_LIMIT) -> Set[str]:
+    db_manager = DatabaseManager()
+    conn = db_manager.get_connection()
+    cursor = conn.cursor()
+    tracked: Set[str] = set()
+    for mode in MODES:
+        cursor.execute(
+            """
+            SELECT uid
+            FROM player_rankings_mm
+            WHERE mode = ?
+              AND crawl_time = (SELECT MAX(crawl_time) FROM player_rankings_mm WHERE mode = ?)
+              AND rank <= ?
+            """,
+            (mode, mode, limit_per_mode),
+        )
+        tracked.update(str(row[0]) for row in cursor.fetchall() if row and row[0])
+    return tracked
+
+
+def get_player_id_by_uid(uid: str) -> Optional[int]:
+    db_manager = DatabaseManager()
+    cursor = db_manager.get_connection().cursor()
+    cursor.execute("SELECT player_id FROM player_identity WHERE uid = ?", (uid,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def run_mm_sync_cycle(
+    mm_limit: int = DEFAULT_MM_LIMIT,
+    include_mm_ranking: bool = True,
+    include_mmr: bool = True,
+) -> Dict[str, Any]:
+    if not _acquire_mm_run_lock():
+        logger.warning("MM sync is already running, skip this cycle.")
+        return {"skipped": True, "reason": "locked"}
+
+    session = requests.Session()
+    session.cookies.update(COOKIES)
+    session.headers.update(HEADERS)
+    session.mount("https://", requests.adapters.HTTPAdapter(max_retries=3))
+
+    stats: Dict[str, Any] = {
+        "mm_rows": 0,
+        "mm_modes_ok": 0,
+        "mm_modes_fail": 0,
+        "mmr_users_ok": 0,
+        "mmr_users_fail": 0,
+        "mmr_samples": 0,
+    }
+    mm_uids: Set[str] = set()
+    crawl_time = datetime.now()
+
+    try:
+        if include_mm_ranking:
+            for mode in MODES:
+                task = f"mm_global_mode_{mode}"
+                try:
+                    rows = fetch_mm_global_mode(session, mode, mm_limit)
+                    row_stats = {"new": 0, "same_insert": 0, "update": 0, "diff_insert": 0}
+                    for item in rows:
+                        uid = str(_safe_int(item.get("uid"), 0))
+                        if uid == "0":
+                            continue
+                        name = item.get("username") or f"uid_{uid}"
+                        player_id = resolve_player_identity(name, crawl_time, uid=uid)
+                        if player_id is None:
+                            continue
+                        op = save_player_ranking_mm_record(
+                            player_id=player_id,
+                            uid=uid,
+                            mode=mode,
+                            rank=_safe_int(item.get("rank"), 0),
+                            name=name,
+                            mm_value=_safe_int(item.get("value"), 0),
+                            lv=_safe_int(item.get("level"), 0),
+                            acc=_safe_float(item.get("acc"), 0.0),
+                            combo=_safe_int(item.get("combo"), 0),
+                            pc=_safe_int(item.get("playcount"), 0),
+                            crawl_time=crawl_time,
+                            source="mm_global",
+                        )
+                        if op in row_stats:
+                            row_stats[op] += 1
+                        mm_uids.add(uid)
+                    stats["mm_rows"] += len(rows)
+                    stats["mm_modes_ok"] += 1
+                    update_mm_crawl_status(task, True, state={"rows": len(rows), **row_stats})
+                    time.sleep(0.2)
+                except Exception as e:
+                    stats["mm_modes_fail"] += 1
+                    update_mm_crawl_status(task, False, error=str(e), state={"mode": mode})
+                    logger.warning("MM global crawl failed for mode %d: %s", mode, e)
+        else:
+            mm_uids.update(get_recent_mm_tracked_uids(limit_per_mode=mm_limit))
+
+        config_players = load_player_config()
+        mm_uids.update(str(uid).strip() for uid in config_players if str(uid).strip().isdigit())
+
+        if include_mmr:
+            for uid in sorted(mm_uids):
+                try:
+                    player_rows = fetch_player_mmr_from_api(session, uid)
+                    source = "ranking_player_all"
+                    if not player_rows:
+                        player_rows = fetch_player_mmr_from_page(session, uid)
+                        source = "page_profile"
+                    if not player_rows:
+                        stats["mmr_users_fail"] += 1
+                        continue
+                    for item in player_rows:
+                        mode = _safe_int(item.get("mode"), -1)
+                        mmr = _safe_int(item.get("mmr"), -1)
+                        if mode < 0 or mmr < 0:
+                            continue
+                        name = item.get("name")
+                        if name:
+                            player_id = resolve_player_identity(name, crawl_time, uid=uid)
+                        else:
+                            player_id = get_player_id_by_uid(uid)
+                        save_player_mmr_sample(
+                            player_id=player_id,
+                            uid=uid,
+                            mode=mode,
+                            mmr=mmr,
+                            mm_rank=item.get("mm_rank"),
+                            name=name,
+                            crawl_time=crawl_time,
+                            source=source,
+                        )
+                        stats["mmr_samples"] += 1
+                    stats["mmr_users_ok"] += 1
+                    time.sleep(0.1)
+                except Exception as e:
+                    stats["mmr_users_fail"] += 1
+                    logger.warning("MMR crawl failed for uid=%s: %s", uid, e)
+
+            update_mm_crawl_status(
+                "mmr_batch",
+                success=(stats["mmr_users_fail"] == 0),
+                error=None if stats["mmr_users_fail"] == 0 else f"failed={stats['mmr_users_fail']}",
+                state=stats,
+            )
+
+        logger.info("MM sync done: %s", stats)
+        return stats
+    finally:
+        _release_mm_run_lock()
 
 
 def save_to_database(mode, df, crawl_time):
@@ -1642,7 +2258,16 @@ def check_data_changed(mode, df):
     return True
 
 
-def run_crawler_cycle(crawl_players=False, crawl_leaderboard_players=False, save_excel=False, push_to_git=False):
+def run_crawler_cycle(
+    crawl_players=False,
+    crawl_leaderboard_players=False,
+    save_excel=False,
+    push_to_git=False,
+    mm_sync=False,
+    mm_limit=DEFAULT_MM_LIMIT,
+    skip_mm_ranking=False,
+    skip_mmr=False,
+):
     """
     运行一个爬取周期。
 
@@ -1651,6 +2276,8 @@ def run_crawler_cycle(crawl_players=False, crawl_leaderboard_players=False, save
         crawl_leaderboard_players: 是否将当前排行榜中的玩家ID加入队列
         save_excel: 是否保存数据到 Excel 文件
         push_to_git: 是否推送数据到 Git 仓库
+        mm_sync: 是否在本轮执行 MM/MMR 同步
+        mm_limit: 每个模式抓取的 MM 榜单上限
     """
     # 每个周期重新加载配置文件玩家
     if crawl_players:
@@ -1714,6 +2341,17 @@ def run_crawler_cycle(crawl_players=False, crawl_leaderboard_players=False, save
             time.sleep(3)
         except Exception as e:
             logger.exception("处理模式 %d 时发生错误", mode)
+
+    if mm_sync:
+        logger.info("开始执行 MM/MMR 同步...")
+        try:
+            run_mm_sync_cycle(
+                mm_limit=mm_limit,
+                include_mm_ranking=not skip_mm_ranking,
+                include_mmr=not skip_mmr,
+            )
+        except Exception as e:
+            logger.warning("MM/MMR sync failed, continue with existing flow: %s", e)
 
     # 只有当 crawl_players 且 crawl_leaderboard_players 为 True 时，才将排行榜中的玩家加入队列
     if crawl_players and crawl_leaderboard_players and all_dfs:
@@ -1864,6 +2502,16 @@ def parse_arguments():
                             help='推送数据到Git仓库（默认不推送）')
     _ = parser.add_argument('--optimize-db', action='store_true',
                             help='优化数据库（按新规则清理冗余记录）并退出')
+    _ = parser.add_argument('--mm-sync', action='store_true',
+                            help='在常规排行榜周期中同步执行 MM 榜与 MMR 抓取')
+    _ = parser.add_argument('--mm-only', action='store_true',
+                            help='仅执行 MM 榜与 MMR 抓取，不执行 EXP 排行榜与玩家主页抓取')
+    _ = parser.add_argument('--mm-limit', type=int, default=DEFAULT_MM_LIMIT,
+                            help=f'每个模式抓取的 MM 榜上限（默认 {DEFAULT_MM_LIMIT}）')
+    _ = parser.add_argument('--skip-mm-ranking', action='store_true',
+                            help='跳过 MM 榜抓取，仅执行 MMR 同步（通常配合 --mm-only）')
+    _ = parser.add_argument('--skip-mmr', action='store_true',
+                            help='跳过 MMR 同步，仅执行 MM 榜抓取')
 
     return parser.parse_args()
 
@@ -1890,10 +2538,11 @@ def main():
     init_database()
 
     # 预加载配置文件玩家并加入队列（仅用于首次运行前的队列填充，后续周期会重新加载）
-    config_players = load_player_config()
-    if config_players:
-        add_players_to_queue(config_players)
-        logger.info("从配置文件加载了 %d 个玩家", len(config_players))
+    if not args.mm_only:
+        config_players = load_player_config()
+        if config_players:
+            add_players_to_queue(config_players)
+            logger.info("从配置文件加载了 %d 个玩家", len(config_players))
 
     if args.optimize_db:
         optimize_database()
@@ -1902,6 +2551,18 @@ def main():
 
     if args.players_only:
         run_players_only()
+        return
+
+    if args.mm_only:
+        mm_limit = max(1, int(args.mm_limit or DEFAULT_MM_LIMIT))
+        try:
+            run_mm_sync_cycle(
+                mm_limit=mm_limit,
+                include_mm_ranking=not args.skip_mm_ranking,
+                include_mmr=not args.skip_mmr,
+            )
+        finally:
+            DatabaseManager().close_connection()
         return
 
     # 确定是否爬取玩家（默认开启，除非被 --no-player-crawl 或 --leaderboard-only 关闭）
@@ -1915,6 +2576,8 @@ def main():
     # 确定是否保存Excel和推送Git
     save_excel = args.save_excel
     push_to_git = args.push_to_git
+    mm_sync = args.mm_sync
+    mm_limit = max(1, int(args.mm_limit or DEFAULT_MM_LIMIT))
 
     if args.once:
         if args.leaderboard_only:
@@ -1932,7 +2595,11 @@ def main():
             crawl_players=crawl_players,
             crawl_leaderboard_players=crawl_leaderboard_players,
             save_excel=save_excel,
-            push_to_git=push_to_git
+            push_to_git=push_to_git,
+            mm_sync=mm_sync,
+            mm_limit=mm_limit,
+            skip_mm_ranking=args.skip_mm_ranking,
+            skip_mmr=args.skip_mmr,
         )
         DatabaseManager().close_connection()
         return
@@ -1949,7 +2616,11 @@ def main():
                     crawl_players=crawl_players,
                     crawl_leaderboard_players=crawl_leaderboard_players,
                     save_excel=save_excel,
-                    push_to_git=push_to_git
+                    push_to_git=push_to_git,
+                    mm_sync=mm_sync,
+                    mm_limit=mm_limit,
+                    skip_mm_ranking=args.skip_mm_ranking,
+                    skip_mmr=args.skip_mmr,
                 )
             except Exception as e:
                 logger.exception("主循环发生未处理异常")

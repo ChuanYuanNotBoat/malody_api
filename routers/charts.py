@@ -3,12 +3,11 @@ from fastapi import APIRouter, Query, HTTPException
 from typing import List, Optional
 from datetime import datetime, timedelta
 import pandas as pd
-import io
-from fastapi.responses import StreamingResponse
 
 # 改为绝对导入
 from malody_api.core.services import ChartService
 from malody_api.utils.selector import MCSelector
+from malody_api.utils.export_response import build_dataframe_download_response, normalize_export_format
 from malody_api.core.models import APIResponse, ChartStats, HotChart, CreatorStats
 
 router = APIRouter(prefix="/charts", tags=["charts"])
@@ -570,6 +569,7 @@ async def export_charts(
 ):
     """导出谱面数据为CSV文件"""
     try:
+        output_format = normalize_export_format(format)
         selector = create_chart_selector_from_query(
             creators=creators,
             modes=str(mode) if mode is not None else None,
@@ -586,16 +586,18 @@ async def export_charts(
         # 获取数据库连接
         from malody_api.core.database import get_db_connection
         conn = get_db_connection()
-        df = pd.read_sql_query(query, conn, params=params)
-        conn.close()
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+        finally:
+            conn.close()
 
-        output = io.StringIO()
-        df.to_csv(output, index=False, encoding='utf-8')
-        output.seek(0)
-        return StreamingResponse(
-            output,
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=charts.csv"}
+        return build_dataframe_download_response(
+            df=df,
+            base_filename="charts",
+            output_format=output_format,
+            sheet_name="charts",
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         return APIResponse(success=False, error=str(e), timestamp=datetime.now())

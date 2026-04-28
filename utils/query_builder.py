@@ -11,7 +11,8 @@ class SafeQueryBuilder:
         'player_rankings', 'player_identity', 'player_aliases', 
         'charts', 'songs', 'player_config', 'player_crawl_status',
         'import_metadata', 'stb_crawler_state',
-        'player_profiles', 'player_titles', 'player_achievements'
+        'player_profiles', 'player_titles', 'player_achievements',
+        'player_rankings_mm', 'player_mmr_samples', 'player_mmr_daily', 'mm_crawl_status'
     }
     
     # 允许的聚合函数
