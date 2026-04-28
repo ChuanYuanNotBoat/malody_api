@@ -172,6 +172,17 @@ class TestStatsDataPlugins(TestCase):
                 pc INTEGER,
                 crawl_time TEXT
             );
+            CREATE TABLE player_rankings_mm (
+                mode INTEGER,
+                rank INTEGER,
+                name TEXT,
+                lv INTEGER,
+                mm_value INTEGER,
+                acc REAL,
+                combo INTEGER,
+                pc INTEGER,
+                crawl_time TEXT
+            );
             """
         )
         self.conn.commit()
@@ -203,6 +214,19 @@ class TestStatsDataPlugins(TestCase):
                 (1, 1, "Carol", 18, 1700, 97.2, 230, 7, "2026-03-01"),
                 (3, 3, "VeryLongPlayerNameForTruncation", 18, 1600, 97.0, 220, 6, "2026-03-01"),
                 (3, 1, "Alice", 19, 1900, 99.0, 280, 9, "2026-02-01"),
+            ],
+        )
+        cursor.executemany(
+            """
+            INSERT INTO player_rankings_mm
+            (mode, rank, name, lv, mm_value, acc, combo, pc, crawl_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (3, 1, "Alice", 20, 12345, 99.5, 300, 10, "2026-03-01"),
+                (3, 2, "Bob", 19, 11200, 98.1, 250, 8, "2026-03-01"),
+                (1, 1, "Carol", 18, 9800, 97.2, 230, 7, "2026-03-01"),
+                (3, 1, "Alice", 19, 12000, 99.0, 280, 9, "2026-02-01"),
             ],
         )
         self.conn.commit()
@@ -342,3 +366,47 @@ class TestStatsDataPlugins(TestCase):
         output = stdout.getvalue()
         self.assertIn("Alice", output)
         self.assertNotIn("Bob", output)
+
+    def test_top_supports_mm_rank_type(self):
+        self.shell.current_mode = 3
+        self.shell.selector.current_mode = 3
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.shell.do_top("5 mm")
+
+        output = stdout.getvalue()
+        self.assertIn("顶级玩家排名 (mm)", output)
+        self.assertIn("MM", output)
+        self.assertIn("Alice", output)
+
+
+    def test_top_mm_reports_missing_table_gracefully(self):
+        cursor = self.conn.cursor()
+        cursor.execute("DROP TABLE player_rankings_mm")
+        self.conn.commit()
+
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.shell.do_top("5 mm")
+
+        self.assertIn("player_rankings_mm", stdout.getvalue())
+
+    def test_top_with_time_range_uses_latest_snapshot_within_range(self):
+        self.shell.selector.set_filters(
+            modes=[3],
+            time_range={"start": "2026-02-01", "end": "2026-03-01"},
+        )
+
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.shell.do_top("10")
+
+        output = stdout.getvalue()
+        self.assertIn("2026-03-01", output)
+        self.assertIn("Alice", output)
+        self.assertIn("Bob", output)
+        self.assertEqual(output.count("Alice"), 1)
+
+    def test_top_caps_large_limit_to_avoid_spam(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.shell.do_top("500")
+
+        output = stdout.getvalue()
+        self.assertIn("200", output)

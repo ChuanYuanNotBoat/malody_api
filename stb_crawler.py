@@ -21,7 +21,30 @@ from urllib.parse import urlparse
 from typing import Any, Dict, List
 
 # 复用现有的数据库管理器和配置
-from malody_rankings import DatabaseManager, init_database, stop_requested, stop_lock, COOKIES, HEADERS
+from malody_rankings import (
+    DatabaseManager,
+    init_database,
+    stop_requested,
+    stop_lock,
+    COOKIES,
+    HEADERS,
+    is_stop_requested,
+    consume_skip_request,
+)
+
+
+def runtime_stop_requested() -> bool:
+    try:
+        return bool(is_stop_requested())
+    except Exception:
+        return bool(stop_requested)
+
+
+def runtime_consume_skip_request() -> bool:
+    try:
+        return bool(consume_skip_request())
+    except Exception:
+        return False
 
 # 配置日志
 def setup_detailed_logging(log_level=logging.INFO, log_file=None):
@@ -173,6 +196,15 @@ class STBCrawler:
     def setup_crawler_logging(self):
         """为爬虫设置专门的日志记录器"""
         self.logger = logging.getLogger('STBCrawler')
+
+    def _should_stop(self) -> bool:
+        return runtime_stop_requested()
+
+    def _consume_skip(self, context: str) -> bool:
+        if runtime_consume_skip_request():
+            self.logger.warning("Received Ctrl+C, skip current %s and continue.", context)
+            return True
+        return False
 
     @staticmethod
     def _is_login_required_page(html):
@@ -785,7 +817,9 @@ class STBCrawler:
         seen_sids = set()
         song_info_cache = {}
 
-        while not stop_requested and success_count < max_charts and sid_count < max_songs:
+        while not self._should_stop() and success_count < max_charts and sid_count < max_songs:
+            if self._consume_skip("newapi source"):
+                break
             try:
                 songs_resp = self._new_api_get("/store/list2", {"from": from_offset, "type": 0}, use_store_key=True)
             except Exception as e:
@@ -801,7 +835,9 @@ class STBCrawler:
                 break
 
             for song in songs:
-                if stop_requested or success_count >= max_charts or sid_count >= max_songs:
+                if self._consume_skip("newapi source"):
+                    break
+                if self._should_stop() or success_count >= max_charts or sid_count >= max_songs:
                     break
 
                 sid = song.get("sid")
@@ -833,7 +869,9 @@ class STBCrawler:
                     continue
 
                 for chart_hint in chart_list:
-                    if stop_requested or success_count >= max_charts:
+                    if self._consume_skip("newapi source"):
+                        break
+                    if self._should_stop() or success_count >= max_charts:
                         break
                     cid = chart_hint.get("cid")
                     if not cid:
@@ -1301,7 +1339,7 @@ class STBCrawler:
         self.retry_queue.clear()
         
         for cid, retry_count in retry_items:
-            if stop_requested:
+            if self._should_stop():
                 break
                 
             self.logger.info("重试 CID %d (第 %d 次重试)", cid, retry_count + 1)
@@ -1484,7 +1522,9 @@ class STBCrawler:
                     self.logger.info("主页回退提取到 %d 个CID", len(fallback_cids))
                     success_count = 0
                     for cid in fallback_cids:
-                        if stop_requested:
+                        if self._consume_skip("homepage source"):
+                            break
+                        if self._should_stop():
                             break
                         if self.crawl_chart_detail(cid):
                             success_count += 1
@@ -1504,7 +1544,10 @@ class STBCrawler:
             crawled_songs = set()
             
             for i, card in enumerate(chart_cards):
-                if stop_requested:
+                if self._consume_skip("homepage source"):
+                    self.logger.info("Skip current homepage source by user request.")
+                    break
+                if self._should_stop():
                     self.logger.info("爬取被中断")
                     break
                     
@@ -1550,7 +1593,9 @@ class STBCrawler:
                     self.logger.info("歌曲 %d 有 %d 个谱面: %s", sid, len(song_cids), song_cids)
                     
                     for j, cid in enumerate(song_cids):
-                        if stop_requested:
+                        if self._consume_skip("homepage source"):
+                            break
+                        if self._should_stop():
                             break
                             
                         if success_count >= max_charts:
@@ -1672,7 +1717,9 @@ class STBCrawler:
             
             success_count = 0
             for i, cid in enumerate(cids_to_crawl):
-                if stop_requested:
+                if self._consume_skip("latest source"):
+                    break
+                if self._should_stop():
                     break
                     
                 self.logger.info("爬取谱面 %d/%d: cid=%s", i+1, len(cids_to_crawl), cid)
@@ -1712,7 +1759,9 @@ class STBCrawler:
         
         for mode in modes:
             for status in statuses:
-                if stop_requested:
+                if self._consume_skip("api search source"):
+                    break
+                if self._should_stop():
                     self.logger.info("爬取被中断")
                     break
                     
@@ -1724,7 +1773,9 @@ class STBCrawler:
                 page = 0
                 has_more = True
                 
-                while has_more and not stop_requested and success_count < max_charts:
+                while has_more and not self._should_stop() and success_count < max_charts:
+                    if self._consume_skip("api search source"):
+                        break
                     result = self.search_charts(mode=mode, status=status, page=page)
                     if self.api_forbidden_detected:
                         self.logger.warning("API数据源被403拒绝，停止该数据源。")
@@ -1742,7 +1793,9 @@ class STBCrawler:
                                    mode, status, page, len(chart_list))
                     
                     for i, chart in enumerate(chart_list):
-                        if stop_requested:
+                        if self._consume_skip("api search source"):
+                            break
+                        if self._should_stop():
                             break
                             
                         if success_count >= max_charts:
@@ -1771,7 +1824,7 @@ class STBCrawler:
                     self.logger.info("模式 %d 状态 %d 第 %d 页完成, 已爬取 %d 个谱面", 
                                    mode, status, page, success_count)
             
-            if stop_requested or success_count >= max_charts:
+            if self._should_stop() or success_count >= max_charts:
                 break
         
         self.logger.info("方式3完成: 成功 %d/%d 个谱面", success_count, max_charts)
@@ -1791,7 +1844,9 @@ class STBCrawler:
         ]
         
         for source_name, crawl_func in sources:
-            if stop_requested:
+            if self._consume_skip(f"source {source_name}"):
+                continue
+            if self._should_stop():
                 self.logger.info("爬取被中断")
                 break
 
@@ -1807,6 +1862,9 @@ class STBCrawler:
             success_count = 0
             
             while retry_count <= max_retries:
+                if self._consume_skip(f"source {source_name}"):
+                    self.logger.info("Skip current source %s by user request.", source_name)
+                    break
                 try:
                     if source_name == "主页爬取":
                         success_count = crawl_func(max_charts=max_charts_per_source)
@@ -1845,7 +1903,7 @@ class STBCrawler:
                 self.logger.warning("数据源 %s 重试 %d 次均失败，跳过", source_name, max_retries)
             
             # 源之间等待
-            if not stop_requested:
+            if not self._should_stop():
                 self.logger.info("等待5秒后切换到下一个数据源...")
                 time.sleep(5)
         
@@ -1904,7 +1962,10 @@ class STBCrawler:
         request_count = 0
         
         try:
-            while not stop_requested and (end_cid is None or current_cid <= end_cid):
+            while not self._should_stop() and (end_cid is None or current_cid <= end_cid):
+                if self._consume_skip(f"cid {current_cid}"):
+                    current_cid += 1
+                    continue
                 # 定期处理重试队列
                 if request_count % process_retry_every == 0 and self.retry_queue:
                     self.logger.info("定期处理重试队列 (%d 个待重试)", len(self.retry_queue))
@@ -1983,7 +2044,7 @@ class STBCrawler:
                            current_cid, total_success, total_errors, len(self.retry_queue))
         
         # 最后处理剩余的重试队列
-        if self.retry_queue and not stop_requested:
+        if self.retry_queue and not self._should_stop():
             self.logger.info("处理剩余的重试队列 (%d 个项目)", len(self.retry_queue))
             retry_success = self.process_retry_queue(retry_delay)
             total_success += retry_success
@@ -2099,7 +2160,10 @@ class STBCrawler:
         request_count = 0
         
         try:
-            while not stop_requested and (end_sid is None or current_sid <= end_sid):
+            while not self._should_stop() and (end_sid is None or current_sid <= end_sid):
+                if self._consume_skip(f"sid {current_sid}"):
+                    current_sid += 1
+                    continue
                 # 跳过已处理或已知为空的SID
                 while (current_sid in empty_songs or 
                        current_sid in failed_songs or
@@ -2130,7 +2194,7 @@ class STBCrawler:
                     # 爬取该SID下的所有CID
                     song_success_count = 0
                     for cid in cids:
-                        if stop_requested:
+                        if self._should_stop():
                             break
                         
                         # 跳过已处理的CID
@@ -2323,7 +2387,10 @@ class STBCrawler:
         max_consecutive_404s = 10  # 连续遇到10个404就认为到达末尾
         
         try:
-            while not stop_requested and consecutive_404s < max_consecutive_404s:
+            while not self._should_stop() and consecutive_404s < max_consecutive_404s:
+                if self._consume_skip(f"sid {current_sid}"):
+                    current_sid += 1
+                    continue
                 self.logger.info("处理 SID %d (连续404: %d/%d)", 
                                current_sid, consecutive_404s, max_consecutive_404s)
                 
@@ -2346,7 +2413,7 @@ class STBCrawler:
                     # 爬取该SID下的所有CID
                     song_success_count = 0
                     for cid in cids:
-                        if stop_requested:
+                        if self._should_stop():
                             break
                         
                         # 跳过已处理的CID
@@ -2395,7 +2462,7 @@ class STBCrawler:
                 
                 # 定期保存进度（每10个SID或每遇到404时）
                 if (current_sid % 10 == 0 or consecutive_404s > 0 or 
-                    stop_requested or consecutive_404s >= max_consecutive_404s):
+                    self._should_stop() or consecutive_404s >= max_consecutive_404s):
                     self._save_sid_backwards_progress(
                         progress_file, current_sid, last_valid_sid, total_songs, 
                         total_charts, total_errors, consecutive_404s
@@ -2558,7 +2625,9 @@ class STBCrawler:
         
         # 重新爬取所有失败项目
         for i, (item_type, item_id) in enumerate(all_failed_items):
-            if stop_requested:
+            if self._consume_skip(f"retry item {item_type}:{item_id}"):
+                continue
+            if self._should_stop():
                 break
                 
             self.logger.info("重新爬取 %s %d (%d/%d)", 

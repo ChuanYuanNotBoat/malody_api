@@ -47,6 +47,32 @@ class TestCrawlerRoutes(TestCase):
         self.assertIn("--end-cid", cmd)
         self.assertIn("--no-resume", cmd)
 
+    def test_run_leaderboard_newapi_command_mapping(self):
+        with patch("malody_api.routers.crawler.os.path.exists", return_value=True), patch(
+            "malody_api.routers.crawler.run_subprocess", return_value=None
+        ):
+            resp = self.client.post("/crawler/run?crawler_type=leaderboard&source=newapi&limit=120")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        cmd = body["data"]["command"]
+        self.assertIn("--ranking-source", cmd)
+        self.assertIn("newapi", cmd)
+        self.assertIn("--ranking-limit", cmd)
+        self.assertIn("120", cmd)
+
+    def test_run_leaderboard_rejects_invalid_source(self):
+        with patch("malody_api.routers.crawler.os.path.exists", return_value=True):
+            resp = self.client.post("/crawler/run?crawler_type=leaderboard&source=all")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("leaderboard source", resp.json()["detail"])
+
+    def test_run_leaderboard_rejects_non_positive_limit(self):
+        with patch("malody_api.routers.crawler.os.path.exists", return_value=True):
+            resp = self.client.post("/crawler/run?crawler_type=leaderboard&source=page&limit=0")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("limit must be > 0", resp.json()["detail"])
+
     def test_run_invalid_crawler_type(self):
         with patch("malody_api.routers.crawler.os.path.exists", return_value=True):
             resp = self.client.post("/crawler/run?crawler_type=unknown")

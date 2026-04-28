@@ -90,6 +90,31 @@ async def get_top_players(
             timestamp=datetime.now()
         )
 
+
+@router.get("/mm/stats", response_model=APIResponse)
+async def get_mm_stats(
+    mm_limit: int = Query(200, description="MM 榜 topN 追踪范围", ge=1, le=2000)
+):
+    """获取 MM/MMR 统计概览（用于数据巡检与观测）"""
+    try:
+        data = player_service.get_mm_stats(mm_limit=mm_limit)
+        if data is None:
+            raise HTTPException(status_code=500, detail="获取 MM/MMR 统计失败")
+        return APIResponse(
+            success=True,
+            data=data,
+            message="MM/MMR 统计已生成",
+            timestamp=datetime.now(),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        return APIResponse(
+            success=False,
+            error=str(e),
+            timestamp=datetime.now(),
+        )
+
 @router.get("/{player_identifier}", response_model=APIResponse)
 async def get_player_info(
     player_identifier: str,

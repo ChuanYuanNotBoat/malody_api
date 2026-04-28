@@ -60,6 +60,7 @@ python run.py
 
 #### 玩家数据
 - `GET /players/top` - 获取顶级玩家排名
+- `GET /players/mm/stats` - 获取 MM/MMR 统计概览（含 tracked players、快照去重指标、抓取状态）
 - `GET /players/{player_identifier}` - 获取玩家基本信息
 - `GET /players/{identifier}/profile` - 获取玩家详细资料（头像、头衔、成就、个人信息）
 - `GET /players/{player_name}/history` - 获取玩家历史排名

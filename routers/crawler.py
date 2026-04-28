@@ -56,7 +56,7 @@ async def run_crawler(
     from_db: bool = Query(False, description="player: 从数据库筛选待更新玩家"),
     max_workers: Optional[int] = Query(None, description="player: 最大并发线程"),
     days_since_update: Optional[int] = Query(None, description="player: 未更新时间阈值（天）"),
-    source: Optional[str] = Query(None, description="stb: 数据源 all/home/latest/api/newapi"),
+    source: Optional[str] = Query(None, description="leaderboard: page/newapi; stb: all/home/latest/api/newapi"),
     cid_crawl: bool = Query(False, description="stb: 启用CID模式"),
     sid_crawl: bool = Query(False, description="stb: 启用SID模式"),
     retry_failed: bool = Query(False, description="stb: 重试失败队列"),
@@ -81,8 +81,16 @@ async def run_crawler(
     if crawler_type == "leaderboard":
         if once:
             cmd.append("--once")
+        if source:
+            if source not in {"page", "newapi"}:
+                raise HTTPException(status_code=400, detail="leaderboard source must be one of: page/newapi")
+            cmd.extend(["--ranking-source", source])
+        if limit is not None:
+            if limit <= 0:
+                raise HTTPException(status_code=400, detail="limit must be > 0")
+            cmd.extend(["--ranking-limit", str(limit)])
         unsupported = []
-        if any([uid, uid_range, from_db, max_workers, days_since_update, source, cid_crawl, sid_crawl, retry_failed, start is not None, end is not None, resume is not True]):
+        if any([uid, uid_range, from_db, max_workers, days_since_update, cid_crawl, sid_crawl, retry_failed, start is not None, end is not None, resume is not True]):
             unsupported.append("player/stb-only parameters")
         if unsupported:
             raise HTTPException(status_code=400, detail=f"leaderboard 不支持参数: {', '.join(unsupported)}")

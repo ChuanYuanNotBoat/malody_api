@@ -1,4 +1,5 @@
 import io
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -229,3 +230,82 @@ class TestStatsPluginBehaviors(TestCase):
         output = stdout.getvalue().lower()
         self.assertIn("export", output)
         self.assertIn("update", output)
+
+    def test_mm_stats_command_reports_invalid_limit(self):
+        shell = _ShellStub()
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_mm_stats("abc")
+        self.assertIn("mm_limit", stdout.getvalue())
+
+    def test_mm_stats_command_prints_summary_from_service(self):
+        shell = _ShellStub()
+        payload = {
+            "counts": {
+                "player_rankings_mm": 10,
+                "player_mmr_samples": 20,
+                "player_mmr_daily": 8,
+            },
+            "freshness": {
+                "player_rankings_mm_max_crawl_time": "2026-04-28T22:52:28",
+                "player_mmr_samples_max_crawl_time": "2026-04-28T23:08:09",
+            },
+            "tracked_players": {
+                "union_players_count": 100,
+                "manual_players_count": 4,
+                "mm_top_players_count": 98,
+                "overlap_count": 2,
+                "mm_limit": 150,
+            },
+            "mm_latest_snapshot_by_mode": [
+                {"mode": 3, "rows": 200, "dup_rank": 1, "dup_uid": 0, "min_rank": 1, "max_rank": 199}
+            ],
+            "mmr_samples_by_source": [
+                {"source": "ranking_player_all", "sample_count": 20, "player_count": 10}
+            ],
+        }
+
+        with patch("malody_api.stats_cli.plugins.utility_plugin._PkgPlayerService") as svc_cls, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as stdout:
+            svc_cls.return_value.get_mm_stats.return_value = payload
+            shell.do_mm_stats("150")
+
+        svc_cls.return_value.get_mm_stats.assert_called_once_with(mm_limit=150)
+        output = stdout.getvalue()
+        self.assertIn("MM/MMR", output)
+        self.assertIn("union=100", output)
+        self.assertIn("mode=3", output)
+
+    def test_mm_stats_fallback_excludes_zero_uid_from_tracked_players(self):
+        shell = _ShellStub()
+        conn = sqlite3.connect(":memory:")
+        cursor = conn.cursor()
+        cursor.executescript(
+            """
+            CREATE TABLE player_rankings_mm (
+                mode INTEGER,
+                rank INTEGER,
+                uid TEXT,
+                crawl_time TEXT
+            );
+            """
+        )
+        cursor.executemany(
+            "INSERT INTO player_rankings_mm (mode, rank, uid, crawl_time) VALUES (?, ?, ?, ?)",
+            [
+                (3, 1, "0", "2026-04-01T00:00:00"),
+                (3, 2, "1001", "2026-04-01T00:00:00"),
+            ],
+        )
+        conn.commit()
+        shell.conn = conn
+
+        with patch("malody_api.stats_cli.plugins.utility_plugin._PkgPlayerService", None), patch(
+            "malody_api.stats_cli.plugins.utility_plugin.os.path.exists", return_value=False
+        ), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_mm_stats("200")
+
+        output = stdout.getvalue()
+        self.assertIn("mm_top=1", output)
+        self.assertNotIn("mm_top=2", output)
+        conn.close()

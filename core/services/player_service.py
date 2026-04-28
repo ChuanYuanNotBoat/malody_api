@@ -2,6 +2,7 @@
 import sqlite3
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
+import os
 from ...core.database import get_db_connection, db_safe_operation
 from ...core.models import Player
 from ...utils.selector import MCSelector
@@ -11,6 +12,228 @@ class PlayerService:
 
     def _ranking_table(self, rank_type: str) -> str:
         return "player_rankings_mm" if rank_type == "mm" else "player_rankings"
+
+    def _table_exists(self, cursor: sqlite3.Cursor, table_name: str) -> bool:
+        cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
+            (table_name,),
+        )
+        return cursor.fetchone() is not None
+
+    def _load_manual_players(self, config_file: str = "players.txt") -> List[str]:
+        if not os.path.exists(config_file):
+            return []
+        out: List[str] = []
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.isdigit():
+                        out.append(line)
+        except Exception:
+            return []
+        return out
+
+    @db_safe_operation
+    def get_mm_stats(self, mm_limit: int = 200) -> Dict[str, Any]:
+        """
+        MM/MMR 统计概览，供 API 与 stats CLI 复用。
+        """
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        def scalar(sql: str, params: tuple = ()) -> Any:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+        def normalize_time(v: Any) -> Any:
+            if isinstance(v, datetime):
+                return v.isoformat()
+            return v
+
+        try:
+            mm_limit = max(1, int(mm_limit or 200))
+
+            counts: Dict[str, Optional[int]] = {}
+            freshness: Dict[str, Any] = {}
+            for table in ["player_rankings", "player_rankings_mm", "player_mmr_samples", "player_mmr_daily", "mm_crawl_status"]:
+                if self._table_exists(cursor, table):
+                    counts[table] = int(scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+                else:
+                    counts[table] = None
+
+            if self._table_exists(cursor, "player_rankings"):
+                freshness["player_rankings_max_crawl_time"] = normalize_time(
+                    scalar("SELECT MAX(crawl_time) FROM player_rankings")
+                )
+            if self._table_exists(cursor, "player_rankings_mm"):
+                freshness["player_rankings_mm_max_crawl_time"] = normalize_time(
+                    scalar("SELECT MAX(crawl_time) FROM player_rankings_mm")
+                )
+            if self._table_exists(cursor, "player_mmr_samples"):
+                freshness["player_mmr_samples_max_crawl_time"] = normalize_time(
+                    scalar("SELECT MAX(crawl_time) FROM player_mmr_samples")
+                )
+            if self._table_exists(cursor, "player_mmr_daily"):
+                freshness["player_mmr_daily_day_min"] = scalar("SELECT MIN(day) FROM player_mmr_daily")
+                freshness["player_mmr_daily_day_max"] = scalar("SELECT MAX(day) FROM player_mmr_daily")
+
+            manual_players = set(self._load_manual_players())
+            mm_top_players: set[str] = set()
+            if self._table_exists(cursor, "player_rankings_mm"):
+                cursor.execute(
+                    """
+                    WITH latest AS (
+                        SELECT mode, MAX(crawl_time) AS ct
+                        FROM player_rankings_mm
+                        GROUP BY mode
+                    )
+                    SELECT DISTINCT r.uid
+                    FROM player_rankings_mm r
+                    JOIN latest l ON l.mode = r.mode AND l.ct = r.crawl_time
+                    WHERE r.rank <= ?
+                      AND r.uid IS NOT NULL
+                      AND r.uid != ''
+                      AND r.uid != '0'
+                    """,
+                    (mm_limit,),
+                )
+                mm_top_players = {str(row[0]) for row in cursor.fetchall() if row and row[0]}
+
+            tracked = {
+                "mm_limit": mm_limit,
+                "manual_players_count": len(manual_players),
+                "mm_top_players_count": len(mm_top_players),
+                "union_players_count": len(manual_players | mm_top_players),
+                "overlap_count": len(manual_players & mm_top_players),
+                "manual_only_count": len(manual_players - mm_top_players),
+                "mm_top_only_count": len(mm_top_players - manual_players),
+                "manual_players": sorted(manual_players),
+            }
+
+            mm_snapshot: List[Dict[str, Any]] = []
+            if self._table_exists(cursor, "player_rankings_mm"):
+                cursor.execute(
+                    """
+                    WITH latest AS (
+                        SELECT mode, MAX(crawl_time) AS ct
+                        FROM player_rankings_mm
+                        GROUP BY mode
+                    )
+                    SELECT r.mode,
+                           r.crawl_time,
+                           COUNT(*) AS rows_count,
+                           COUNT(DISTINCT r.uid) AS uid_distinct,
+                           COUNT(DISTINCT r.rank) AS rank_distinct,
+                           MIN(r.rank) AS min_rank,
+                           MAX(r.rank) AS max_rank,
+                           SUM(CASE WHEN r.rank <= 0 THEN 1 ELSE 0 END) AS invalid_rank_rows
+                    FROM player_rankings_mm r
+                    JOIN latest l ON l.mode = r.mode AND l.ct = r.crawl_time
+                    GROUP BY r.mode, r.crawl_time
+                    ORDER BY r.mode
+                    """
+                )
+                for row in cursor.fetchall():
+                    rows_count = int(row[2] or 0)
+                    uid_distinct = int(row[3] or 0)
+                    rank_distinct = int(row[4] or 0)
+                    mm_snapshot.append(
+                        {
+                            "mode": row[0],
+                            "crawl_time": normalize_time(row[1]),
+                            "rows": rows_count,
+                            "uid_distinct": uid_distinct,
+                            "rank_distinct": rank_distinct,
+                            "dup_uid": max(rows_count - uid_distinct, 0),
+                            "dup_rank": max(rows_count - rank_distinct, 0),
+                            "min_rank": row[5],
+                            "max_rank": row[6],
+                            "invalid_rank_rows": int(row[7] or 0),
+                        }
+                    )
+
+            mmr_sources: List[Dict[str, Any]] = []
+            if self._table_exists(cursor, "player_mmr_samples"):
+                cursor.execute(
+                    """
+                    SELECT source, COUNT(*) AS sample_count, COUNT(DISTINCT uid) AS player_count
+                    FROM player_mmr_samples
+                    GROUP BY source
+                    ORDER BY sample_count DESC
+                    """
+                )
+                mmr_sources = [
+                    {
+                        "source": row[0],
+                        "sample_count": int(row[1] or 0),
+                        "player_count": int(row[2] or 0),
+                    }
+                    for row in cursor.fetchall()
+                ]
+
+            mmr_daily_modes: List[Dict[str, Any]] = []
+            if self._table_exists(cursor, "player_mmr_daily"):
+                cursor.execute(
+                    """
+                    SELECT mode,
+                           COUNT(*) AS rows_count,
+                           COUNT(DISTINCT uid) AS player_count,
+                           MIN(day) AS min_day,
+                           MAX(day) AS max_day
+                    FROM player_mmr_daily
+                    GROUP BY mode
+                    ORDER BY mode
+                    """
+                )
+                mmr_daily_modes = [
+                    {
+                        "mode": row[0],
+                        "rows": int(row[1] or 0),
+                        "players": int(row[2] or 0),
+                        "min_day": row[3],
+                        "max_day": row[4],
+                    }
+                    for row in cursor.fetchall()
+                ]
+
+            crawl_status: List[Dict[str, Any]] = []
+            if self._table_exists(cursor, "mm_crawl_status"):
+                cursor.execute(
+                    """
+                    SELECT task, last_crawled, last_success, crawl_count, success_count, last_error
+                    FROM mm_crawl_status
+                    ORDER BY task
+                    """
+                )
+                crawl_status = [
+                    {
+                        "task": row[0],
+                        "last_crawled": normalize_time(row[1]),
+                        "last_success": normalize_time(row[2]),
+                        "crawl_count": int(row[3] or 0),
+                        "success_count": int(row[4] or 0),
+                        "fail_count": max(int(row[3] or 0) - int(row[4] or 0), 0),
+                        "last_error": row[5],
+                    }
+                    for row in cursor.fetchall()
+                ]
+
+            return {
+                "counts": counts,
+                "freshness": freshness,
+                "tracked_players": tracked,
+                "mm_latest_snapshot_by_mode": mm_snapshot,
+                "mmr_samples_by_source": mmr_sources,
+                "mmr_daily_by_mode": mmr_daily_modes,
+                "mm_crawl_status": crawl_status,
+                "generated_at": datetime.now().isoformat(),
+            }
+        finally:
+            conn.close()
 
     @db_safe_operation
     def get_top_players(self, selector: MCSelector, limit: int = 10, rank_type: str = "exp") -> List[Player]:
@@ -189,6 +412,36 @@ class PlayerService:
                 result["mm_value"] = player_data[2]
             else:
                 result["exp"] = player_data[2]
+                # 默认个人页返回中附带同模式 MM 快照，避免调用方额外筛选/再次请求
+                if self._table_exists(cursor, "player_rankings_mm"):
+                    mm_where = ["player_id = ?", "mode = ?"]
+                    mm_params: List[Any] = [player_id, player_data[6]]
+                    if selector.filters['time_range']:
+                        mm_where.append("crawl_time BETWEEN ? AND ?")
+                        mm_params.extend(
+                            [
+                                selector.filters['time_range']['start'],
+                                selector.filters['time_range']['end'],
+                            ]
+                        )
+                    mm_where_clause = " AND ".join(mm_where)
+                    cursor.execute(
+                        f"""
+                        SELECT rank, mm_value, crawl_time
+                        FROM player_rankings_mm
+                        WHERE {mm_where_clause}
+                        ORDER BY crawl_time DESC
+                        LIMIT 1
+                        """,
+                        mm_params,
+                    )
+                    mm_row = cursor.fetchone()
+                    if mm_row:
+                        result["mm_snapshot"] = {
+                            "rank": mm_row[0],
+                            "mm_value": mm_row[1],
+                            "last_updated": mm_row[2],
+                        }
             return result
 
         finally:
