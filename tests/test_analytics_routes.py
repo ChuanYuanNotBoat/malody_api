@@ -44,3 +44,12 @@ class TestAnalyticsRoutes(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("period", resp.json()["detail"])
 
+    def test_dashboard_overview_route(self):
+        fake = {"database": {"file_size_bytes": 1}}
+        with patch("routers.analytics.dashboard_service.get_overview", return_value=fake):
+            resp = self.client.get("/analytics/dashboard-overview")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertIn("database", body["data"])
+

@@ -84,6 +84,8 @@ def register_routers(app):
         from routers.page_parser import router as page_parser_router
         from routers.crawler import router as crawler_router   # 新增爬虫控制路由
         from routers.official_api import router as official_api_router
+        from routers.quality import router as quality_router
+        from routers.plugins import router as plugins_router
         
         # 注册路由
         app.include_router(players_router)
@@ -94,6 +96,8 @@ def register_routers(app):
         app.include_router(page_parser_router)
         app.include_router(crawler_router)                     # 新增
         app.include_router(official_api_router)
+        app.include_router(quality_router)
+        app.include_router(plugins_router)
         
         print("All routers registered successfully.")
         
@@ -161,7 +165,9 @@ def setup_routes(app):
                 "query": "/query/",
                 "page_parser": "/page-parser/",
                 "crawler": "/crawler/",
-                "official_api": "/official-api/"
+                "official_api": "/official-api/",
+                "quality": "/quality/",
+                "plugins": "/plugins/"
             }
         }
     
@@ -252,8 +258,8 @@ def main():
 
     print("Starting Malody API server...")
     print(f"Database: {db_path}")
-    print("Docs: http://localhost:8000/docs")
-    print("API: http://localhost:8000")
+    print(f"Docs: http://{config.HOST}:{config.PORT}/docs")
+    print(f"API: http://{config.HOST}:{config.PORT}")
     print("Press Ctrl+C to stop.")
     print("-" * 50)
     
@@ -265,10 +271,10 @@ def main():
     # 启动服务器
     uvicorn.run(
         app,  # 直接传递app实例，而不是字符串模块路径
-        host="0.0.0.0",
-        port=8000,
+        host=config.HOST,
+        port=config.PORT,
         reload=False,
-        log_level="info",
+        log_level=config.LOG_LEVEL,
         access_log=True
     )
 

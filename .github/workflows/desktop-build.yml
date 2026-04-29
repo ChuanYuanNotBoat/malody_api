@@ -1,0 +1,27 @@
+name: desktop-build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-build.yml"
+
+jobs:
+  build-desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install frontend deps
+        run: npm install
+        working-directory: desktop
+      - name: Build frontend
+        run: npm run build
+        working-directory: desktop
+      - name: Cargo check (desktop shell)
+        run: cargo check
+        working-directory: desktop/src-tauri
+

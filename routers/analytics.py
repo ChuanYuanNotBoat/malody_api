@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 # 修复导入路径 - 改为绝对导入
 from malody_api.core.services import AnalysisService
+from malody_api.core.services.dashboard_service import dashboard_service
 from malody_api.utils.selector import MCSelector
 from malody_api.core.models import APIResponse
 
@@ -194,3 +195,13 @@ async def compare_players(
             error=str(e),
             timestamp=datetime.now()
         )
+
+
+@router.get("/dashboard-overview", response_model=APIResponse)
+async def get_dashboard_overview():
+    """Get dashboard overview data for local GUI."""
+    try:
+        data = dashboard_service.get_overview()
+        return APIResponse(success=True, data=data, timestamp=datetime.now())
+    except Exception as e:
+        return APIResponse(success=False, error=str(e), timestamp=datetime.now())

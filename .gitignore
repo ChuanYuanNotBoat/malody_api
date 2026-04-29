@@ -67,3 +67,14 @@ logs_*.js
 docs/TODO_CRAWLER_DB_*.md
 docs/FEATURE_STATUS_CRAWLER_DB_*.md
 docs/mm_mmr_analysis_*.md
+
+# Desktop (Tauri + React)
+desktop/node_modules/
+desktop/dist/
+desktop/.vite/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/.tauri/
+desktop/*.tsbuildinfo
+desktop/vite.config.js
+desktop/vite.config.d.ts
