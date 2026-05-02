@@ -4,6 +4,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import FuncFormatter
+from selector import MCSelector
 
 
 def install(cls, *, colorize, colors, db_safe_operation):
@@ -36,26 +37,15 @@ def install(cls, *, colorize, colors, db_safe_operation):
             print(colorize("[top_chart] Note: limit capped to 100 for readability.", Colors.YELLOW))
             limit = 100
 
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?", (mode,))
-        latest_time = cursor.fetchone()[0]
+        try:
+            from malody_api.core.services.player_service import PlayerService
+        except ImportError:
+            from core.services.player_service import PlayerService
 
-        if not latest_time:
-            mode_name = self.mode_names.get(mode, "Unknown")
-            print(colorize(f"\n[top_chart] No data in mode {mode} ({mode_name}).", Colors.YELLOW))
-            return
-
-        cursor.execute(
-            """
-            SELECT pr.rank, pr.name, pr.acc, pr.exp
-            FROM player_rankings pr
-            WHERE pr.mode = ? AND pr.crawl_time = ?
-            ORDER BY pr.rank
-            LIMIT ?
-            """,
-            (mode, latest_time, limit),
-        )
-        players = cursor.fetchall()
+        selector = MCSelector()
+        selector.current_mode = mode
+        players_data = PlayerService().get_top_players(selector, limit=limit, rank_type="exp")
+        players = [(p.rank, p.name, p.accuracy, p.exp) for p in players_data]
 
         if not players:
             mode_name = self.mode_names.get(mode, "Unknown")

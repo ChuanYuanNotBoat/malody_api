@@ -1,15 +1,19 @@
-import copy
+﻿import copy
+from datetime import datetime, timedelta
 
 
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
 
-    def do_search(self, arg):
-        """
-        通用搜索功能（支持选择器筛选）
+    def _parse_dt(value):
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            return datetime.fromisoformat(value)
+        return None
 
-        用法: search <关键词> [类型] [模式]
-        """
+    def do_search(self, arg):
+        """search <keyword> [player|chart|creator] [mode]"""
         args = arg.split()
         if not args:
             print(colorize("错误: 请输入搜索关键词", Colors.RED))
@@ -55,6 +59,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     def _search_players(self, cursor, keyword, mode):
         where_clause, params = self._build_player_where(mode)
 
+        # UID direct lookup path
         if keyword.isdigit():
             cursor.execute(
                 "SELECT pi.player_id, pi.current_name, pi.uid FROM player_identity pi WHERE pi.uid = ?",
@@ -72,57 +77,82 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     SELECT pr.rank, pr.lv, pr.acc, pr.combo, pr.pc, pr.crawl_time
                     FROM player_rankings pr
                     WHERE {player_where}
-                    ORDER BY pr.crawl_time DESC LIMIT 1
+                    ORDER BY pr.crawl_time DESC
+                    LIMIT 1
                     """,
                     player_params,
                 )
                 player_data = cursor.fetchone()
                 if player_data:
-                    rank, lv, acc, combo, pc, crawl_time = player_data
+                    rank, lv, acc, combo, pc, _crawl_time = player_data
                     print(colorize(f"\n玩家: {name} (UID: {uid})", Colors.CYAN))
                     print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
                     print(get_separator())
                     print(f"排名: {rank}, 等级: {lv}, 准确率: {acc:.2f}%")
-                    print(f"连击: {combo}, 游戏次数: {pc}")
+                    print(f"连击: {combo}, 游玩次数: {pc}")
                     return
 
-            print(colorize(f"未找到UID为 {keyword} 的玩家", Colors.YELLOW))
-        else:
-            where_clause += """
-             AND (
-                pr.name LIKE ?
-                OR pr.player_id IN (
-                    SELECT pa.player_id
-                    FROM player_aliases pa
-                    WHERE pa.alias LIKE ?
-                )
-                OR pr.player_id IN (
-                    SELECT pi.player_id
-                    FROM player_identity pi
-                    WHERE pi.current_name LIKE ?
-                )
-             )
-            """
-            params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
+            print(colorize(f"未找到 UID={keyword} 的玩家", Colors.YELLOW))
+            return
 
-            cursor.execute(
-                f"""
-                SELECT DISTINCT pr.name, pr.rank, pr.lv, pr.acc, pr.crawl_time
+        cursor.execute("SELECT MAX(pr.crawl_time) FROM player_rankings pr WHERE " + where_clause, params)
+        latest_time = cursor.fetchone()[0]
+        if not latest_time:
+            print(colorize(f"未找到包含 '{keyword}' 的玩家", Colors.YELLOW))
+            return
+
+        end_time = _parse_dt(latest_time)
+        like_value = f"%{keyword}%"
+
+        def _query_window(start_time, end_time_obj):
+            query = f"""
+            WITH latest AS (
+                SELECT pr.player_id, pr.mode, MAX(pr.crawl_time) AS max_time
                 FROM player_rankings pr
                 WHERE {where_clause}
-                ORDER BY pr.rank LIMIT 10
-                """,
-                params,
+                  AND pr.crawl_time BETWEEN ? AND ?
+                GROUP BY pr.player_id, pr.mode
             )
-            results = cursor.fetchall()
-            if results:
-                print(colorize(f"\n找到 {len(results)} 个匹配玩家", Colors.CYAN))
-                print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
-                print(get_separator())
-                for name, rank, lv, acc, crawl_time in results:
-                    print(f"{name}: 排名 {rank}, 等级 {lv}, 准确率 {acc:.2f}%")
-            else:
-                print(colorize(f"未找到包含 '{keyword}' 的玩家", Colors.YELLOW))
+            SELECT pr.name, pr.rank, pr.lv, pr.acc, pr.crawl_time, pr.player_id, pr.mode
+            FROM player_rankings pr
+            JOIN latest l
+              ON l.player_id = pr.player_id
+             AND l.mode = pr.mode
+             AND l.max_time = pr.crawl_time
+            WHERE {where_clause}
+              AND (
+                pr.name LIKE ?
+                OR EXISTS (SELECT 1 FROM player_aliases pa WHERE pa.player_id = pr.player_id AND pa.alias LIKE ?)
+                OR EXISTS (SELECT 1 FROM player_identity pi WHERE pi.player_id = pr.player_id AND pi.current_name LIKE ?)
+              )
+            ORDER BY pr.rank ASC, pr.crawl_time DESC
+            LIMIT 10
+            """
+            qparams = params + [start_time, end_time_obj] + params + [like_value, like_value, like_value]
+            cursor.execute(query, qparams)
+            return cursor.fetchall()
+
+        if self.selector.filters.get("time_range"):
+            start_time = self.selector.filters["time_range"].get("start")
+            if isinstance(start_time, str):
+                start_time = _parse_dt(start_time)
+            results = _query_window(start_time, end_time)
+        else:
+            results = []
+            for hours in (24, 72, 168, 720):
+                candidate = _query_window(end_time - timedelta(hours=hours), end_time)
+                results = candidate
+                if len(candidate) >= 10:
+                    break
+
+        if results:
+            print(colorize(f"\n找到 {len(results)} 个匹配玩家", Colors.CYAN))
+            print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
+            print(get_separator())
+            for name, rank, lv, acc, _crawl_time, _player_id, _mode in results:
+                print(f"{name}: 排名 {rank}, 等级 {lv}, 准确率 {acc:.2f}%")
+        else:
+            print(colorize(f"未找到包含 '{keyword}' 的玩家", Colors.YELLOW))
 
     def _search_charts(self, cursor, keyword, mode):
         where_clause, params = self._build_chart_where(mode)

@@ -158,6 +158,18 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 (uid, mode, start_date.date().isoformat()),
             )
             raw_rows = cursor.fetchall()
+            if not raw_rows:
+                # Fallback for sparse datasets: use all available history.
+                cursor.execute(
+                    """
+                    SELECT day, mmr, sample_time
+                    FROM player_mmr_daily
+                    WHERE uid = ? AND mode = ?
+                    ORDER BY day, sample_time
+                    """,
+                    (uid, mode),
+                )
+                raw_rows = cursor.fetchall()
             dedup_rows = _dedupe_by_day(raw_rows, lambda row: row[0])
             history_data = [(row[0], row[1]) for row in dedup_rows]
 
@@ -206,6 +218,18 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 (player_id, mode, start_date),
             )
             raw_rows = cursor.fetchall()
+            if not raw_rows:
+                # Fallback for sparse datasets: use all available history.
+                cursor.execute(
+                    f"""
+                    SELECT pr.rank, pr.crawl_time
+                    FROM {table} pr
+                    WHERE pr.player_id = ? AND pr.mode = ?
+                    ORDER BY pr.crawl_time
+                    """,
+                    (player_id, mode),
+                )
+                raw_rows = cursor.fetchall()
             dedup_rows = _dedupe_by_day(
                 raw_rows,
                 lambda row: row[1].date() if hasattr(row[1], "date") else str(row[1])[:10],

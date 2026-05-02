@@ -1,14 +1,16 @@
-# malody_api/core/services/player_service.py
-import sqlite3
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+﻿# malody_api/core/services/player_service.py
 import os
+import sqlite3
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+
 from ...core.database import get_db_connection, db_safe_operation
 from ...core.models import Player
 from ...utils.selector import MCSelector
 
+
 class PlayerService:
-    """玩家数据服务"""
+    """鐜╁鏁版嵁鏈嶅姟"""
 
     def _ranking_table(self, rank_type: str) -> str:
         return "player_rankings_mm" if rank_type == "mm" else "player_rankings"
@@ -39,8 +41,7 @@ class PlayerService:
     @db_safe_operation
     def get_mm_stats(self, mm_limit: int = 200) -> Dict[str, Any]:
         """
-        MM/MMR 统计概览，供 API 与 stats CLI 复用。
-        """
+        MM/MMR 缁熻姒傝锛屼緵 API 涓?stats CLI 澶嶇敤銆?        """
         conn = get_db_connection()
         cursor = conn.cursor()
 
@@ -237,62 +238,104 @@ class PlayerService:
 
     @db_safe_operation
     def get_top_players(self, selector: MCSelector, limit: int = 10, rank_type: str = "exp") -> List[Player]:
-        """获取顶级玩家排名"""
+        """Get top players from reconstructed snapshot rows."""
         conn = get_db_connection()
         cursor = conn.cursor()
 
         try:
-            where_clause, params = selector.build_player_sql_where("pr")
             table = self._ranking_table(rank_type)
+            value_field = "mm_value" if rank_type == "mm" else "exp"
+            where_clause, params = selector.build_player_sql_where("pr")
 
-            # 获取最新爬取时间
-            latest_time = self._get_latest_crawl_time(cursor, selector, rank_type=rank_type)
+            # Resolve snapshot end time.
+            if selector.filters["time_range"]:
+                cursor.execute(
+                    f"""
+                    SELECT MAX(pr.crawl_time)
+                    FROM {table} pr
+                    WHERE {where_clause} AND pr.crawl_time <= ?
+                    """,
+                    params + [selector.filters["time_range"]["end"]],
+                )
+            else:
+                cursor.execute(
+                    f"SELECT MAX(pr.crawl_time) FROM {table} pr WHERE {where_clause}",
+                    params,
+                )
+
+            latest_time = cursor.fetchone()[0]
             if not latest_time:
                 return []
 
-            # 添加时间条件（如果没有设置时间筛选）
-            if not selector.filters['time_range']:
-                if "crawl_time" not in where_clause:
-                    where_clause += " AND pr.crawl_time = ?"
-                    params.append(latest_time)
+            end_time = latest_time if isinstance(latest_time, datetime) else datetime.fromisoformat(str(latest_time))
 
-            if rank_type == "mm":
+            def _fetch_rows(start_time: datetime, end_time_obj: datetime) -> List[tuple]:
                 query = f"""
-                SELECT pr.rank, pr.name, pr.lv, pr.mm_value, pr.acc, pr.combo, pr.pc, pr.mode
+                WITH latest AS (
+                    SELECT pr.player_id, pr.mode, MAX(pr.crawl_time) AS max_time
+                    FROM {table} pr
+                    WHERE {where_clause}
+                      AND pr.crawl_time BETWEEN ? AND ?
+                    GROUP BY pr.player_id, pr.mode
+                )
+                SELECT pr.player_id, pr.mode, pr.rank, pr.name, pr.lv, pr.{value_field}, pr.acc, pr.combo, pr.pc, pr.crawl_time
                 FROM {table} pr
+                JOIN latest l
+                  ON l.player_id = pr.player_id
+                 AND l.mode = pr.mode
+                 AND l.max_time = pr.crawl_time
                 WHERE {where_clause}
-                ORDER BY pr.rank
-                LIMIT ?
+                ORDER BY pr.rank ASC, pr.crawl_time DESC
                 """
+                query_params = params + [start_time, end_time_obj] + params
+                cursor.execute(query, query_params)
+                return cursor.fetchall()
+
+            if selector.filters["time_range"]:
+                start_time = selector.filters["time_range"]["start"]
+                if isinstance(start_time, str):
+                    start_time = datetime.fromisoformat(start_time)
+                rows = _fetch_rows(start_time, end_time)
             else:
-                query = f"""
-                SELECT pr.rank, pr.name, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc, pr.mode
-                FROM {table} pr
-                WHERE {where_clause}
-                ORDER BY pr.rank
-                LIMIT ?
-                """
-            params.append(limit)
+                # Adaptive window to avoid sparse exact timestamp snapshots after interval compaction.
+                rows = []
+                min_target = min(limit, 20)
+                for hours in (24, 72, 168, 720):
+                    candidate_rows = _fetch_rows(end_time - timedelta(hours=hours), end_time)
+                    seen_keys = set()
+                    for r in candidate_rows:
+                        seen_keys.add((r[0], r[1]))
+                    rows = candidate_rows
+                    if len(seen_keys) >= min_target:
+                        break
 
-            cursor.execute(query, params)
-            players_data = cursor.fetchall()
+            dedup_rows: List[tuple] = []
+            seen_keys = set()
+            for row in rows:
+                key = (row[0], row[1])
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                dedup_rows.append(row)
+                if len(dedup_rows) >= limit:
+                    break
 
             result: List[Player] = []
-            for row in players_data:
+            for row in dedup_rows:
                 payload = {
-                    "rank": row[0],
-                    "name": row[1],
-                    "level": row[2],
-                    "accuracy": row[4],
-                    "combo": row[5],
-                    "play_count": row[6],
-                    "mode": row[7],
+                    "rank": row[2],
+                    "name": row[3],
+                    "level": row[4],
+                    "accuracy": row[6],
+                    "combo": row[7],
+                    "play_count": row[8],
+                    "mode": row[1],
                     "rank_type": rank_type,
                 }
                 if rank_type == "mm":
-                    payload["mm_value"] = row[3]
+                    payload["mm_value"] = row[5]
                 else:
-                    payload["exp"] = row[3]
+                    payload["exp"] = row[5]
                 result.append(Player(**payload))
             return result
 
@@ -305,19 +348,19 @@ class PlayerService:
         selector: MCSelector,
         rank_type: str = "exp",
     ) -> Optional[datetime]:
-        """获取最新爬取时间"""
+        """Get latest crawl_time for the selected scope."""
         table = self._ranking_table(rank_type)
         try:
-            if selector.filters['modes']:
-                mode_condition = "pr.mode IN ({})".format(','.join(['?']*len(selector.filters['modes'])))
+            if selector.filters["modes"]:
+                mode_condition = "pr.mode IN ({})".format(",".join(["?"] * len(selector.filters["modes"])))
                 cursor.execute(
                     f"SELECT MAX(crawl_time) FROM {table} pr WHERE {mode_condition}",
-                    selector.filters['modes']
+                    selector.filters["modes"],
                 )
             elif selector.current_mode != -1:
                 cursor.execute(
                     f"SELECT MAX(crawl_time) FROM {table} WHERE mode = ?",
-                    (selector.current_mode,)
+                    (selector.current_mode,),
                 )
             else:
                 cursor.execute(f"SELECT MAX(crawl_time) FROM {table}")
@@ -326,21 +369,21 @@ class PlayerService:
             return result[0] if result and result[0] else None
         except Exception:
             return None
-    
+
     @db_safe_operation
     def get_player_info(self, player_identifier: str, selector: MCSelector, rank_type: str = "exp") -> Dict[str, Any]:
-        """获取玩家基本信息"""
+        """Get one player's latest profile for the selected filters."""
         conn = get_db_connection()
         cursor = conn.cursor()
 
         try:
-            # 判断是UID还是名称，并获取player_id
+            # 鍒ゆ柇鏄疷ID杩樻槸鍚嶇О锛屽苟鑾峰彇player_id
             player_id = self._get_player_id(cursor, player_identifier)
             if not player_id:
-                return {"error": f"未找到玩家: {player_identifier}"}
+                return {"error": f"鏈壘鍒扮帺瀹? {player_identifier}"}
             table = self._ranking_table(rank_type)
 
-            # 构建查询条件
+            # 鏋勫缓鏌ヨ鏉′欢
             where_conditions = ["pr.player_id = ?"]
             query_params = [player_id]
 
@@ -351,15 +394,17 @@ class PlayerService:
                 where_conditions.append("pr.mode = ?")
                 query_params.append(selector.current_mode)
 
-            # 时间筛选
-            if selector.filters['time_range']:
+            # Time filter
+            if selector.filters["time_range"]:
                 where_conditions.append("pr.crawl_time BETWEEN ? AND ?")
-                query_params.extend([
-                    selector.filters['time_range']['start'],
-                    selector.filters['time_range']['end']
-                ])
+                query_params.extend(
+                    [
+                        selector.filters["time_range"]["start"],
+                        selector.filters["time_range"]["end"],
+                    ]
+                )
             else:
-                # 如果没有时间筛选，获取最新数据
+                # When no time filter is provided, return the latest record per mode.
                 where_conditions.append(
                     f"pr.crawl_time = (SELECT MAX(crawl_time) FROM {table} WHERE player_id = ? AND mode = pr.mode)"
                 )
@@ -392,9 +437,9 @@ class PlayerService:
 
             player_data = cursor.fetchone()
             if not player_data:
-                return {"error": "没有找到玩家数据"}
+                return {"error": "娌℃湁鎵惧埌鐜╁鏁版嵁"}
 
-            # 获取玩家别名
+            # 鑾峰彇鐜╁鍒悕
             aliases = self._get_player_aliases(cursor, player_id)
 
             result = {
@@ -412,7 +457,7 @@ class PlayerService:
                 result["mm_value"] = player_data[2]
             else:
                 result["exp"] = player_data[2]
-                # 默认个人页返回中附带同模式 MM 快照，避免调用方额外筛选/再次请求
+                # 榛樿涓汉椤佃繑鍥炰腑闄勫甫鍚屾ā寮?MM 蹇収锛岄伩鍏嶈皟鐢ㄦ柟棰濆绛涢€?鍐嶆璇锋眰
                 if self._table_exists(cursor, "player_rankings_mm"):
                     mm_where = ["player_id = ?", "mode = ?"]
                     mm_params: List[Any] = [player_id, player_data[6]]
@@ -446,17 +491,17 @@ class PlayerService:
 
         finally:
             conn.close()
-    
+
     @db_safe_operation
     def get_player_profile(self, identifier: str) -> Dict[str, Any]:
-        """获取玩家详细资料（头像、头衔、成就、个人信息）"""
+        """鑾峰彇鐜╁璇︾粏璧勬枡锛堝ご鍍忋€佸ご琛斻€佹垚灏便€佷釜浜轰俊鎭級"""
         conn = get_db_connection()
         cursor = conn.cursor()
 
         player_id = None
         uid = None
 
-        # 获取 player_id 和 uid
+        # 鑾峰彇 player_id 鍜?uid
         if identifier.isdigit():
             uid = identifier
             cursor.execute("SELECT player_id FROM player_identity WHERE uid = ?", (uid,))
@@ -475,7 +520,7 @@ class PlayerService:
 
         if not player_id and not uid:
             conn.close()
-            return {"error": f"未找到玩家: {identifier}"}
+            return {"error": f"鏈壘鍒扮帺瀹? {identifier}"}
 
         profile = {}
         if uid:
@@ -501,12 +546,12 @@ class PlayerService:
             "titles": titles,
             "achievements": achievements
         }
-    
+
     def _get_player_id(self, cursor: sqlite3.Cursor, identifier: str) -> Optional[int]:
-        """获取玩家ID"""
+        """鑾峰彇鐜╁ID"""
         if identifier.isdigit():
             cursor.execute(
-                "SELECT player_id FROM player_identity WHERE uid = ?", 
+                "SELECT player_id FROM player_identity WHERE uid = ?",
                 (identifier,)
             )
         else:
@@ -514,18 +559,18 @@ class PlayerService:
                 "SELECT player_id FROM player_aliases WHERE alias = ?",
                 (identifier,)
             )
-        
+
         result = cursor.fetchone()
         return result[0] if result else None
-    
+
     def _get_player_aliases(self, cursor: sqlite3.Cursor, player_id: int) -> List[str]:
-        """获取玩家别名"""
+        """鑾峰彇鐜╁鍒悕"""
         cursor.execute(
             "SELECT alias FROM player_aliases WHERE player_id = ? ORDER BY last_seen DESC",
             (player_id,)
         )
         return [row[0] for row in cursor.fetchall()]
-    
+
     @db_safe_operation
     def get_player_history(
         self,
@@ -534,17 +579,17 @@ class PlayerService:
         days: int = 30,
         metric: str = "exp_rank",
     ) -> List[Dict[str, Any]]:
-        """获取玩家历史排名/MMR"""
+        """鑾峰彇鐜╁鍘嗗彶鎺掑悕/MMR"""
         conn = get_db_connection()
         cursor = conn.cursor()
 
         try:
-            # 获取玩家ID
+            # 鑾峰彇鐜╁ID
             player_id = self._get_player_id(cursor, player_name)
             if not player_id:
                 return []
 
-            # 计算时间范围
+            # 璁＄畻鏃堕棿鑼冨洿
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
 
@@ -612,59 +657,88 @@ class PlayerService:
 
         finally:
             conn.close()
-    
+
     @db_safe_operation
     def search_players(self, keyword: str, selector: MCSelector, limit: int = 10) -> List[Dict[str, Any]]:
-        """搜索玩家"""
+        """Search players from reconstructed snapshot rows."""
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         try:
-            # 构建基础查询条件
-            where_conditions = []
-            params = []
-            
-            # 玩家名搜索
-            where_conditions.append("pr.name LIKE ?")
-            params.append(f"%{keyword}%")
-            
-            # 模式筛选
-            if selector.filters['modes']:
-                where_conditions.append("pr.mode IN ({})".format(','.join(['?']*len(selector.filters['modes']))))
-                params.extend(selector.filters['modes'])
-            elif selector.current_mode != -1:
-                where_conditions.append("pr.mode = ?")
-                params.append(selector.current_mode)
-            
-            # 获取最新数据
-            latest_time = self._get_latest_crawl_time(cursor, selector)
-            if latest_time:
-                where_conditions.append("pr.crawl_time = ?")
-                params.append(latest_time)
-            
-            where_clause = " AND ".join(where_conditions)
-            
-            query = f"""
-            SELECT DISTINCT pr.name, pr.rank, pr.lv, pr.acc, pr.mode
-            FROM player_rankings pr
-            WHERE {where_clause}
-            ORDER BY pr.rank
-            LIMIT ?
-            """
-            params.append(limit)
-            
-            cursor.execute(query, params)
-            results = cursor.fetchall()
-            
+            table = "player_rankings"
+            where_clause, params = selector.build_player_sql_where("pr")
+            like_value = f"%{keyword}%"
+
+            # Resolve snapshot end time for current selector scope.
+            if selector.filters["time_range"]:
+                cursor.execute(
+                    f"""
+                    SELECT MAX(pr.crawl_time)
+                    FROM {table} pr
+                    WHERE {where_clause} AND pr.crawl_time <= ?
+                    """,
+                    params + [selector.filters["time_range"]["end"]],
+                )
+            else:
+                cursor.execute(
+                    f"SELECT MAX(pr.crawl_time) FROM {table} pr WHERE {where_clause}",
+                    params,
+                )
+            latest_time = cursor.fetchone()[0]
+            if not latest_time:
+                return []
+            end_time = latest_time if isinstance(latest_time, datetime) else datetime.fromisoformat(str(latest_time))
+
+            def _query_window(start_time: datetime, end_time_obj: datetime) -> List[tuple]:
+                query = f"""
+                WITH latest AS (
+                    SELECT pr.player_id, pr.mode, MAX(pr.crawl_time) AS max_time
+                    FROM {table} pr
+                    WHERE {where_clause}
+                      AND pr.crawl_time BETWEEN ? AND ?
+                    GROUP BY pr.player_id, pr.mode
+                )
+                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.acc, pr.mode, pr.crawl_time
+                FROM {table} pr
+                JOIN latest l
+                  ON l.player_id = pr.player_id
+                 AND l.mode = pr.mode
+                 AND l.max_time = pr.crawl_time
+                WHERE {where_clause}
+                  AND (
+                    pr.name LIKE ?
+                    OR EXISTS (SELECT 1 FROM player_aliases pa WHERE pa.player_id = pr.player_id AND pa.alias LIKE ?)
+                    OR EXISTS (SELECT 1 FROM player_identity pi WHERE pi.player_id = pr.player_id AND pi.current_name LIKE ?)
+                  )
+                ORDER BY pr.rank ASC, pr.crawl_time DESC
+                LIMIT ?
+                """
+                query_params = params + [start_time, end_time_obj] + params + [like_value, like_value, like_value, limit]
+                cursor.execute(query, query_params)
+                return cursor.fetchall()
+
+            if selector.filters["time_range"]:
+                start_time = selector.filters["time_range"]["start"]
+                if isinstance(start_time, str):
+                    start_time = datetime.fromisoformat(start_time)
+                results = _query_window(start_time, end_time)
+            else:
+                results = []
+                for hours in (24, 72, 168, 720):
+                    candidate = _query_window(end_time - timedelta(hours=hours), end_time)
+                    results = candidate
+                    if len(candidate) >= limit:
+                        break
+
             return [
                 {
-                    "name": row[0],
-                    "rank": row[1],
-                    "level": row[2],
-                    "accuracy": row[3],
-                    "mode": row[4]
+                    "name": row[1],
+                    "rank": row[2],
+                    "level": row[3],
+                    "accuracy": row[4],
+                    "mode": row[5],
                 } for row in results
             ]
-            
+
         finally:
             conn.close()
