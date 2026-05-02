@@ -1,6 +1,8 @@
 import os
 import re
+
 import matplotlib.pyplot as plt
+
 
 def install(cls, *, colorize, colors, db_safe_operation):
     Colors = colors
@@ -321,7 +323,7 @@ def install(cls, *, colorize, colors, db_safe_operation):
         chart_choice = input(colorize("\n是否生成资料统计图表? (y/N): ", Colors.CYAN)).lower()
         if chart_choice == 'y':
             self._generate_profile_chart(profile, titles, achievements, player_name, ranking, rankings, mode)
-        
+
     def _generate_profile_chart(self, profile, titles, achievements, player_name, ranking, rankings, mode):
         """Generate per-mode profile charts."""
         rows = []

@@ -1,7 +1,6 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query
-
 from malody_api.core.models import APIResponse
 from malody_api.core.security import require_api_key
 from malody_api.core.services.official_api_service import OfficialAPIService

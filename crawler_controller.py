@@ -3,25 +3,25 @@
 爬虫控制器 - 支持IMAP接收邮件命令 + 预设参数展开 + QQ外发报告 + 本地Shell测试
 """
 
-import os
-import sys
-import yaml
-import json
-import time
-import signal
-import logging
-import subprocess
-import threading
-import re
-import smtplib
-import imaplib
-import email
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime
-from typing import Dict, List, Optional, Any
 import argparse
 import cmd
+import email
+import imaplib
+import json
+import logging
+import os
+import signal
+import smtplib
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Dict, List, Optional, Any
+
+import yaml
 
 # 确保日志目录存在
 os.makedirs("logs", exist_ok=True)

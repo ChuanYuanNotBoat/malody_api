@@ -33,19 +33,23 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 issues_found.append(f"数据库完整性: {integrity_result}")
                 print(colorize(f"发现数据库完整性问题: {integrity_result}", Colors.YELLOW))
             
-            # 检查状态统计问题
-            cursor.execute("SELECT COUNT(*) FROM charts WHERE status = 1")
-            beta_count = cursor.fetchone()[0]
-            
-            # 检查是否有状态为1的记录但统计为0
-            if beta_count == 0:
-                cursor.execute("SELECT cid FROM charts WHERE status = 1 LIMIT 5")
-                beta_records = cursor.fetchall()
-                if beta_records:
-                    issues_found.append("状态为1的记录存在但统计为0")
-                    print(colorize(f"发现 {len(beta_records)} 个状态为1的记录，但统计显示为0", Colors.YELLOW))
-                    for cid, in beta_records:
-                        print(f"  CID {cid} 状态为1")
+            # 检查已知状态不一致问题
+            known_issues = [
+                (139970, 1),  # CID 139970 应该是状态1
+                # 可以在这里添加其他已知的问题CID和正确状态
+            ]
+            pending_known_issue_fixes = []
+            for cid, correct_status in known_issues:
+                cursor.execute("SELECT status FROM charts WHERE cid = ?", (cid,))
+                result = cursor.fetchone()
+                if result and result[0] != correct_status:
+                    pending_known_issue_fixes.append((cid, result[0], correct_status))
+
+            if pending_known_issue_fixes:
+                issues_found.append(f"known_status_mismatch:{len(pending_known_issue_fixes)}")
+                print(colorize(f"发现 {len(pending_known_issue_fixes)} 个已知状态不一致问题", Colors.YELLOW))
+                for cid, current_status, correct_status in pending_known_issue_fixes[:5]:
+                    print(f"  CID {cid}: {current_status} -> {correct_status}")
             
             # 如果没有发现问题但强制修复，或者发现问题
             if issues_found or force_repair:
@@ -64,21 +68,11 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 
                 # 修复已知的状态不一致问题
                 print("修复状态不一致问题...")
-                known_issues = [
-                    (139970, 1),  # CID 139970 应该是状态1
-                    # 可以在这里添加其他已知的问题CID和正确状态
-                ]
-                
                 fixed_count = 0
-                for cid, correct_status in known_issues:
-                    cursor.execute("SELECT status FROM charts WHERE cid = ?", (cid,))
-                    result = cursor.fetchone()
-                    if result:
-                        current_status = result[0]
-                        if current_status != correct_status:
-                            cursor.execute("UPDATE charts SET status = ? WHERE cid = ?", (correct_status, cid))
-                            fixed_count += 1
-                            print(f"  修复 CID {cid}: 状态 {current_status} -> {correct_status}")
+                for cid, current_status, correct_status in pending_known_issue_fixes:
+                    cursor.execute("UPDATE charts SET status = ? WHERE cid = ?", (correct_status, cid))
+                    fixed_count += 1
+                    print(f"  修复 CID {cid}: 状态 {current_status} -> {correct_status}")
                 
                 self.conn.commit()
                 

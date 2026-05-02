@@ -1,13 +1,13 @@
 # malody_api/routers/analytics.py
-from fastapi import APIRouter, Query, HTTPException
-from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
+from typing import Optional
 
+from fastapi import APIRouter, Query, HTTPException
+from malody_api.core.models import APIResponse
 # 修复导入路径 - 改为绝对导入
 from malody_api.core.services import AnalysisService
 from malody_api.core.services.dashboard_service import dashboard_service
 from malody_api.utils.selector import MCSelector
-from malody_api.core.models import APIResponse
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 analysis_service = AnalysisService()
@@ -25,7 +25,7 @@ async def analyze_player_trends(
             start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
         except ValueError:
             raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD")
-        
+
         # 解析显示字段
         fields = None
         if display_fields:
@@ -34,24 +34,24 @@ async def analyze_player_trends(
             invalid_fields = [field for field in fields if field not in valid_fields]
             if invalid_fields:
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail=f"无效的显示字段: {', '.join(invalid_fields)}"
                 )
-        
+
         selector = MCSelector()
         selector.current_mode = mode
-        
+
         trend_analysis = analysis_service.analyze_player_trends(start_datetime, selector, fields)
-        
+
         if "error" in trend_analysis:
             raise HTTPException(status_code=404, detail=trend_analysis["error"])
-        
+
         return APIResponse(
             success=True,
             data=trend_analysis,
             timestamp=datetime.now()
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -73,10 +73,10 @@ async def get_chart_trends(
     try:
         selector = MCSelector()
         selector.current_mode = mode
-        
+
         if creators:
             selector.set_filters(players=creators.split(','))
-        
+
         if difficulties:
             try:
                 if '-' in difficulties:
@@ -86,26 +86,26 @@ async def get_chart_trends(
                     selector.set_filters(difficulties=[float(difficulties.strip())])
             except ValueError:
                 pass
-        
+
         if statuses:
             try:
                 status_list = [int(s.strip()) for s in statuses.split(',')]
                 selector.set_filters(statuses=status_list)
             except ValueError:
                 pass
-        
+
         if period not in ["days", "months"]:
             raise HTTPException(status_code=400, detail="period 仅支持 days 或 months")
-        
+
         trend_data = analysis_service.get_chart_trends(selector, period)
-        
+
         return APIResponse(
             success=True,
             data=trend_data,
             message=f"找到 {len(trend_data)} 个时间段的数据",
             timestamp=datetime.now()
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -125,25 +125,25 @@ async def compare_modes(
             mode_list = [int(m.strip()) for m in modes.split(',')]
         except ValueError:
             raise HTTPException(status_code=400, detail="模式必须是数字")
-        
+
         # 验证模式有效性
         valid_modes = list(range(10))  # 0-9
         invalid_modes = [m for m in mode_list if m not in valid_modes]
         if invalid_modes:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"无效的模式: {', '.join(map(str, invalid_modes))}"
             )
-        
+
         comparison_data = analysis_service.compare_modes(mode_list)
-        
+
         return APIResponse(
             success=True,
             data=comparison_data,
             message=f"比较了 {len(comparison_data)} 个模式",
             timestamp=datetime.now()
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:

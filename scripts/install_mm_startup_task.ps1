@@ -3,6 +3,7 @@ param(
     [int]$IntervalMinutes = 30,
     [int]$MmLimit = 200,
     [string]$ProjectRoot = "F:\projects\tools\working\malody_tools\malody_api",
+    [string]$PythonPath = "",
     [switch]$Remove
 )
 
@@ -34,8 +35,16 @@ if (-not (Test-Path $scriptPath)) {
 }
 
 $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -IntervalMinutes $IntervalMinutes -MmLimit $MmLimit -ProjectRoot `"$ProjectRoot`""
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arg
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable
+if ($PythonPath) {
+    $arg += " -PythonPath `"$PythonPath`""
+}
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arg -WorkingDirectory $ProjectRoot
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 5)
 
 function Remove-TaskIfExists {
     param(

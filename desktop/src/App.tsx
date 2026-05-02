@@ -1,5 +1,5 @@
-﻿import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+﻿import {useEffect, useMemo, useState} from "react";
+import {useMutation, useQuery, useQueryClient} from "@tanstack/react-query";
 import ReactECharts from "echarts-for-react";
 import {
   Alert,
@@ -12,6 +12,7 @@ import {
   Input,
   InputNumber,
   Layout,
+  message,
   Row,
   Select,
   Space,
@@ -19,8 +20,7 @@ import {
   Table,
   Tabs,
   Tag,
-  Typography,
-  message
+  Typography
 } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import enUS from "antd/locale/en_US";
@@ -39,7 +39,7 @@ import {
   runPlugin,
   startQualityCheckJob
 } from "./api";
-import { AppLocale, dictionaries } from "./i18n";
+import {AppLocale, dictionaries} from "./i18n";
 
 const { Header, Content } = Layout;
 

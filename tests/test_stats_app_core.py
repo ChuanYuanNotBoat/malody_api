@@ -97,3 +97,26 @@ class TestStatsAppCore(TestCase):
 
         self.assertEqual(rc, 1)
         self.assertIn("init failed", stdout.getvalue())
+
+    def test_auto_repair_database_fixes_known_status_mismatch(self):
+        conn = sqlite3.connect(":memory:")
+        cursor = conn.cursor()
+        cursor.executescript(
+            """
+            CREATE TABLE charts (
+                cid INTEGER PRIMARY KEY,
+                status INTEGER
+            );
+            INSERT INTO charts (cid, status) VALUES (139970, 0);
+            """
+        )
+        conn.commit()
+
+        shell = stats_app.MalodyViz.__new__(stats_app.MalodyViz)
+        shell.conn = conn
+        with patch("sys.stdout", new_callable=io.StringIO):
+            shell.auto_repair_database()
+
+        cursor.execute("SELECT status FROM charts WHERE cid = 139970")
+        self.assertEqual(cursor.fetchone()[0], 1)
+        conn.close()

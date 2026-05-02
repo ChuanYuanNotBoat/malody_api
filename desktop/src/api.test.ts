@@ -1,11 +1,5 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import {
-  getQualityCheckJob,
-  startQualityCheckJob,
-  runDbMaintenance,
-  getPlugins,
-  API_BASE
-} from "./api";
+import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
+import {API_BASE, getPlugins, getQualityCheckJob, runDbMaintenance, startQualityCheckJob} from "./api";
 
 describe("api request edge cases", () => {
   beforeEach(() => {

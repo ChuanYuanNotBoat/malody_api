@@ -1,12 +1,11 @@
 # malody_api/routers/query.py
-from fastapi import APIRouter, Query, HTTPException, Body
-from typing import List, Dict, Any, Optional
 from datetime import datetime
-import json
+from typing import List, Dict, Optional
 
+from fastapi import APIRouter, Query, HTTPException, Body
+from malody_api.core.models import APIResponse
 # 修复导入路径 - 改为绝对导入
 from malody_api.utils.query_builder import AdvancedQueryService
-from malody_api.core.models import APIResponse
 
 router = APIRouter(prefix="/query", tags=["advanced-query"])
 query_service = AdvancedQueryService()
@@ -25,7 +24,7 @@ async def execute_advanced_query(
 ):
     """
     执行高级查询
-    
+
     过滤条件示例:
     ```json
     [
@@ -33,7 +32,7 @@ async def execute_advanced_query(
       {"field": "rank", "operator": "<=", "value": 100}
     ]
     ```
-    
+
     支持的操作符: =, !=, >, <, >=, <=, LIKE, IN, BETWEEN, IS NULL, IS NOT NULL
     """
     try:
@@ -48,17 +47,17 @@ async def execute_advanced_query(
             offset=offset,
             distinct=distinct
         )
-        
+
         if not result["success"]:
             raise HTTPException(status_code=400, detail=result["error"])
-        
+
         return APIResponse(
             success=True,
             data=result["data"],
             message=f"查询成功，返回 {len(result['data'])} 条记录",
             timestamp=datetime.now()
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -73,16 +72,16 @@ async def get_table_schema(table_name: str):
     """获取表结构信息"""
     try:
         schema = query_service.get_table_schema(table_name)
-        
+
         if "error" in schema:
             raise HTTPException(status_code=404, detail=schema["error"])
-        
+
         return APIResponse(
             success=True,
             data=schema,
             timestamp=datetime.now()
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -97,16 +96,16 @@ async def get_database_statistics():
     """获取数据库统计信息"""
     try:
         stats = query_service.get_database_stats()
-        
+
         if "error" in stats:
             raise HTTPException(status_code=500, detail=stats["error"])
-        
+
         return APIResponse(
             success=True,
             data=stats,
             timestamp=datetime.now()
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -137,7 +136,7 @@ async def get_predefined_queries():
         },
         "chart_statistics_by_status": {
             "description": "按状态统计谱面信息",
-            "endpoint": "/query/execute", 
+            "endpoint": "/query/execute",
             "method": "POST",
             "parameters": {
                 "table": "charts",
@@ -149,7 +148,7 @@ async def get_predefined_queries():
         "player_ranking_history": {
             "description": "获取玩家排名历史",
             "endpoint": "/query/execute",
-            "method": "POST", 
+            "method": "POST",
             "parameters": {
                 "table": "player_rankings",
                 "columns": ["name", "rank", "crawl_time"],
@@ -177,7 +176,7 @@ async def get_predefined_queries():
             }
         }
     }
-    
+
     return APIResponse(
         success=True,
         data=predefined_queries,

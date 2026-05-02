@@ -5,12 +5,11 @@ from typing import Callable, Optional
 
 import pandas as pd
 
-from utils.stats_xlsx_formatter import (
-    apply_change_conditional_formatting,
-    autosize_openpyxl_sheet,
-)
 from utils.stats_update_runner import parse_cli_options, split_cli_args
-
+from utils.stats_xlsx_formatter import (
+  apply_change_conditional_formatting,
+  autosize_openpyxl_sheet,
+)
 
 ColorizeFn = Callable[[str, str], str]
 TimeRangeParserFn = Callable[[str], Optional[dict]]

@@ -53,7 +53,7 @@ def split_cli_args(text: str, colorize: ColorizeFn, red: str) -> Optional[List[s
     try:
         return shlex.split(text) if text else []
     except ValueError as e:
-        print(colorize(f"鍙傛暟瑙ｆ瀽澶辫触: {e}", red))
+        print(colorize(f"参数解析失败: {e}", red))
         return None
 
 
@@ -63,7 +63,7 @@ def parse_cli_options(tokens: List[str], colorize: ColorizeFn, red: str) -> Opti
     while i < len(tokens):
         token = tokens[i]
         if not token.startswith("--"):
-            print(colorize(f"鏃犳晥鍙傛暟: {token}", red))
+            print(colorize(f"无效参数: {token}", red))
             return None
         if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
             options[token] = tokens[i + 1]
@@ -81,7 +81,7 @@ def parse_positive_int(name: str, value: str, colorize: ColorizeFn, red: str) ->
             raise ValueError()
         return iv
     except Exception:
-        print(colorize(f"鍙傛暟 {name} 蹇呴』鏄鏁存暟: {value}", red))
+        print(colorize(f"参数 {name} 必须是正整数: {value}", red))
         return None
 
 
@@ -96,7 +96,7 @@ def build_update_command(
     crawler_flags = ["--leaderboard", "--player", "--stb"]
     selected = [f for f in crawler_flags if f in tokens]
     if len(selected) > 1:
-        print(colorize("閿欒: --leaderboard/--player/--stb 鍙兘閫変竴涓?", red))
+        print(colorize("错误: --leaderboard/--player/--stb 只能选一个", red))
         return None
     crawler_type = selected[0] if selected else "--leaderboard"
     filtered_tokens = [t for t in tokens if t not in crawler_flags]
@@ -110,7 +110,7 @@ def build_update_command(
         allow = {"--once"}
         unknown = [k for k in options.keys() if k not in allow]
         if unknown:
-            print(colorize(f"leaderboard 涓嶆敮鎸佸弬鏁? {', '.join(unknown)}", red))
+            print(colorize(f"leaderboard 不支持参数: {', '.join(unknown)}", red))
             return None
         if options.get("--once") is True or not tokens:
             cmd.append("--once")
@@ -121,11 +121,11 @@ def build_update_command(
         cmd = [python_executable, script]
         unknown = [k for k in options.keys() if k not in PLAYER_ALLOWED_FLAGS]
         if unknown:
-            print(colorize(f"player 涓嶆敮鎸佸弬鏁? {', '.join(unknown)}", red))
+            print(colorize(f"player 不支持参数: {', '.join(unknown)}", red))
             return None
 
         if options.get("--once"):
-            print(colorize("鎻愮ず: player_profile_crawler.py 涓嶆敮鎸?--once锛屽凡蹇界暐", yellow))
+            print(colorize("提示: player_profile_crawler.py 不支持 --once，已忽略", yellow))
 
         value_flags = ["--uid", "--uid-list", "--uid-range", "--uid-file", "--log-level", "--log-file", "--resume-file"]
         int_flags = ["--leaderboard-mode", "--limit", "--days-since-update", "--max-workers", "--rpm", "--save-interval"]
@@ -153,7 +153,7 @@ def build_update_command(
     cmd = [python_executable, script]
     unknown = [k for k in options.keys() if k not in STB_ALLOWED_FLAGS]
     if unknown:
-        print(colorize(f"stb 涓嶆敮鎸佸弬鏁? {', '.join(unknown)}", red))
+        print(colorize(f"stb 不支持参数: {', '.join(unknown)}", red))
         return None
 
     if options.get("--once") is True:
@@ -164,7 +164,7 @@ def build_update_command(
     if isinstance(options.get("--source"), str):
         source = options["--source"]
         if source not in ["all", "home", "latest", "api"]:
-            print(colorize("--source 浠呮敮鎸?all/home/latest/api", red))
+            print(colorize("--source 仅支持 all/home/latest/api", red))
             return None
         cmd.extend(["--source", source])
 
@@ -222,13 +222,13 @@ def build_update_command(
         if rv in ["false", "0", "no", "n"]:
             cmd.append("--no-resume")
         elif rv not in ["true", "1", "yes", "y"]:
-            print(colorize("--resume 浠呮敮鎸?true/false", red))
+            print(colorize("--resume 仅支持 true/false", red))
             return None
 
     if isinstance(options.get("--log-level"), str):
         level = str(options["--log-level"]).upper()
         if level not in ["DEBUG", "INFO", "WARNING", "ERROR"]:
-            print(colorize("--log-level 浠呮敮鎸?DEBUG/INFO/WARNING/ERROR", red))
+            print(colorize("--log-level 仅支持 DEBUG/INFO/WARNING/ERROR", red))
             return None
         cmd.extend(["--log-level", level])
     if isinstance(options.get("--log-file"), str):
@@ -237,7 +237,7 @@ def build_update_command(
 
 
 def run_streaming_command(cmd: List[str], colorize: ColorizeFn, cyan: str, green: str, red: str) -> None:
-    print(colorize(f"\n寮€濮嬫墽琛? {' '.join(cmd)}", cyan))
+    print(colorize(f"\n开始执行: {' '.join(cmd)}", cyan))
     try:
         process = subprocess.Popen(
             cmd,
@@ -252,8 +252,8 @@ def run_streaming_command(cmd: List[str], colorize: ColorizeFn, cyan: str, green
                 print(clean_line)
         process.wait()
         if process.returncode == 0:
-            print(colorize("\n鏁版嵁鏇存柊鎴愬姛!", green))
+            print(colorize("\n数据更新成功!", green))
         else:
-            print(colorize(f"\n鏁版嵁鏇存柊澶辫触锛岄€€鍑虹爜: {process.returncode}", red))
+            print(colorize(f"\n数据更新失败，退出码: {process.returncode}", red))
     except Exception as e:
-        print(colorize(f"\n鏇存柊杩囩▼涓彂鐢熼敊璇? {e}", red))
+        print(colorize(f"\n更新过程中发生错误: {e}", red))

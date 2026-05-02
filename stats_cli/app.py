@@ -1,29 +1,21 @@
 # malody_stats.py
 import argparse
-import sqlite3
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import atexit
 import cmd
 import os
-import sys
-from typing import Dict, List, Tuple, Optional
-import matplotlib.dates as mdates
-from matplotlib.ticker import MaxNLocator, LogLocator, FuncFormatter
-import subprocess
-import atexit
-import signal
-from functools import wraps
 import shutil
-import re
-import math
-import json
-import copy                     # 新增导入，用于深拷贝选择器
-from selector import global_selector, MCSelector
-from utils.stats_export_runner import parse_export_request, run_export
-from utils.stats_update_runner import build_update_command, run_streaming_command, split_cli_args
+import signal
+import sqlite3
+import sys
+from datetime import datetime
+from functools import wraps
+from typing import List, Optional
+
+import matplotlib.pyplot as plt
+
+from selector import global_selector
 from stats_cli.plugins.registry import install_plugins
+
 
 # 修复matplotlib中文字体问题
 def setup_chinese_font():
@@ -86,18 +78,18 @@ def enable_powershell_colors():
         try:
             # 方法1: 通过设置环境变量启用虚拟终端
             os.environ["TERM"] = "xterm-256color"
-            
+
             # 方法2: 使用 ctypes 启用虚拟终端处理
             if hasattr(sys, 'getwindowsversion'):
                 import ctypes
                 from ctypes import wintypes
-                
+
                 kernel32 = ctypes.windll.kernel32
                 STD_OUTPUT_HANDLE = -11
-                
+
                 # 获取标准输出句柄
                 hstdout = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-                
+
                 # 获取当前控制台模式
                 mode = wintypes.DWORD()
                 if kernel32.GetConsoleMode(hstdout, ctypes.byref(mode)):
@@ -154,33 +146,33 @@ def color_enabled():
             # 检查是否在 Windows Terminal、PowerShell 5.1+ 或支持 ANSI 的 CMD 中运行
             term_program = os.environ.get('TERM_PROGRAM', '')
             term = os.environ.get('TERM', '')
-            
+
             # Windows Terminal 或现代 PowerShell
             if 'WindowsTerminal' in term_program or 'TERM' in os.environ:
                 return True
-            
+
             # 检查 PowerShell 版本（5.1+ 支持 ANSI）
             import subprocess
-            result = subprocess.run(['powershell', '$PSVersionTable.PSVersion.Major'], 
+            result = subprocess.run(['powershell', '$PSVersionTable.PSVersion.Major'],
                                   capture_output=True, text=True, timeout=2)
             if result.returncode == 0 and result.stdout.strip().isdigit():
                 ps_version = int(result.stdout.strip())
                 if ps_version >= 5:
                     return True
-                    
+
             # 最后的手段：尝试检测控制台能力
             import ctypes
             from ctypes import wintypes
-            
+
             kernel32 = ctypes.windll.kernel32
             STD_OUTPUT_HANDLE = -11
             hstdout = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-            
+
             mode = wintypes.DWORD()
             if kernel32.GetConsoleMode(hstdout, ctypes.byref(mode)):
                 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
                 return (mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
-                
+
         except:
             pass
         return False
@@ -212,15 +204,15 @@ def format_change(change_value, reverse=False, is_percent=False):
     """格式化变化值，添加颜色"""
     if change_value is None:
         return "N/A"
-    
+
     if change_value == 0:
         return "0"
-    
+
     if is_percent:
         change_str = f"{change_value:+.2f}%"
     else:
         change_str = f"{change_value:+d}"
-    
+
     # 对于排名变化，负数表示进步（排名上升）
     if reverse:
         if change_value < 0:
@@ -232,7 +224,7 @@ def format_change(change_value, reverse=False, is_percent=False):
             return colorize(change_str, Colors.GREEN)  # 增加
         elif change_value < 0:
             return colorize(change_str, Colors.RED)    # 减少
-    
+
     return change_str
 
 def format_number(number):
@@ -262,56 +254,56 @@ def get_subseparator(width=None):
 
 class MalodyViz(cmd.Cmd):
     """Malody排行榜数据可视化工具"""
-    
+
     intro = colorize("\n欢迎使用Malody排行榜数据可视化工具!\n\n", Colors.CYAN) + \
             "输入 " + colorize("help", Colors.GREEN) + " 或 " + colorize("?", Colors.GREEN) + " 查看命令列表。\n" + \
             "输入 " + colorize("help <命令名>", Colors.GREEN) + " 查看具体命令的详细说明。\n\n" + \
             "所有生成的图表将保存在 " + colorize("viz_output", Colors.YELLOW) + " 目录中。\n" + \
             "提示: 可以使用 " + colorize("ls", Colors.GREEN) + " 命令查看当前目录文件。\n"
     prompt = colorize("(malody-viz) ", Colors.BLUE)
-    
+
     def __init__(self):
         super().__init__()
         self.db_path = "malody_rankings.db"
         self.conn = None
         self.current_mode = -1  # -1 表示所有模式
         self.output_dir = "viz_output"
-        
+
         atexit.register(self.cleanup)
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
-        
+
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
-        
+
         self.connect_db()
-        
+
         # 初始化选择器
         self.selector = global_selector
         self.selector.current_mode = self.current_mode
-        
+
         self.mode_names = {
             -1: "All",  # 所有模式
             0: "Key",
-            1: "Step", 
+            1: "Step",
             2: "DJ",
             3: "Catch",
             4: "Pad",
             5: "Taiko",
-            6: "Ring", 
+            6: "Ring",
             7: "Slide",
             8: "Live",
             9: "Cube"
         }
-        
+
         # 自动修复数据库问题
         self.auto_repair_database()
-    
+
     def connect_db(self):
         """连接到SQLite数据库"""
         try:
             self.conn = sqlite3.connect(
-                self.db_path, 
+                self.db_path,
                 detect_types=sqlite3.PARSE_DECLTYPES,
                 check_same_thread=False
             )
@@ -321,7 +313,7 @@ class MalodyViz(cmd.Cmd):
         except sqlite3.Error as e:
             print(colorize(f"数据库连接错误: {e}", Colors.RED))
             sys.exit(1)
-    
+
     def cleanup(self):
         """清理资源"""
         if self.conn:
@@ -330,94 +322,91 @@ class MalodyViz(cmd.Cmd):
                 print(colorize("\n数据库连接已安全关闭", Colors.GREEN))
             except:
                 pass
-    
+
     def signal_handler(self, signum, frame):
         """处理中断信号"""
         print(colorize("\n正在安全退出...", Colors.YELLOW))
         self.cleanup()
         sys.exit(0)
-    
+
     def emptyline(self):
         """空行时不执行任何操作"""
         pass
-    
+
     def get_unique_filename(self, base_name, extension):
         """生成不重复的文件名，添加时间戳"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         name_only = os.path.splitext(base_name)[0]
         return f"{name_only}_{timestamp}.{extension}"
-    
+
     @db_safe_operation
     def auto_repair_database(self):
         """
         自动修复数据库常见问题
         """
         cursor = self.conn.cursor()
-        
+
         print(colorize("\n正在检查数据库状态...", Colors.CYAN))
-        
+
         try:
             # 检查数据库完整性
             cursor.execute("PRAGMA integrity_check")
             integrity_result = cursor.fetchone()[0]
-            
+
             issues_found = []
-            
+
             if integrity_result != "ok":
                 issues_found.append(f"数据库完整性: {integrity_result}")
                 print(colorize(f"发现数据库完整性问题: {integrity_result}", Colors.YELLOW))
-            
-            # 检查状态为1的记录是否存在但统计不显示的问题
-            cursor.execute("SELECT COUNT(*) FROM charts WHERE status = 1")
-            beta_count = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT cid FROM charts WHERE status = 1 LIMIT 1")
-            beta_exists = cursor.fetchone()
-            
-            if beta_count == 0 and beta_exists:
-                issues_found.append("状态为1的记录存在但统计不显示")
-                print(colorize("发现状态统计不一致问题", Colors.YELLOW))
-            
+
+            # 检查已知状态不一致问题
+            known_issues = [
+                (139970, 1),  # CID 139970 应该是状态1
+                # 可以在这里添加其他已知的问题CID和正确状态
+            ]
+            pending_known_issue_fixes = []
+            for cid, correct_status in known_issues:
+                cursor.execute("SELECT status FROM charts WHERE cid = ?", (cid,))
+                current_status = cursor.fetchone()
+                if current_status and current_status[0] != correct_status:
+                    pending_known_issue_fixes.append((cid, current_status[0], correct_status))
+
+            if pending_known_issue_fixes:
+                issues_found.append(f"known_status_mismatch:{len(pending_known_issue_fixes)}")
+                print(colorize(f"发现 {len(pending_known_issue_fixes)} 个已知状态不一致问题", Colors.YELLOW))
+
             # 如果有问题，自动修复
             if issues_found:
                 print(colorize(f"发现 {len(issues_found)} 个问题，正在自动修复...", Colors.YELLOW))
-                
+
                 # 修复索引
                 print("修复数据库索引...")
                 cursor.execute("REINDEX")
-                
+
                 # 清理数据库
                 print("清理数据库...")
                 cursor.execute("VACUUM")
-                
+
                 # 修复已知的状态不一致问题
                 print("修复状态不一致问题...")
-                known_issues = [
-                    (139970, 1),  # CID 139970 应该是状态1
-                    # 可以在这里添加其他已知的问题CID和正确状态
-                ]
-                
-                for cid, correct_status in known_issues:
-                    cursor.execute("SELECT status FROM charts WHERE cid = ?", (cid,))
-                    current_status = cursor.fetchone()
-                    if current_status and current_status[0] != correct_status:
-                        cursor.execute("UPDATE charts SET status = ? WHERE cid = ?", (correct_status, cid))
-                        print(f"  修复 CID {cid}: 状态 {current_status[0]} -> {correct_status}")
-                
+                for cid, old_status, correct_status in pending_known_issue_fixes:
+                    cursor.execute("UPDATE charts SET status = ? WHERE cid = ?", (correct_status, cid))
+                    print(f"  修复 CID {cid}: 状态 {old_status} -> {correct_status}")
+
                 self.conn.commit()
-                
+
                 # 验证修复结果
                 cursor.execute("PRAGMA integrity_check")
                 new_integrity = cursor.fetchone()[0]
-                
+
                 if new_integrity == "ok":
                     print(colorize("自动修复完成！数据库现在正常。", Colors.GREEN))
                 else:
                     print(colorize(f"修复后完整性检查: {new_integrity}", Colors.YELLOW))
-                    
+
             else:
                 print(colorize("数据库状态正常，无需修复。", Colors.GREEN))
-                
+
         except Exception as e:
             print(colorize(f"自动修复过程中发生错误: {e}", Colors.RED))
     # 增强 do_update 命令

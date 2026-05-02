@@ -4,7 +4,6 @@ from typing import Any, Callable, Dict, List
 from .db_maintenance_service import db_maintenance_service
 from .quality_service import quality_service
 
-
 PluginRunner = Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]
 
 

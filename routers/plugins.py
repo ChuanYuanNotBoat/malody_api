@@ -2,7 +2,6 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-
 from malody_api.core.models import APIResponse
 from malody_api.core.security import require_api_key
 from malody_api.core.services.plugin_service import plugin_service

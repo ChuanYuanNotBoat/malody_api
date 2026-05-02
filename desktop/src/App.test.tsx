@@ -1,8 +1,8 @@
 ﻿import React from "react";
-import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import {beforeEach, describe, expect, it, vi} from "vitest";
+import {render, screen, waitFor} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {QueryClient, QueryClientProvider} from "@tanstack/react-query";
 import App from "./App";
 import * as api from "./api";
 

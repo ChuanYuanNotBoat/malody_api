@@ -1,14 +1,14 @@
 # malody_api/routers/charts.py
-from fastapi import APIRouter, Query, HTTPException
-from typing import List, Optional
 from datetime import datetime, timedelta
-import pandas as pd
+from typing import Optional
 
+import pandas as pd
+from fastapi import APIRouter, Query, HTTPException
+from malody_api.core.models import APIResponse, ChartStats, HotChart, CreatorStats
 # 改为绝对导入
 from malody_api.core.services import ChartService
-from malody_api.utils.selector import MCSelector
 from malody_api.utils.export_response import build_dataframe_download_response, normalize_export_format
-from malody_api.core.models import APIResponse, ChartStats, HotChart, CreatorStats
+from malody_api.utils.selector import MCSelector
 
 router = APIRouter(prefix="/charts", tags=["charts"])
 chart_service = ChartService()
@@ -23,10 +23,10 @@ def create_chart_selector_from_query(
 ) -> MCSelector:
     """从查询参数创建谱面选择器"""
     selector = MCSelector()
-    
+
     if creators:
         selector.set_filters(players=creators.split(','))
-    
+
     if modes:
         try:
             mode_list = [int(m.strip()) for m in modes.split(',')]
@@ -34,7 +34,7 @@ def create_chart_selector_from_query(
         except ValueError:
             if strict:
                 raise HTTPException(status_code=400, detail="modes 参数格式无效，应为逗号分隔整数")
-    
+
     if difficulties:
         try:
             if '-' in difficulties:
@@ -45,7 +45,7 @@ def create_chart_selector_from_query(
         except ValueError:
             if strict:
                 raise HTTPException(status_code=400, detail="difficulties 参数格式无效，示例: 5-10 或 9")
-    
+
     if statuses:
         try:
             status_list = [int(s.strip()) for s in statuses.split(',')]
@@ -56,7 +56,7 @@ def create_chart_selector_from_query(
         except ValueError:
             if strict:
                 raise HTTPException(status_code=400, detail="statuses 参数格式无效，应为逗号分隔整数")
-    
+
     if time_range:
         parsed = parse_time_range(time_range)
         if parsed is None:
@@ -64,14 +64,14 @@ def create_chart_selector_from_query(
                 raise HTTPException(status_code=400, detail="time_range 格式无效，示例: 7d/30d/8w/6m/2026-01-01")
         else:
             selector.set_filters(time_range=parsed)
-    
+
     return selector
 
 def parse_time_range(time_range: str) -> Optional[dict]:
     """解析时间范围参数"""
     from datetime import datetime, timedelta
     now = datetime.now()
-    
+
     try:
         if time_range.endswith('d'):
             days = int(time_range[:-1])
@@ -127,18 +127,18 @@ async def get_chart_stats(
             time_range=time_range,
             statuses=statuses
         )
-        
+
         if mode is not None:
             selector.current_mode = mode
-        
+
         stats = chart_service.get_chart_stats(selector)
-        
+
         return APIResponse(
             success=True,
             data=stats,
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,
@@ -163,19 +163,19 @@ async def get_hot_charts(
             difficulties=difficulties,
             statuses=statuses
         )
-        
+
         if mode is not None:
             selector.current_mode = mode
-        
+
         hot_charts = chart_service.get_hot_charts(selector, sort_by, limit)
-        
+
         return APIResponse(
             success=True,
             data=hot_charts,
             message=f"找到 {len(hot_charts)} 个热门谱面",
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,
@@ -200,19 +200,19 @@ async def get_recent_charts(
             difficulties=difficulties,
             statuses=statuses
         )
-        
+
         if mode is not None:
             selector.current_mode = mode
-        
+
         recent_charts = chart_service.get_recent_charts(selector, days, limit)
-        
+
         return APIResponse(
             success=True,
             data=recent_charts,
             message=f"找到 {len(recent_charts)} 个最近更新的谱面",
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,
@@ -234,19 +234,19 @@ async def get_stable_creators(
             modes=str(mode) if mode is not None else None,
             difficulties=difficulties
         )
-        
+
         if mode is not None:
             selector.current_mode = mode
-        
+
         stable_creators = chart_service.get_stable_creators(selector, limit)
-        
+
         return APIResponse(
             success=True,
             data=stable_creators,
             message=f"找到 {len(stable_creators)} 个创作者",
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,
@@ -514,16 +514,16 @@ async def search_charts(
         if mode is not None:
             selector.set_filters(modes=[mode])
             selector.current_mode = mode
-        
+
         search_results = chart_service.search_charts(keyword, selector, limit)
-        
+
         return APIResponse(
             success=True,
             data=search_results,
             message=f"找到 {len(search_results)} 个匹配谱面",
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,
@@ -543,16 +543,16 @@ async def search_creators(
         if mode is not None:
             selector.set_filters(modes=[mode])
             selector.current_mode = mode
-        
+
         search_results = chart_service.search_creators(keyword, selector, limit)
-        
+
         return APIResponse(
             success=True,
             data=search_results,
             message=f"找到 {len(search_results)} 个匹配创作者",
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,

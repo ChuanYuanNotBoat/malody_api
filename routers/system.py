@@ -3,7 +3,6 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-
 from malody_api.core.database import get_db_connection
 from malody_api.core.models import APIResponse
 from malody_api.core.security import require_api_key

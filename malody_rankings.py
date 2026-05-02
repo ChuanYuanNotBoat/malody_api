@@ -1,26 +1,26 @@
-﻿import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-from openpyxl import load_workbook
-from datetime import datetime, timedelta
-import time
-import os
+﻿import argparse
 import gc
-import logging
-import sys
-import sqlite3
-import subprocess
 import json
-from threading import Lock, Thread
-import signal
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+import os
 import queue
 import re
-import argparse
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# 棰滆壊鏀寔锛堜粎鍦ㄧ粓绔彲鐢ㄦ椂鍚敤锛?
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from openpyxl import load_workbook
+
+# Color support (enabled only when terminal supports ANSI).
 USE_COLOR = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
 def colorize(text, color_code):
     """Add ANSI color escape sequence when terminal supports color."""
@@ -28,7 +28,7 @@ def colorize(text, color_code):
         return f"\033[{color_code}m{text}\033[0m"
     return text
 
-# 淇 Python 3.12+ 涓?SQLite datetime 閫傞厤鍣ㄧ殑寮冪敤璀﹀憡
+# Silence Python 3.12+ SQLite datetime adapter deprecation warning.
 def adapt_datetime(dt):
     return dt.isoformat()
 
@@ -45,7 +45,7 @@ except ImportError:
     HAS_TQDM = False
     print("tqdm not installed; using simple progress output.")
 
-# 閰嶇疆鏃ュ織
+# Logging configuration.
 logging.basicConfig(
     filename='crawler.log',
     level=logging.INFO,
@@ -57,7 +57,7 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 logger.addHandler(console_handler)
 
-# Cookie 閰嶇疆锛堣鏍规嵁瀹為檯鎯呭喌鏇存柊锛?
+# Cookie configuration (update with real values before running).
 def _load_cookies() -> dict:
     """
     Load cookies from runtime sources, highest priority first:
@@ -133,12 +133,12 @@ last_sigint_time = 0.0
 SIGINT_STOP_WINDOW_SECONDS = 2.0
 stop_lock = Lock()
 
-# 鐜╁閰嶇疆鏂囦欢
+# Player configuration file.
 PLAYER_CONFIG_FILE = "players.txt"
 
-# 鐜╁鐖彇闃熷垪鍜岀姸鎬侊紙甯﹀叏灞€鍘婚噸闆嗗悎锛?
+# Player crawl queue and state (with global dedupe set).
 player_queue = queue.Queue()
-_player_set = set()          # 鐢ㄤ簬鍘婚噸
+_player_set = set()          # 用于去重
 _player_set_lock = Lock()
 player_crawl_lock = Lock()
 player_crawl_in_progress = False
@@ -196,12 +196,12 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 def get_git_commit_message():
-    """鐢熸垚 Git 鎻愪氦娑堟伅"""
+    """Build the Git commit message."""
     return datetime.now().strftime("%Y-%m-%d %H:%M updated")
 
 
 class DatabaseManager:
-    """鏁版嵁搴撹繛鎺ョ鐞嗗櫒锛堟敮鎸佸绾跨▼鐙珛杩炴帴锛?"""
+    """Database connection manager with per-thread connections."""
     _instance = None
     _lock = Lock()
 
@@ -212,7 +212,7 @@ class DatabaseManager:
         return cls._instance
 
     def get_connection(self, thread_id=None):
-        """鑾峰彇褰撳墠绾跨▼鐨勬暟鎹簱杩炴帴"""
+        """Get the database connection for current thread."""
         if thread_id is None:
             thread_id = threading.get_ident()
         with self._lock:
@@ -228,7 +228,7 @@ class DatabaseManager:
             return self.connections[thread_id]
 
     def close_connection(self, thread_id=None):
-        """鍏抽棴鎸囧畾绾跨▼鎴栨墍鏈夎繛鎺?"""
+        """Close one thread connection or all connections."""
         with self._lock:
             if thread_id is None:
                 for conn in self.connections.values():
@@ -239,7 +239,7 @@ class DatabaseManager:
                 del self.connections[thread_id]
 
     def execute_query(self, query, params=None, thread_id=None):
-        """鎵ц鍗曟潯鏌ヨ骞舵彁浜?"""
+        """Execute a single query and commit."""
         conn = self.get_connection(thread_id)
         cursor = conn.cursor()
         try:
@@ -254,7 +254,7 @@ class DatabaseManager:
             raise e
 
     def executemany_query(self, query, params_list, thread_id=None):
-        """鎵归噺鎵ц骞舵彁浜?"""
+        """Execute many statements and commit."""
         conn = self.get_connection(thread_id)
         cursor = conn.cursor()
         try:
@@ -458,67 +458,67 @@ def ensure_mm_schema(cursor: sqlite3.Cursor):
 
 
 def migrate_database():
-    """杩佺Щ鏁版嵁搴擄細涓哄悇琛ㄦ坊鍔?uid 瀛楁锛堝鏋滃皻鏈坊鍔狅級"""
+    """Migrate database: add uid columns for tables if missing."""
     db_manager = DatabaseManager()
     cursor = db_manager.get_connection().cursor()
-    logger.info("寮€濮嬫暟鎹簱杩佺Щ...")
+    logger.info("开始数据库迁移...")
     try:
-        # 妫€鏌?player_identity 琛?
+        # Check the player_identity table.
         cursor.execute("PRAGMA table_info(player_identity)")
         columns = [column[1] for column in cursor.fetchall()]
         if 'uid' not in columns:
             cursor.execute('ALTER TABLE player_identity ADD COLUMN uid TEXT')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)')
-            logger.info("宸叉坊鍔?uid 瀛楁鍒?player_identity 琛?")
+            logger.info("已添加 uid 字段到 player_identity 表")
 
         cursor.execute("PRAGMA table_info(player_aliases)")
         columns = [column[1] for column in cursor.fetchall()]
         if 'uid' not in columns:
             cursor.execute('ALTER TABLE player_aliases ADD COLUMN uid TEXT')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_aliases_uid ON player_aliases(uid)')
-            logger.info("宸叉坊鍔?uid 瀛楁鍒?player_aliases 琛?")
+            logger.info("已添加 uid 字段到 player_aliases 表")
 
         cursor.execute("PRAGMA table_info(player_rankings)")
         columns = [column[1] for column in cursor.fetchall()]
         if 'uid' not in columns:
             cursor.execute('ALTER TABLE player_rankings ADD COLUMN uid TEXT')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
-            logger.info("宸叉坊鍔?uid 瀛楁鍒?player_rankings 琛?")
+            logger.info("已添加 uid 字段到 player_rankings 表")
 
         ensure_mm_schema(cursor)
         logger.info("MM/MMR schema ensured")
 
         db_manager.get_connection().commit()
-        # 璁板綍鍙樻洿鍒?markdown 鏂囦欢
+        # Record migration changes into a markdown file.
         with open('sql_changes.md', 'w', encoding='utf-8') as f:
-            f.write("# SQL鏁版嵁搴撶粨鏋勫彉鏇磋褰昞n\n")
-            f.write("## 鐗堟湰 2.0 - 娣诲姞UID鏀寔\n\n")
-            f.write("### 鍙樻洿鍐呭\n\n")
-            f.write("1. 鍦?`player_identity` 琛ㄤ腑娣诲姞 `uid` 瀛楁\n")
-            f.write("2. 鍦?`player_aliases` 琛ㄤ腑娣诲姞 `uid` 瀛楁\n")
-            f.write("3. 鍦?`player_rankings` 琛ㄤ腑娣诲姞 `uid` 瀛楁\n")
-            f.write("4. 涓哄悇琛ㄧ殑 `uid` 瀛楁鍒涘缓绱㈠紩\n\n")
-            f.write("### SQL璇彞\n\n")
+            f.write("# SQL数据库结构变更记录\n\n")
+            f.write("## 版本 2.0 - 添加UID支持\n\n")
+            f.write("### 变更内容\n\n")
+            f.write("1. 在 `player_identity` 表中添加 `uid` 字段\n")
+            f.write("2. 在 `player_aliases` 表中添加 `uid` 字段\n")
+            f.write("3. 在 `player_rankings` 表中添加 `uid` 字段\n")
+            f.write("4. 为各表的 `uid` 字段创建索引\n\n")
+            f.write("### SQL语句\n\n")
             f.write("```sql\n")
-            f.write("-- 娣诲姞uid瀛楁\n")
+            f.write("-- 添加uid字段\n")
             f.write("ALTER TABLE player_identity ADD COLUMN uid TEXT;\n")
             f.write("ALTER TABLE player_aliases ADD COLUMN uid TEXT;\n")
             f.write("ALTER TABLE player_rankings ADD COLUMN uid TEXT;\n\n")
-            f.write("-- 鍒涘缓绱㈠紩\n")
+            f.write("-- 创建索引\n")
             f.write("CREATE INDEX idx_player_identity_uid ON player_identity(uid);\n")
             f.write("CREATE INDEX idx_player_aliases_uid ON player_aliases(uid);\n")
             f.write("CREATE INDEX idx_player_rankings_uid ON player_rankings(uid);\n")
             f.write("```\n")
-        logger.info("鏁版嵁搴撹縼绉诲畬鎴愶紝鍙樻洿宸茶褰曞埌 sql_changes.md")
+        logger.info("数据库迁移完成，变更已记录到 sql_changes.md")
         return True
     except Exception as e:
-        logger.error("鏁版嵁搴撹縼绉诲け璐? %s", e)
+        logger.error("数据库迁移失败: %s", e)
         db_manager.get_connection().rollback()
         return False
 
 
 def init_database():
-    """鍒濆鍖栨暟鎹簱锛屽垱寤烘墍鏈夎〃缁撴瀯"""
+    """Initialize database and create required table schemas."""
     db_manager = DatabaseManager()
     cursor = db_manager.get_connection().cursor()
     try:
@@ -597,7 +597,7 @@ def init_database():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
         ensure_mm_schema(cursor)
 
-        # 鍒濆鍖?import_metadata
+        # Initialize import metadata rows.
         for mode in MODES:
             cursor.execute(
                 "INSERT OR IGNORE INTO import_metadata (mode, last_import_time) VALUES (?, NULL)",
@@ -605,23 +605,23 @@ def init_database():
             )
 
         db_manager.get_connection().commit()
-        logger.info("鏁版嵁搴撳垵濮嬪寲瀹屾垚")
-        migrate_database()  # 灏濊瘯娣诲姞 uid 瀛楁锛堣嫢宸插瓨鍦ㄥ垯璺宠繃锛?
+        logger.info("数据库初始化完成")
+        migrate_database()  # 尝试添加 uid 字段（若已存在则跳过）
     except Exception as e:
-        logger.error("鏁版嵁搴撳垵濮嬪寲澶辫触: %s", e)
+        logger.error("数据库初始化失败: %s", e)
         raise
 
 
 def resolve_player_identity(name, crawl_time, uid=None):
     """
-    瑙ｆ瀽鐜╁韬唤锛屼紭鍏堜娇鐢?uid锛屽鐞嗘敼鍚嶆儏鍐点€?
-    杩斿洖 player_id銆?
+    解析玩家身份，优先使用 uid，处理改名情况。
+    返回 player_id。
     """
     db_manager = DatabaseManager()
     cursor = db_manager.get_connection().cursor()
     try:
         player_id = None
-        # 浼樺厛浣跨敤 uid 鏌ユ壘
+        # Prefer uid-based lookup first.
         if uid:
             try:
                 cursor.execute(
@@ -631,12 +631,12 @@ def resolve_player_identity(name, crawl_time, uid=None):
                 result = cursor.fetchone()
                 if result:
                     player_id = result[0]
-                    # 鏇存柊鏈€鍚庣湅瑙佹椂闂村拰褰撳墠鍚嶅瓧
+                    # Refresh last-seen timestamp and current display name.
                     cursor.execute(
                         "UPDATE player_identity SET last_seen = ?, current_name = ? WHERE player_id = ?",
                         (crawl_time, name, player_id)
                     )
-                    # 璁板綍鍒悕锛堝鏋滄湭璁板綍锛?
+                    # Insert alias record when missing.
                     cursor.execute(
                         "SELECT alias_id FROM player_aliases WHERE player_id = ? AND alias = ?",
                         (player_id, name)
@@ -653,11 +653,11 @@ def resolve_player_identity(name, crawl_time, uid=None):
                         )
             except sqlite3.OperationalError as e:
                 if "no such column: uid" in str(e):
-                    logger.warning("uid 鍒椾笉瀛樺湪锛屽洖閫€鍒板悕绉版煡鎵?")
+                    logger.warning("uid 列不存在，回退到名称查找")
                 else:
                     raise
 
-        # 濡傛灉鏈€氳繃 uid 鎵惧埌锛屽皾璇曢€氳繃鍒悕鏌ユ壘
+        # If uid lookup misses, fall back to alias lookup.
         if not player_id:
             cursor.execute(
                 "SELECT player_id FROM player_aliases WHERE alias = ?",
@@ -666,7 +666,7 @@ def resolve_player_identity(name, crawl_time, uid=None):
             result = cursor.fetchone()
             if result:
                 player_id = result[0]
-                # 濡傛灉鏈?uid锛屽垯鏇存柊 identity 鍜?aliases 琛ㄤ腑鐨?uid
+                # If uid is available, backfill uid into identity/alias tables.
                 if uid:
                     try:
                         cursor.execute(
@@ -679,7 +679,7 @@ def resolve_player_identity(name, crawl_time, uid=None):
                         )
                     except sqlite3.OperationalError as e:
                         if "no such column: uid" in str(e):
-                            logger.warning("uid 鍒椾笉瀛樺湪锛岃烦杩?uid 鏇存柊")
+                            logger.warning("uid 列不存在，跳过 uid 更新")
                         else:
                             raise
                 cursor.execute(
@@ -691,7 +691,7 @@ def resolve_player_identity(name, crawl_time, uid=None):
                     (crawl_time, name, player_id)
                 )
             else:
-                # 鍏ㄦ柊鐜╁
+                # Create a brand-new player identity.
                 cursor.execute(
                     "INSERT INTO player_identity (uid, current_name, first_seen, last_seen) VALUES (?, ?, ?, ?)",
                     (uid, name, crawl_time, crawl_time)
@@ -704,13 +704,13 @@ def resolve_player_identity(name, crawl_time, uid=None):
         db_manager.get_connection().commit()
         return player_id
     except Exception as e:
-        logger.error("瑙ｆ瀽鐜╁韬唤澶辫触: %s", e)
+        logger.error("解析玩家身份失败: %s", e)
         db_manager.get_connection().rollback()
         return None
 
 
 def link_player_aliases(original_name, new_name, change_time):
-    """鎵嬪姩鍏宠仈鐜╁鐨勪袱涓悕瀛楋紙澶勭悊鏀瑰悕锛?"""
+    """Manually link two names for one player (rename handling)."""
     db_manager = DatabaseManager()
     cursor = db_manager.get_connection().cursor()
     try:
@@ -720,7 +720,7 @@ def link_player_aliases(original_name, new_name, change_time):
         )
         result = cursor.fetchone()
         if not result:
-            logger.error("鎵句笉鍒板師濮嬪悕瀛? %s", original_name)
+            logger.error("找不到原始名字: %s", original_name)
             return False
         player_id = result[0]
 
@@ -730,7 +730,7 @@ def link_player_aliases(original_name, new_name, change_time):
         )
         result = cursor.fetchone()
         if result:
-            # 鏂板悕瀛楀凡鍏宠仈鍒板彟涓€涓?player_id锛岄渶瑕佸悎骞?
+            # New name belongs to another player_id; merge required.
             old_player_id = result[0]
             cursor.execute(
                 "UPDATE player_rankings SET player_id = ? WHERE player_id = ?",
@@ -745,7 +745,7 @@ def link_player_aliases(original_name, new_name, change_time):
                 (old_player_id,)
             )
         else:
-            # 鏂板悕瀛楁湭鍑虹幇杩囷紝鐩存帴娣诲姞鍒悕
+            # New name has not appeared before; add alias directly.
             cursor.execute(
                 "INSERT INTO player_aliases (player_id, alias, first_seen, last_seen) VALUES (?, ?, ?, ?)",
                 (player_id, new_name, change_time, change_time)
@@ -755,20 +755,20 @@ def link_player_aliases(original_name, new_name, change_time):
             (new_name, player_id)
         )
         db_manager.get_connection().commit()
-        logger.info("鎴愬姛鍏宠仈鐜╁鏀瑰悕: %s -> %s", original_name, new_name)
+        logger.info("成功关联玩家改名: %s -> %s", original_name, new_name)
         return True
     except Exception as e:
-        logger.error("澶勭悊鐜╁鏀瑰悕澶辫触: %s", e)
+        logger.error("处理玩家改名失败: %s", e)
         db_manager.get_connection().rollback()
         return False
 
 
 def parse_player_list(html):
-    """瑙ｆ瀽鎺掕姒滈〉闈紝杩斿洖鐜╁鏁版嵁鍒楄〃锛堝寘鍚帺瀹禝D锛?"""
+    """Parse leaderboard page and return player rows (with player ID)."""
     soup = BeautifulSoup(html, "html.parser")
     players = []
 
-    # 澶勭悊鍓?鍚嶏紙item-top锛?
+    # Handle top 3 entries (item-top).
     top_items = soup.select("div.item-top")
     for item in top_items:
         label_tag = item.select_one("i.label")
@@ -830,7 +830,7 @@ def parse_player_list(html):
             "pc": playcount
         })
 
-    # 澶勭悊4鍚嶅強浠ュ悗锛坉iv.item锛?
+    # Handle rank 4+ entries (div.item).
     list_items = soup.select("div.item")
     for item in list_items:
         rank_tag = item.select_one("span.rank")
@@ -872,7 +872,7 @@ def parse_player_list(html):
             "pc": playcount
         })
 
-    # 绫诲瀷杞崲涓庢竻娲?
+    # Type conversion and data cleanup.
     processed_players = []
     for p in players:
         try:
@@ -912,12 +912,12 @@ def parse_player_list(html):
 
 
 def parse_player_profile(html, player_id):
-    """瑙ｆ瀽鐜╁涓汉涓婚〉锛岃繑鍥炶鐜╁鎵€鏈夋ā寮忕殑鎺掑悕鏁版嵁"""
+    """Parse player profile page and return rankings for all modes."""
     soup = BeautifulSoup(html, "html.parser")
     player_data = []
 
     name_tag = soup.select_one("div.user_head .name span")
-    player_name = name_tag.text.strip() if name_tag else f"鐜╁_{player_id}"
+    player_name = name_tag.text.strip() if name_tag else f"玩家_{player_id}"
 
     rank_items = soup.select("div.rank .item")
     for item in rank_items:
@@ -1001,16 +1001,16 @@ def parse_player_profile(html, player_id):
                 "mode": mode
             })
         except Exception as e:
-            logger.warning("瑙ｆ瀽鐜╁ %s 妯″紡 %s 鏁版嵁鏃跺嚭閿? %s", player_id, mode, e)
+            logger.warning("解析玩家 %s 模式 %s 数据时出错: %s", player_id, mode, e)
             continue
     return player_data
 
 
 def crawl_player_profile(session, player_identifier):
-    """鐖彇鍗曚釜鐜╁鐨勪釜浜轰富椤垫暟鎹?"""
+    """Fetch one player profile page and parse ranking records."""
     try:
         if not player_identifier.isdigit():
-            logger.warning("鐜╁鏍囪瘑绗﹀繀椤绘槸鏁板瓧ID: %s", player_identifier)
+            logger.warning("玩家标识符必须是数字ID: %s", player_identifier)
             return None
         url = PLAYER_PROFILE_URL.format(player_id=player_identifier)
         resp = session.get(url, timeout=30)
@@ -1018,15 +1018,15 @@ def crawl_player_profile(session, player_identifier):
         player_data = parse_player_profile(resp.text, player_identifier)
         return player_data
     except requests.exceptions.RequestException as e:
-        logger.error("鐖彇鐜╁ %s 涓汉涓婚〉澶辫触: %s", player_identifier, e)
+        logger.error("爬取玩家 %s 个人主页失败: %s", player_identifier, e)
         return None
     except Exception as e:
-        logger.error("澶勭悊鐜╁ %s 鏁版嵁鏃跺嚭閿? %s", player_identifier, e)
+        logger.error("处理玩家 %s 数据时出错: %s", player_identifier, e)
         return None
 
 
 def get_excel_filename(mode):
-    """鏍规嵁妯″紡杩斿洖 Excel 鏂囦欢鍚?"""
+    """Return the Excel filename for the given mode."""
     if mode == 0:
         return "key.xlsx"
     elif mode == 3:
@@ -1036,13 +1036,13 @@ def get_excel_filename(mode):
 
 
 def crawl_mode_player(session, mode):
-    """鐖彇鍗曚釜妯″紡鐨勬帓琛屾鏁版嵁锛岃繑鍥?DataFrame"""
+    """Fetch one mode leaderboard and return a DataFrame."""
     url = BASE_URL.format(mode=mode)
     try:
         resp = session.get(url, timeout=30)
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error("妯″紡 %d 璇锋眰澶辫触: %s", mode, e)
+        logger.error("模式 %d 请求失败: %s", mode, e)
         return pd.DataFrame()
 
     players = parse_player_list(resp.text)
@@ -1055,9 +1055,9 @@ def crawl_mode_player(session, mode):
 
 
 def save_data_to_excel(mode, df, timestamp):
-    """淇濆瓨 DataFrame 鍒?Excel 鏂囦欢锛堜粎鍦ㄥ惎鐢?Excel 淇濆瓨鏃朵娇鐢級"""
+    """Save DataFrame to Excel (only when Excel output is enabled)."""
     if df.empty:
-        logger.warning("妯″紡 %d 鏃犳湁鏁堟暟鎹紝璺宠繃淇濆瓨", mode)
+        logger.warning("模式 %d 无有效数据，跳过保存", mode)
         return
 
     filename = get_excel_filename(mode)
@@ -1089,26 +1089,26 @@ def save_data_to_excel(mode, df, timestamp):
         if latest_sheet:
             df_prev = pd.read_excel(filename, sheet_name=latest_sheet)
             if not df_prev.empty and df_prev.equals(df):
-                logger.info("妯″紡 %d 鏁版嵁鏈彉鍖栵紝璺宠繃淇濆瓨", mode)
+                logger.info("模式 %d 数据未变化，跳过保存", mode)
                 return
 
         sub_sheet_name = f"{sheet_name}_{timestamp.strftime('%Y-%m-%d_%H-%M')}"
         with pd.ExcelWriter(filename, engine='openpyxl', mode='a') as writer:
             df.to_excel(writer, sheet_name=sub_sheet_name, index=False)
-        logger.info("妯″紡 %d 鏁版嵁淇濆瓨鍒?%s -> %s", mode, filename, sub_sheet_name)
+        logger.info("模式 %d 数据保存到 %s -> %s", mode, filename, sub_sheet_name)
     except Exception as e:
-        logger.exception("淇濆瓨妯″紡 %d 鏁版嵁鍒癊xcel澶辫触", mode)
+        logger.exception("保存模式 %d 数据到Excel失败", mode)
 
 
 def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time, source):
     """
-    鍖洪棿妯″瀷鎺掕姒滀繚瀛橈紙缁熶竴澶勭悊鎵€鏈夋潵婧愶級銆?
-    杩斿洖鍊硷細
-        'new'          : 棣栨鎻掑叆
-        'diff_insert'  : 鐘舵€佸彉鍖栵紝鎻掑叆鏂?start
-        'update'       : 寤堕暱 end
-        'same_insert'  : 鎻掑叆 end
-        'update_fill'  : 濉厖 lv
+    区间模型排行榜保存（统一处理所有来源）。
+    返回值：
+        'new'          : 首次插入
+        'diff_insert'  : 状态变化，插入新 start
+        'update'       : 延长 end
+        'same_insert'  : 插入 end
+        'update_fill'  : 填充 lv
     """
     db_manager = DatabaseManager()
     conn = db_manager.get_connection()
@@ -1116,7 +1116,7 @@ def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, c
 
     current_core = (rank, name, exp, acc, combo, pc)
 
-    # 鍙彇鏈€鏂颁袱鏉?
+    # Load only the latest two rows for interval-state comparison.
     cursor.execute('''
         SELECT id, rank, name, lv, exp, acc, combo, pc, crawl_time
         FROM player_rankings
@@ -1127,7 +1127,7 @@ def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, c
 
     rows = cursor.fetchall()
 
-    # 娌℃湁璁板綍 鈫?start
+    # No history yet -> insert the first start record.
     if not rows:
         cursor.execute('''
             INSERT INTO player_rankings
@@ -1137,12 +1137,12 @@ def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, c
         conn.commit()
         return 'new'
 
-    # 鏈€鏂拌褰?
+    # Latest stored record.
     last = rows[0]
     last_id, last_rank, last_name, last_lv, last_exp, last_acc, last_combo, last_pc, last_time = last
     last_core = (last_rank, last_name, last_exp, last_acc, last_combo, last_pc)
 
-    # 鍒ゆ柇鏄惁宸叉湁 end锛堜袱鏉＄浉鍚岋級
+    # Determine whether an end marker already exists (latest two rows equal).
     has_two_same = False
     if len(rows) == 2:
         second = rows[1]
@@ -1150,17 +1150,21 @@ def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, c
         if second_core == last_core:
             has_two_same = True
 
-    # 鐘舵€佺浉鍚?
+    # Current core fields are identical to latest state.
     if last_core == current_core:
+        # Guard against legacy/source bug: lv may temporarily bounce to 0 even when
+        # other core fields are unchanged. Keep the known non-zero lv in this case.
+        if last_lv and last_lv > 0 and (lv is None or lv == 0):
+            lv = last_lv
 
-        # lv 琛ュ叏
+        # Backfill lv only when previous lv is missing (0).
         if last_lv == 0 and lv != 0:
             cursor.execute('UPDATE player_rankings SET lv = ?, crawl_time = ? WHERE id = ?', (lv, crawl_time, last_id))
             conn.commit()
             return 'update_fill'
 
         if not has_two_same:
-            # 鎻掑叆 end
+            # Insert a new end record for unchanged status.
             cursor.execute('''
                 INSERT INTO player_rankings
                 (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
@@ -1169,12 +1173,12 @@ def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, c
             conn.commit()
             return 'same_insert'
         else:
-            # 寤堕暱 end
+            # Extend end by updating latest crawl_time only.
             cursor.execute('UPDATE player_rankings SET crawl_time = ? WHERE id = ?', (crawl_time, last_id))
             conn.commit()
             return 'update'
 
-    # 鐘舵€佸彉鍖?鈫?鏂?start
+    # State changed -> start a new interval segment.
     cursor.execute('''
         INSERT INTO player_rankings
         (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
@@ -1200,7 +1204,7 @@ def save_player_ranking_mm_record(
     source: str,
 ) -> str:
     """
-    MM 鎺掕鍖洪棿妯″瀷淇濆瓨銆?
+    MM 排行区间模型保存。
     """
     db_manager = DatabaseManager()
     conn = db_manager.get_connection()
@@ -1624,8 +1628,8 @@ def fetch_player_mmr_from_page(session: requests.Session, uid: str) -> List[Dict
         if mode < 0:
             continue
         text = item.get_text(" ", strip=True)
-        mmr_match = re.search(r"(?:MMR|MM|Grade)[\s:锛?]*([0-9,]+)", text, re.IGNORECASE)
-        rank_match = re.search(r"(?:MMRank|GradeRank)[\s:锛?]*#?([0-9,]+)", text, re.IGNORECASE)
+        mmr_match = re.search(r"(?:MMR|MM|Grade)[\s:：]*([0-9,]+)", text, re.IGNORECASE)
+        rank_match = re.search(r"(?:MMRank|GradeRank)[\s:：]*#?([0-9,]+)", text, re.IGNORECASE)
         if not mmr_match:
             continue
         rows.append(
@@ -1662,7 +1666,7 @@ def get_recent_mm_tracked_uids(limit_per_mode: int = DEFAULT_MM_LIMIT) -> Set[st
 
 def get_recent_exp_tracked_uids(limit_per_mode: int = DEFAULT_MM_LIMIT) -> Set[str]:
     """
-    浠庢渶鏂?EXP 姒滄寜妯″紡鎻愬彇 topN uid锛岀敤浜庤ˉ鍏呴潪 MM 姒滅帺瀹剁殑 MMR 鎶撳彇鑼冨洿銆?    """
+    Extract top-N UIDs from latest EXP ranking per mode to expand MMR fetch coverage for non-MM players."""
     db_manager = DatabaseManager()
     conn = db_manager.get_connection()
     cursor = conn.cursor()
@@ -1886,7 +1890,7 @@ def run_mm_sync_cycle(
                 uid_list = filtered
             total_users = len(uid_list)
             logger.info("MMR sync start: users=%d", total_users)
-            mmr_iter = tqdm(uid_list, desc="MMR鎶撳彇", unit="鐜╁") if HAS_TQDM else uid_list
+            mmr_iter = tqdm(uid_list, desc="MMR抓取", unit="玩家") if HAS_TQDM else uid_list
             for idx, uid in enumerate(mmr_iter, start=1):
                 if is_stop_requested():
                     logger.info("Stop requested, interrupt MMR crawl.")
@@ -1985,7 +1989,7 @@ def run_mm_sync_cycle(
 
 
 def save_to_database(mode, df, crawl_time):
-    """灏?DataFrame 涓殑鎺掕姒滄暟鎹€愭潯鏅鸿兘淇濆瓨鍒版暟鎹簱锛屽苟鎵撳嵃缁熻"""
+    """Smart-save leaderboard rows from DataFrame and print operation stats."""
     if df.empty:
         return
 
@@ -2006,24 +2010,24 @@ def save_to_database(mode, df, crawl_time):
                 combo=row['combo'],
                 pc=row['pc'],
                 crawl_time=crawl_time,
-                source='leaderboard'  # 鎺掕姒滄暟鎹?
+                source='leaderboard'  # 排行榜数据
             )
             stats[op] += 1
 
     total = sum(stats.values())
-    msg = (f"妯″紡 {mode} 鏁版嵁澶勭悊瀹屾垚: 鎬昏 {total} 鏉?| "
-           f"{colorize('棣栨', '92')}: {stats['new']} | "
-           f"{colorize('鍙樺寲鎻掑叆', '93')}: {stats['diff_insert']} | "
-           f"{colorize('鐩稿悓鎻掑叆', '94')}: {stats['same_insert']} | "
-           f"{colorize('鏃堕棿鏇存柊', '95')}: {stats['update']} | "
-           f"{colorize('LV濉厖', '96')}: {stats['update_fill']}")
+    msg = (f"模式 {mode} 数据处理完成: 总计 {total} 条 | "
+           f"{colorize('首次', '92')}: {stats['new']} | "
+           f"{colorize('变化插入', '93')}: {stats['diff_insert']} | "
+           f"{colorize('相同插入', '94')}: {stats['same_insert']} | "
+           f"{colorize('时间更新', '95')}: {stats['update']} | "
+           f"{colorize('LV填充', '96')}: {stats['update_fill']}")
     print(msg)
-    logger.info("妯″紡 %d 鏁版嵁缁熻: new=%d, diff=%d, same=%d, update=%d, fill=%d",
+    logger.info("模式 %d 数据统计: new=%d, diff=%d, same=%d, update=%d, fill=%d",
                 mode, stats['new'], stats['diff_insert'], stats['same_insert'], stats['update'], stats['update_fill'])
 
 
 def save_player_profile_to_database(player_data, crawl_time, player_identifier):
-    """灏嗙帺瀹朵釜浜轰富椤电殑鎺掑悕鏁版嵁閫愭潯鏅鸿兘淇濆瓨鍒版暟鎹簱锛屽苟鏇存柊鐖彇鐘舵€?"""
+    """Smart-save player profile ranking rows and update crawl status."""
     if not player_data:
         return False
 
@@ -2049,12 +2053,12 @@ def save_player_profile_to_database(player_data, crawl_time, player_identifier):
                     combo=data['combo'],
                     pc=data['pc'],
                     crawl_time=crawl_time,
-                    source='profile'  # 涓汉椤垫暟鎹?
+                    source='profile'  # 个人页数据
                 )
                 stats[op] += 1
                 success = True
 
-        # 鏇存柊鐖彇鐘舵€?
+        # Update crawl status after processing this player.
         cursor.execute('''
             INSERT OR REPLACE INTO player_crawl_status
             (player_identifier, last_crawled, crawl_count, success_count, last_error)
@@ -2066,20 +2070,20 @@ def save_player_profile_to_database(player_data, crawl_time, player_identifier):
         conn.commit()
 
         total = sum(stats.values())
-        msg = (f"鐜╁ {player_identifier} 鏁版嵁澶勭悊瀹屾垚: 鎬昏 {total} 鏉?| "
-               f"{colorize('棣栨', '92')}: {stats['new']} | "
-               f"{colorize('鍙樺寲鎻掑叆', '93')}: {stats['diff_insert']} | "
-               f"{colorize('鐩稿悓鎻掑叆', '94')}: {stats['same_insert']} | "
-               f"{colorize('鏃堕棿鏇存柊', '95')}: {stats['update']} | "
-               f"{colorize('LV濉厖', '96')}: {stats['update_fill']}")
+        msg = (f"玩家 {player_identifier} 数据处理完成: 总计 {total} 条 | "
+               f"{colorize('首次', '92')}: {stats['new']} | "
+               f"{colorize('变化插入', '93')}: {stats['diff_insert']} | "
+               f"{colorize('相同插入', '94')}: {stats['same_insert']} | "
+               f"{colorize('时间更新', '95')}: {stats['update']} | "
+               f"{colorize('LV填充', '96')}: {stats['update_fill']}")
         print(msg)
-        logger.info("鐜╁ %s 鏁版嵁缁熻: new=%d, diff=%d, same=%d, update=%d, fill=%d",
+        logger.info("玩家 %s 数据统计: new=%d, diff=%d, same=%d, update=%d, fill=%d",
                     player_identifier, stats['new'], stats['diff_insert'], stats['same_insert'], stats['update'], stats['update_fill'])
         return success
 
     except Exception as e:
-        logger.error("淇濆瓨鐜╁ %s 鏁版嵁鍒版暟鎹簱澶辫触: %s", player_identifier, e)
-        # 璁板綍澶辫触鐘舵€?
+        logger.error("保存玩家 %s 数据到数据库失败: %s", player_identifier, e)
+        # Persist failed crawl status for this player.
         cursor.execute('''
             INSERT OR REPLACE INTO player_crawl_status
             (player_identifier, last_crawled, crawl_count, success_count, last_error)
@@ -2093,7 +2097,7 @@ def save_player_profile_to_database(player_data, crawl_time, player_identifier):
 
 
 def check_excel_file_integrity(filename):
-    """妫€鏌?Excel 鏂囦欢鏄惁瀹屾暣鍙敤"""
+    """Check whether an Excel file is structurally valid and readable."""
     try:
         if not os.path.exists(filename):
             return False
@@ -2106,17 +2110,17 @@ def check_excel_file_integrity(filename):
         wb.close()
         return bool(sheetnames)
     except Exception as e:
-        logger.warning("Excel鏂囦欢瀹屾暣鎬ф鏌ュけ璐? %s - %s", filename, e)
+        logger.warning("Excel文件完整性检查失败: %s - %s", filename, e)
         return False
 
 
 def repair_excel_file(filename):
-    """灏濊瘯淇鎹熷潖鐨?Excel 鏂囦欢"""
+    """Attempt to repair a corrupted Excel file."""
     try:
         backup_name = f"{filename}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         import shutil
         shutil.copy2(filename, backup_name)
-        logger.info("宸插垱寤哄浠芥枃浠? %s", backup_name)
+        logger.info("已创建备份文件: %s", backup_name)
 
         try:
             xl = pd.ExcelFile(filename)
@@ -2124,25 +2128,25 @@ def repair_excel_file(filename):
                 for sheet_name in xl.sheet_names:
                     df = pd.read_excel(filename, sheet_name=sheet_name)
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
-            logger.info("鎴愬姛淇Excel鏂囦欢: %s", filename)
+            logger.info("成功修复Excel文件: %s", filename)
             return True
         except Exception as e:
-            logger.error("浣跨敤pandas淇澶辫触: %s", e)
+            logger.error("使用pandas修复失败: %s", e)
             try:
                 wb = load_workbook(filename)
                 wb.save(filename)
-                logger.info("浣跨敤openpyxl淇鎴愬姛: %s", filename)
+                logger.info("使用openpyxl修复成功: %s", filename)
                 return True
             except Exception as e2:
-                logger.error("浣跨敤openpyxl淇涔熷け璐? %s", e2)
+                logger.error("使用openpyxl修复也失败: %s", e2)
                 return False
     except Exception as e:
-        logger.error("淇Excel鏂囦欢杩囩▼涓彂鐢熼敊璇? %s", e)
+        logger.error("修复Excel文件过程中发生错误: %s", e)
         return False
 
 
 def import_mode_data(mode):
-    """瀵煎叆鍗曚釜妯″紡鐨勫巻鍙叉暟鎹紙浠?Excel 鍒版暟鎹簱锛?"""
+    """Import one mode historical data from Excel into database."""
     global stop_requested
 
     thread_id = threading.get_ident()
@@ -2158,15 +2162,15 @@ def import_mode_data(mode):
 
     filename = get_excel_filename(mode)
     if not os.path.exists(filename):
-        logger.warning("妯″紡 %d 鐨凟xcel鏂囦欢涓嶅瓨鍦? %s", mode, filename)
+        logger.warning("模式 %d 的Excel文件不存在: %s", mode, filename)
         return 0
 
     if not check_excel_file_integrity(filename):
-        logger.warning("妯″紡 %d 鐨凟xcel鏂囦欢鍙兘宸叉崯鍧? %s", mode, filename)
+        logger.warning("模式 %d 的Excel文件可能已损坏: %s", mode, filename)
         if repair_excel_file(filename):
-            logger.info("鏂囦欢淇鎴愬姛锛岀户缁鍏?")
+            logger.info("文件修复成功，继续导入")
         else:
-            logger.error("鏂囦欢淇澶辫触锛岃烦杩囨ā寮?%d", mode)
+            logger.error("文件修复失败，跳过模式 %d", mode)
             return 0
 
     cursor = conn.cursor()
@@ -2181,12 +2185,12 @@ def import_mode_data(mode):
         xl = pd.ExcelFile(filename)
         sheet_names = xl.sheet_names
     except Exception as e:
-        logger.error("鎵撳紑Excel鏂囦欢澶辫触: %s", e)
+        logger.error("打开Excel文件失败: %s", e)
         try:
             wb = load_workbook(filename)
             sheet_names = wb.sheetnames
         except Exception as e2:
-            logger.error("涓ょ鏂瑰紡閮芥棤娉曟墦寮€Excel鏂囦欢: %s", e2)
+            logger.error("两种方式都无法打开Excel文件: %s", e2)
             return 0
 
     sheet_names = [s for s in sheet_names if s.startswith(f"mode_{mode}_")]
@@ -2205,14 +2209,14 @@ def import_mode_data(mode):
     if HAS_TQDM:
         mode_pbar = tqdm(
             sheet_times,
-            desc=f"妯″紡 {mode}",
+            desc=f"模式 {mode}",
             position=mode + 1,
             leave=False,
             unit="row"
         )
     else:
         mode_pbar = sheet_times
-        print(f"寮€濮嬪鐞嗘ā寮?{mode}锛屽叡 {len(sheet_times)} 涓〃...")
+        print(f"开始处理模式 {mode}，共 {len(sheet_times)} 个表...")
 
     imported_count = 0
     batch_size = 50
@@ -2267,10 +2271,10 @@ def import_mode_data(mode):
                 conn.commit()
 
             if HAS_TQDM:
-                mode_pbar.set_postfix_str(f"宸插鍏? {imported_count}")
+                mode_pbar.set_postfix_str(f"已导入 {imported_count}")
 
         except Exception as e:
-            logger.error("瀵煎叆妯″紡 %d 琛?%s 鏃跺嚭閿? %s", mode, sheet_name, e)
+            logger.error("导入模式 %d 表 %s 时出错: %s", mode, sheet_name, e)
             conn.rollback()
             continue
 
@@ -2296,43 +2300,43 @@ def import_mode_data(mode):
 
 
 def import_historical_data():
-    """浠庢墍鏈夋ā寮忕殑 Excel 鏂囦欢瀵煎叆鍘嗗彶鏁版嵁鍒版暟鎹簱"""
+    """Import historical data from all mode Excel files into database."""
     if HAS_TQDM:
-        main_pbar = tqdm(total=len(MODES), desc="鎬讳綋杩涘害", position=0)
+        main_pbar = tqdm(total=len(MODES), desc="总体进度", position=0)
     else:
-        print("寮€濮嬪鍏ュ巻鍙叉暟鎹?..")
+        print("开始导入历史数据...")
 
     for mode in MODES:
         try:
             result = import_mode_data(mode)
             if HAS_TQDM:
                 main_pbar.update(1)
-                main_pbar.set_postfix_str(f"妯″紡 {mode} 瀹屾垚: {result} 鏉¤褰?")
+                main_pbar.set_postfix_str(f"模式 {mode} 完成: {result} 条记录")
             else:
-                print(f"妯″紡 {mode} 瀹屾垚: {result} 鏉¤褰?")
+                print(f"模式 {mode} 完成: {result} 条记录")
         except Exception as e:
-            logger.error("妯″紡 %d 瀵煎叆澶辫触: %s", mode, e)
+            logger.error("模式 %d 导入失败: %s", mode, e)
             if HAS_TQDM:
                 main_pbar.update(1)
-                main_pbar.set_postfix_str(f"妯″紡 {mode} 澶辫触: {e}")
+                main_pbar.set_postfix_str(f"模式 {mode} 失败: {e}")
             else:
-                print(f"妯″紡 {mode} 澶辫触: {e}")
+                print(f"模式 {mode} 失败: {e}")
 
     if HAS_TQDM:
         main_pbar.close()
 
     if not HAS_TQDM:
-        print("鍘嗗彶鏁版嵁瀵煎叆瀹屾垚")
+        print("历史数据导入完成")
 
 
 def load_player_config():
-    """鍔犺浇鐜╁閰嶇疆鏂囦欢 players.txt锛岃繑鍥炵帺瀹禝D鍒楄〃"""
+    """Load players.txt and return configured player IDs."""
     players = []
     if not os.path.exists(PLAYER_CONFIG_FILE):
-        logger.info("鐜╁閰嶇疆鏂囦欢涓嶅瓨鍦紝鍒涘缓绌烘枃浠? %s", PLAYER_CONFIG_FILE)
+        logger.info("玩家配置文件不存在，创建空文件: %s", PLAYER_CONFIG_FILE)
         with open(PLAYER_CONFIG_FILE, 'w', encoding='utf-8') as f:
-            f.write("# 姣忚涓€涓帺瀹禝D锛堝繀椤绘槸鏁板瓧锛塡n")
-            f.write("# 渚嬪:\n")
+            f.write("# 每行一个玩家ID（必须是数字）\n")
+            f.write("# 例如:\n")
             f.write("# 923177\n")
             f.write("# 123456\n")
         return players
@@ -2345,12 +2349,12 @@ def load_player_config():
         logger.info("Loaded %d players from config file.", len(players))
         return players
     except Exception as e:
-        logger.error("鍔犺浇鐜╁閰嶇疆鏂囦欢澶辫触: %s", e)
+        logger.error("加载玩家配置文件失败: %s", e)
         return []
 
 
 def add_players_to_queue(players):
-    """灏嗙帺瀹舵坊鍔犲埌鐖彇闃熷垪锛岃嚜鍔ㄥ幓閲?"""
+    """Add players into crawl queue with deduplication."""
     added = 0
     with _player_set_lock:
         for player in players:
@@ -2363,7 +2367,7 @@ def add_players_to_queue(players):
 
 
 def get_players_from_leaderboard(df_list):
-    """浠庢帓琛屾鏁版嵁涓彁鍙栨墍鏈夌帺瀹禝D锛堝幓閲嶏級"""
+    """Extract all unique player IDs from leaderboard DataFrames."""
     players = set()
     for df in df_list:
         if not df.empty and 'player_id' in df.columns:
@@ -2374,17 +2378,17 @@ def get_players_from_leaderboard(df_list):
 
 
 def run_player_crawler():
-    """杩愯鐜╁涓汉涓婚〉鐖彇鍣紙鍚屾鎵ц锛?"""
+    """Run player profile crawler synchronously."""
     global player_crawl_in_progress, last_player_crawl_time
 
     with player_crawl_lock:
         if player_crawl_in_progress:
-            logger.info("鐜╁鐖彇鍣ㄥ凡鍦ㄨ繍琛岋紝璺宠繃")
+            logger.info("玩家爬取器已在运行，跳过")
             return
         player_crawl_in_progress = True
 
     try:
-        logger.info("寮€濮嬬帺瀹朵釜浜轰富椤电埇鍙栧懆鏈?")
+        logger.info("开始玩家个人主页爬取周期")
         last_player_crawl_time = datetime.now()
 
         session = requests.Session()
@@ -2395,18 +2399,18 @@ def run_player_crawler():
         with _player_set_lock:
             total_players = len(_player_set)
         if total_players == 0:
-            logger.info("鐖彇闃熷垪涓虹┖锛岃烦杩?")
+            logger.info("爬取队列为空，跳过")
             return
 
-        logger.info("寮€濮嬬埇鍙?%d 涓帺瀹剁殑涓汉涓婚〉鏁版嵁", total_players)
+        logger.info("开始爬取 %d 个玩家的个人主页数据", total_players)
 
         successful_crawls = 0
         failed_crawls = 0
 
         if HAS_TQDM:
-            pbar = tqdm(total=total_players, desc="鐜╁涓婚〉鐖彇", unit="鐜╁")
+            pbar = tqdm(total=total_players, desc="玩家主页爬取", unit="玩家")
         else:
-            print(f"寮€濮嬬埇鍙?{total_players} 涓帺瀹剁殑涓汉涓婚〉鏁版嵁...")
+            print(f"开始爬取 {total_players} 个玩家的个人主页数据...")
 
         while True:
             if is_stop_requested():
@@ -2436,7 +2440,7 @@ def run_player_crawler():
                     failed_crawls += 1
 
                 if HAS_TQDM:
-                    pbar.set_postfix_str(f"???: {successful_crawls}, ???: {failed_crawls}")
+                    pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
 
                 time.sleep(3)
 
@@ -2444,7 +2448,7 @@ def run_player_crawler():
                 logger.error("Error while processing player %s: %s", player_identifier, e)
                 failed_crawls += 1
                 if HAS_TQDM:
-                    pbar.set_postfix_str(f"???: {successful_crawls}, ???: {failed_crawls}")
+                    pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
             finally:
                 if HAS_TQDM:
                     _ = pbar.update(1)
@@ -2453,20 +2457,20 @@ def run_player_crawler():
         if HAS_TQDM:
             pbar.close()
 
-        logger.info("鐜╁涓汉涓婚〉鐖彇瀹屾垚: 鎴愬姛 %d, 澶辫触 %d", successful_crawls, failed_crawls)
+        logger.info("玩家个人主页爬取完成: 成功 %d, 失败 %d", successful_crawls, failed_crawls)
 
     except Exception as e:
-        logger.error("鐜╁鐖彇鍛ㄦ湡鍙戠敓閿欒: %s", e)
+        logger.error("玩家爬取周期发生错误: %s", e)
     finally:
         with player_crawl_lock:
             player_crawl_in_progress = False
 
 
 def git_check_updates():
-    """妫€鏌ヨ繙绋?Git 浠撳簱鏄惁鏈夋洿鏂帮紙浠呮娴?.db 鍜?.xlsx 鏂囦欢锛?"""
+    """Check remote Git repo updates for .db/.xlsx data files only."""
     try:
         if not os.path.exists(os.path.join(GIT_REPO_PATH, '.git')):
-            logger.info("褰撳墠鐩綍涓嶆槸Git浠撳簱锛岃烦杩嘒it鏇存柊妫€鏌?")
+            logger.info("当前目录不是Git仓库，跳过Git更新检查")
             return False
 
         original_cwd = os.getcwd()
@@ -2474,13 +2478,13 @@ def git_check_updates():
 
         result = subprocess.run(["git", "remote", "-v"], capture_output=True, text=True)
         if not result.stdout.strip():
-            logger.info("鏈厤缃瓽it杩滅▼浠撳簱锛岃烦杩囨洿鏂版鏌?")
+            logger.info("未配置Git远程仓库，跳过更新检查")
             os.chdir(original_cwd)
             return False
 
         result = subprocess.run(["git", "fetch", "origin"], capture_output=True, text=True)
         if result.returncode != 0:
-            logger.warning("Git fetch澶辫触: %s", result.stderr)
+            logger.warning("Git fetch失败: %s", result.stderr)
             os.chdir(original_cwd)
             return False
 
@@ -2493,65 +2497,65 @@ def git_check_updates():
 
         if result.stdout.strip():
             updated_files = result.stdout.strip().split('\n')
-            logger.info("鍙戠幇杩滅▼鏇存柊鏂囦欢: %s", updated_files)
+            logger.info("发现远程更新文件: %s", updated_files)
             return True
         else:
-            logger.info("杩滅▼浠撳簱娌℃湁.db鎴?xlsx鏂囦欢鐨勬洿鏂?")
+            logger.info("远程仓库没有 .db 或 xlsx 文件的更新")
             return False
 
     except subprocess.CalledProcessError as e:
-        logger.warning("Git妫€鏌ユ洿鏂板け璐? %s", e)
+        logger.warning("Git检查更新失败: %s", e)
         return False
     except Exception as e:
-        logger.warning("Git妫€鏌ユ洿鏂板彂鐢熸剰澶栭敊璇? %s", e)
+        logger.warning("Git检查更新发生意外错误: %s", e)
         return False
 
 
 def git_pull_data_files():
-    """浠庤繙绋?Git 浠撳簱鎷夊彇鏁版嵁鏂囦欢锛堢敤鎴蜂氦浜掔‘璁わ級"""
+    """Pull data files from remote Git repo with interactive confirmation."""
     try:
         if not os.path.exists(os.path.join(GIT_REPO_PATH, '.git')):
-            logger.info("褰撳墠鐩綍涓嶆槸Git浠撳簱锛岃烦杩嘒it鎷夊彇")
+            logger.info("当前目录不是Git仓库，跳过Git拉取")
             return False
 
         print("\n" + "="*60)
-        print("妫€娴嬪埌杩滅▼浠撳簱鏈夋洿鏂帮紒")
-        print("鏇存柊鏂囦欢鍖呮嫭: catch.xlsx, key.xlsx, malody_rankings.db 绛夋暟鎹枃浠?")
-        print("杩欎簺鏇存柊灏嗚鐩栨偍鏈湴鐨勬暟鎹枃浠躲€?")
+        print("检测到远程仓库有更新！")
+        print("更新文件包括: catch.xlsx, key.xlsx, malody_rankings.db 等数据文件")
+        print("这些更新将覆盖您本地的数据文件。")
         print("="*60)
-        print("鎮ㄦ湁10绉掓椂闂村喅瀹氭槸鍚︽媺鍙栨洿鏂帮細")
-        print("  - 杈撳叆 'y' 鎴?'yes' 纭鎷夊彇")
-        print("  - 杈撳叆 'n' 鎴?'no' 璺宠繃鎷夊彇")
-        print("  - 10绉掑唴鏃犲搷搴斿皢鑷姩璺宠繃")
+        print("您有10秒时间决定是否拉取更新：")
+        print("  - 输入 'y' 或 'yes' 确认拉取")
+        print("  - 输入 'n' 或 'no' 跳过拉取")
+        print("  - 10秒内无响应将自动跳过")
         print("="*60)
 
         try:
             import select
             import sys
-            print("璇风‘璁ゆ槸鍚︽媺鍙栨洿鏂?(y/n, 10绉掕秴鏃?: ", end='', flush=True)
+            print("请确认是否拉取更新 (y/n, 10秒超时): ", end='', flush=True)
             start_time = time.time()
             while time.time() - start_time < 10:
                 if select.select([sys.stdin], [], [], 0.1)[0]:
                     user_input = sys.stdin.readline().strip().lower()
                     if user_input in ['y', 'yes']:
-                        print("纭鎷夊彇鏇存柊...")
+                        print("确认拉取更新...")
                         break
                     elif user_input in ['n', 'no']:
-                        print("璺宠繃鎷夊彇鏇存柊銆?")
+                        print("跳过拉取更新。")
                         return False
                     else:
-                        print("鏃犳晥杈撳叆锛岃杈撳叆 y 鎴?n: ", end='', flush=True)
+                        print("无效输入，请输入 y 或 n: ", end='', flush=True)
                 time.sleep(0.1)
             else:
-                print("\n10绉掕秴鏃讹紝鑷姩璺宠繃鎷夊彇鏇存柊銆?")
+                print("\n10秒超时，自动跳过拉取更新。")
                 return False
         except ImportError:
-            print("璇风‘璁ゆ槸鍚︽媺鍙栨洿鏂?(y/n, 10绉掕秴鏃?: ", end='', flush=True)
+            print("请确认是否拉取更新 (y/n, 10秒超时): ", end='', flush=True)
             user_input = input()
             if user_input.lower() in ['y', 'yes']:
-                print("纭鎷夊彇鏇存柊...")
+                print("确认拉取更新...")
             else:
-                print("璺宠繃鎷夊彇鏇存柊銆?")
+                print("跳过拉取更新。")
                 return False
 
         original_cwd = os.getcwd()
@@ -2563,6 +2567,7 @@ def git_pull_data_files():
         files_to_pull = [f for f in excel_files if os.path.exists(f)]
         files_to_pull.append(DB_FILE)
 
+        # Pull data files one-by-one from origin/main so code files remain untouched.
         success = True
         for file in files_to_pull:
             result = subprocess.run(
@@ -2570,30 +2575,30 @@ def git_pull_data_files():
                 capture_output=True, text=True
             )
             if result.returncode == 0:
-                logger.info("宸叉媺鍙栨枃浠? %s", file)
+                logger.info("已拉取文件: %s", file)
             else:
-                logger.warning("鎷夊彇鏂囦欢 %s 澶辫触: %s", file, result.stderr)
+                logger.warning("拉取文件 %s 失败: %s", file, result.stderr)
                 success = False
 
         os.chdir(original_cwd)
         return success
     except subprocess.CalledProcessError as e:
-        logger.warning("Git鎷夊彇鏂囦欢澶辫触: %s", e)
+        logger.warning("Git拉取文件失败: %s", e)
         return False
     except Exception as e:
-        logger.warning("Git鎷夊彇鏂囦欢鍙戠敓鎰忓閿欒: %s", e)
+        logger.warning("Git拉取文件发生意外错误: %s", e)
         return False
 
 
 def git_add_commit_push(has_changes=True):
-    """鑷姩娣诲姞銆佹彁浜ゅ拰鎺ㄩ€?Git 鏇存敼"""
+    """Auto add/commit/push Git changes."""
     if not has_changes:
-        logger.info("鎵€鏈夋ā寮忓潎鏃犳暟鎹彉鍖栵紝璺宠繃Git鎺ㄩ€?")
+        logger.info("所有模式均无数据变化，跳过Git推送")
         return True
 
     try:
         if not os.path.exists(os.path.join(GIT_REPO_PATH, '.git')):
-            logger.info("褰撳墠鐩綍涓嶆槸Git浠撳簱锛岃烦杩嘒it鎺ㄩ€?")
+            logger.info("当前目录不是Git仓库，跳过Git推送")
             return True
 
         original_cwd = os.getcwd()
@@ -2601,7 +2606,7 @@ def git_add_commit_push(has_changes=True):
 
         result = subprocess.run(["git", "remote", "-v"], capture_output=True, text=True)
         if not result.stdout.strip():
-            logger.info("鏈厤缃瓽it杩滅▼浠撳簱锛岃烦杩囨帹閫?")
+            logger.info("未配置Git远程仓库，跳过推送")
             os.chdir(original_cwd)
             return True
 
@@ -2612,42 +2617,42 @@ def git_add_commit_push(has_changes=True):
         for file in files_to_add:
             result = subprocess.run(["git", "add", file], capture_output=True, text=True)
             if result.returncode != 0:
-                logger.warning("娣诲姞鏂囦欢 %s 澶辫触: %s", file, result.stderr)
+                logger.warning("添加文件 %s 失败: %s", file, result.stderr)
 
         result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
         if not result.stdout.strip():
-            logger.info("娌℃湁鏂囦欢鏇存敼锛岃烦杩嘒it鎻愪氦")
+            logger.info("没有文件更改，跳过Git提交")
             os.chdir(original_cwd)
             return True
 
         result = subprocess.run(["git", "commit", "-m", GIT_COMMIT_MESSAGE], capture_output=True, text=True)
         if result.returncode == 0:
-            logger.info("Git鎻愪氦鎴愬姛: %s", GIT_COMMIT_MESSAGE)
+            logger.info("Git提交成功: %s", GIT_COMMIT_MESSAGE)
         else:
-            logger.warning("Git鎻愪氦澶辫触: %s", result.stderr)
+            logger.warning("Git提交失败: %s", result.stderr)
             os.chdir(original_cwd)
             return False
 
         result = subprocess.run(["git", "push"], capture_output=True, text=True)
         if result.returncode == 0:
-            logger.info("Git鎺ㄩ€佹垚鍔?")
+            logger.info("Git推送成功")
             success = True
         else:
-            logger.warning("Git鎺ㄩ€佸け璐? %s", result.stderr)
+            logger.warning("Git推送失败: %s", result.stderr)
             success = False
 
         os.chdir(original_cwd)
         return success
     except subprocess.CalledProcessError as e:
-        logger.warning("Git鎿嶄綔澶辫触: %s", e)
+        logger.warning("Git操作失败: %s", e)
         return False
     except Exception as e:
-        logger.warning("Git鎿嶄綔鍙戠敓鎰忓閿欒: %s", e)
+        logger.warning("Git操作发生意外错误: %s", e)
         return False
 
 
 def check_data_changed(mode, df):
-    """妫€鏌ュ綋鍓嶆暟鎹笌鏈€鏂扮殑 Excel 琛ㄦ槸鍚︾浉鍚岋紙鐢ㄤ簬鍐冲畾鏄惁淇濆瓨 Excel锛?"""
+    """Check whether current data equals latest Excel snapshot."""
     filename = get_excel_filename(mode)
     sheet_name = f"mode_{mode}"
 
@@ -2680,7 +2685,7 @@ def check_data_changed(mode, df):
             if not df_prev.empty and df_prev.equals(df):
                 return False
     except Exception as e:
-        logger.error("妫€鏌ユ暟鎹彉鍖栨椂鍑洪敊: %s", e)
+        logger.error("检查数据变化时出错: %s", e)
         return True
 
     return True
@@ -2699,36 +2704,36 @@ def run_crawler_cycle(
     ranking_limit=DEFAULT_MM_LIMIT,
 ):
     """
-    杩愯涓€涓埇鍙栧懆鏈熴€?
+    运行一个爬取周期。
 
     Args:
-        crawl_players: 鏄惁鍚姩鐜╁鐖櫕锛堟秷璐归槦鍒椾腑鐨勭帺瀹禝D锛屽寘鍚厤缃枃浠朵腑鐨勭帺瀹讹級
-        crawl_leaderboard_players: 鏄惁灏嗗綋鍓嶆帓琛屾涓殑鐜╁ID鍔犲叆闃熷垪
-        save_excel: 鏄惁淇濆瓨鏁版嵁鍒?Excel 鏂囦欢
-        push_to_git: 鏄惁鎺ㄩ€佹暟鎹埌 Git 浠撳簱
-        mm_sync: 鏄惁鍦ㄦ湰杞墽琛?MM/MMR 鍚屾
-        mm_limit: 姣忎釜妯″紡鎶撳彇鐨?MM 姒滃崟涓婇檺
+        crawl_players: 是否启动玩家爬虫（消费队列中的玩家ID，包含配置文件中的玩家）
+        crawl_leaderboard_players: 是否将当前排行榜中的玩家ID加入队列
+        save_excel: 是否保存数据到 Excel 文件
+        push_to_git: 是否推送数据到 Git 仓库
+        mm_sync: 是否在本轮执行 MM/MMR 同步
+        mm_limit: 每个模式抓取的 MM 榜单上限
     """
-    # 姣忎釜鍛ㄦ湡閲嶆柊鍔犺浇閰嶇疆鏂囦欢鐜╁
+    # Reload configured players at the beginning of each cycle.
     if crawl_players:
         config_players = load_player_config()
         if config_players:
             add_players_to_queue(config_players)
-            logger.info("鍛ㄦ湡寮€濮嬶細宸查噸鏂板姞杞?%d 涓厤缃枃浠剁帺瀹跺埌闃熷垪", len(config_players))
+            logger.info("周期开始：已重新加载 %d 个配置文件玩家到队列", len(config_players))
 
     try:
         if push_to_git and git_check_updates():
-            logger.info("妫€娴嬪埌杩滅▼浠撳簱鏈夋洿鏂帮紝姝ｅ湪鎷夊彇鏁版嵁鏂囦欢...")
+            logger.info("检测到远程仓库有更新，正在拉取数据文件...")
             if git_pull_data_files():
-                logger.info("鏁版嵁鏂囦欢鎷夊彇瀹屾垚锛岄噸鏂板垵濮嬪寲鏁版嵁搴?..")
+                logger.info("数据文件拉取完成，重新初始化数据库...")
                 DatabaseManager().close_connection()
                 init_database()
             else:
-                logger.warning("鏁版嵁鏂囦欢鎷夊彇澶辫触锛岀户缁娇鐢ㄦ湰鍦版暟鎹?")
+                logger.warning("数据文件拉取失败，继续使用本地数据")
         else:
-            logger.info("鏈娴嬪埌杩滅▼鏇存柊鎴朑it涓嶅彲鐢紝缁х画浣跨敤鏈湴鏁版嵁")
+            logger.info("未检测到远程更新或Git不可用，继续使用本地数据")
     except Exception as e:
-        logger.warning("Git鏇存柊妫€鏌ュけ璐ワ紝缁х画浣跨敤鏈湴鏁版嵁: %s", e)
+        logger.warning("Git更新检查失败，继续使用本地数据: %s", e)
 
     session = requests.Session()
     session.cookies.update(COOKIES)
@@ -2737,7 +2742,7 @@ def run_crawler_cycle(
 
     start_time = datetime.now()
     logger.info("=" * 50)
-    logger.info("寮€濮嬬埇鍙栧懆鏈? %s", start_time)
+    logger.info("开始爬取周期: %s", start_time)
 
     has_changes = False
     all_dfs = []
@@ -2799,6 +2804,7 @@ def run_crawler_cycle(
         except Exception as e:
             logger.exception("Unexpected error while processing mode %d", mode)
 
+    # Seed MM/MMR sync with players seen in this cycle's leaderboard snapshots.
     mm_seed_uids: Set[str] = set(get_players_from_leaderboard(all_dfs)) if all_dfs else set()
 
     if mm_sync and not is_stop_requested():
@@ -2809,6 +2815,7 @@ def run_crawler_cycle(
             try:
                 include_mm_ranking = not skip_mm_ranking
                 if ranking_source == "newapi" and include_mm_ranking:
+                    # newapi ranking already includes MM rows; skip duplicate fetch in mm_sync.
                     logger.info("Ranking source is newapi, skip duplicate MM ranking fetch in mm_sync.")
                     include_mm_ranking = False
                 run_mm_sync_cycle(
@@ -2826,23 +2833,23 @@ def run_crawler_cycle(
         leaderboard_players = get_players_from_leaderboard(all_dfs)
         if leaderboard_players:
             add_players_to_queue(leaderboard_players)
-            logger.info("浠庢帓琛屾娣诲姞浜?%d 涓帺瀹跺埌鐖彇闃熷垪", len(leaderboard_players))
+            logger.info("从排行榜添加了 %d 个玩家到爬取队列", len(leaderboard_players))
 
-    # 鍚姩鐜╁鐖彇锛堝悓姝ユ墽琛岋級
+    # Run player-profile crawl synchronously in current cycle.
     if crawl_players:
-        logger.info("鍚屾鎵ц鐜╁涓婚〉鐖彇...")
+        logger.info("同步执行玩家主页爬取...")
         run_player_crawler()
     else:
-        logger.info("鐜╁鐖彇宸茬鐢紝璺宠繃")
+        logger.info("玩家爬取已禁用，跳过")
 
-    # 鍙湁鍦ㄦ槑纭寚瀹氭椂鎵嶆帹閫?Git
+    # Push to Git only when explicitly enabled by CLI option.
     if push_to_git:
         try:
             _ = git_add_commit_push(has_changes)
         except Exception as e:
-            logger.warning("Git鎺ㄩ€佸け璐ワ紝浣嗘暟鎹凡淇濆瓨鍒版湰鍦? %s", e)
+            logger.warning("Git推送失败，但数据已保存在本地: %s", e)
     else:
-        logger.info("Git鎺ㄩ€佸凡绂佺敤锛屾暟鎹粎淇濆瓨鍦ㄦ湰鍦?")
+        logger.info("Git推送已禁用，数据仅保存在本地")
 
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
@@ -2852,100 +2859,149 @@ def run_crawler_cycle(
 
 def optimize_database():
     """
-    浼樺寲鏁版嵁搴擄細鎸夌収鏂拌鍒欐竻鐞嗘棫鏁版嵁锛屽彧淇濈暀蹇呰璁板綍銆?
-    瀵逛簬姣忎釜鐜╁姣忎釜妯″紡锛屾寜鏃堕棿鎺掑簭锛?
-      - 濡傛灉杩炵画涓ゆ潯璁板綍鏁版嵁鐩稿悓锛屽垯鍒犻櫎涓棿閲嶅鐨勶紝浠呬繚鐣欑涓€鏉″拰鏈€鍚庝竴鏉°€?
-    鏈€缁堢粨鏋滐細姣忎釜鐜╁姣忎釜妯″紡鐨勬暟鎹簭鍒椾腑锛岀浉閭讳袱鏉¤褰曠殑鏁版嵁涓€瀹氫笉鍚屻€?
-    鎵撳嵃浼樺寲鍓嶅悗鐨勮褰曟暟鍜屾暟鎹簱鏂囦欢澶у皬锛屽苟璁＄畻浼樺寲鐜囥€?
+    优化数据库：按照新规则清理旧数据，只保留必要记录。
+    对于每个玩家每个模式，按时间排序：
+      - 以保存逻辑一致的核心字段（rank/name/exp/acc/combo/pc）划分稳定段。
+      - 对稳定段仅保留边界两条记录（start/end），删除中间重复记录。
+    最终结果：每个稳定段最多保留两条边界记录（与区间模型保存逻辑一致）。
+    打印优化前后的记录数和数据库文件大小，并计算优化率。
     """
-    logger.info("寮€濮嬫暟鎹簱浼樺寲...")
+    logger.info("开始数据库优化...")
     db_manager = DatabaseManager()
     conn = db_manager.get_connection()
     cursor = conn.cursor()
 
-    # 鑾峰彇浼樺寲鍓嶇殑璁板綍鎬绘暟鍜屾枃浠跺ぇ灏?
+    # Collect baseline row count and file size before optimization.
     cursor.execute("SELECT COUNT(*) FROM player_rankings")
     before_count = cursor.fetchone()[0]
     before_size = os.path.getsize(DB_FILE) if os.path.exists(DB_FILE) else 0
 
-    # 鑾峰彇鎵€鏈夌帺瀹禝D鍜屾ā寮?
+    # Enumerate all (player_id, mode) pairs to process.
     cursor.execute("SELECT DISTINCT player_id, mode FROM player_rankings")
     player_mode_pairs = cursor.fetchall()
 
     total_pairs = len(player_mode_pairs)
     if total_pairs == 0:
-        logger.info("鏁版嵁搴撲负绌猴紝鏃犻渶浼樺寲")
+        logger.info("数据库为空，无需优化")
         return
 
-    # 浣跨敤浜嬪姟鎵归噺澶勭悊
+    def _is_valid_lv(value) -> bool:
+        try:
+            return value is not None and int(value) > 0
+        except Exception:
+            return False
+
+    # Process in one transaction for better performance.
     conn.execute("BEGIN TRANSACTION")
     deleted_total = 0
-    kept_total = 0
+    delete_batch_size = 500
+    lv_repaired_total = 0
 
-    # 浣跨敤杩涘害鏉?
+    # Optional progress visualization.
     iterator = tqdm(player_mode_pairs, desc="Optimize DB", unit="pair") if HAS_TQDM else player_mode_pairs
 
-    for player_id, mode in iterator:
-        # 鑾峰彇璇ョ帺瀹惰妯″紡鐨勬墍鏈夎褰曪紝鎸夋椂闂村崌搴?
-        cursor.execute('''
-            SELECT id, rank, name, lv, exp, acc, combo, pc, crawl_time
-            FROM player_rankings
-            WHERE player_id = ? AND mode = ?
-            ORDER BY crawl_time ASC
-        ''', (player_id, mode))
-        rows = cursor.fetchall()
+    try:
+        for player_id, mode in iterator:
+            # Load all records for this player/mode in ascending time order.
+            cursor.execute('''
+                SELECT id, rank, name, lv, exp, acc, combo, pc, crawl_time
+                FROM player_rankings
+                WHERE player_id = ? AND mode = ?
+                ORDER BY crawl_time ASC, id ASC
+            ''', (player_id, mode))
+            rows = cursor.fetchall()
 
-        if len(rows) <= 1:
-            continue
+            if len(rows) <= 1:
+                continue
 
-        to_delete = []
-        i = 0
-        while i < len(rows):
-            j = i + 1
-            # 鎵惧埌浠?i 寮€濮嬬殑杩炵画鐩稿悓鏁版嵁娈?
-            while j < len(rows) and rows[j][1:8] == rows[i][1:8]:  # 姣旇緝 rank~pc
-                j += 1
-            # 鍖洪棿涓?[i, j-1]锛岃嫢闀垮害 > 1锛屽垯鍒犻櫎涓棿閮ㄥ垎锛堜繚鐣?i 鍜?j-1锛?
-            if j - i > 1:
-                for k in range(i + 1, j - 1):
-                    to_delete.append(rows[k][0])
-            i = j
+            to_delete = []
+            i = 0
+            while i < len(rows):
+                j = i + 1
+                # Find a contiguous segment of identical ranking payload.
+                # Align with save_player_ranking_record current_core:
+                # (rank, name, exp, acc, combo, pc) -- lv is intentionally excluded.
+                while j < len(rows) and (
+                    rows[j][1], rows[j][2], rows[j][4], rows[j][5], rows[j][6], rows[j][7]
+                ) == (
+                    rows[i][1], rows[i][2], rows[i][4], rows[i][5], rows[i][6], rows[i][7]
+                ):
+                    j += 1
 
-        if to_delete:
-            placeholders = ','.join('?' * len(to_delete))
-            cursor.execute(f"DELETE FROM player_rankings WHERE id IN ({placeholders})", to_delete)
-            deleted_total += len(to_delete)
-            if HAS_TQDM:
-                _ = iterator.set_postfix(deleted=deleted_total)
+                # Extra handling for legacy lv bug (0 <-> actual oscillation):
+                # if a stable core-segment contains any valid non-zero lv, normalize
+                # kept boundary rows' lv to the segment's latest non-zero lv.
+                preferred_lv = None
+                for k in range(j - 1, i - 1, -1):
+                    candidate_lv = rows[k][3]
+                    if _is_valid_lv(candidate_lv):
+                        preferred_lv = int(candidate_lv)
+                        break
+
+                if preferred_lv is not None:
+                    start_id, start_lv = rows[i][0], rows[i][3]
+                    end_id, end_lv = rows[j - 1][0], rows[j - 1][3]
+
+                    if not _is_valid_lv(start_lv):
+                        cursor.execute("UPDATE player_rankings SET lv = ? WHERE id = ?", (preferred_lv, start_id))
+                        lv_repaired_total += 1
+
+                    if end_id != start_id and not _is_valid_lv(end_lv):
+                        cursor.execute("UPDATE player_rankings SET lv = ? WHERE id = ?", (preferred_lv, end_id))
+                        lv_repaired_total += 1
+
+                # For [i, j-1] with length>1, drop middle rows and keep boundaries.
+                if j - i > 1:
+                    for k in range(i + 1, j - 1):
+                        to_delete.append(rows[k][0])
+                i = j
+
+            if to_delete:
+                for start in range(0, len(to_delete), delete_batch_size):
+                    chunk = to_delete[start:start + delete_batch_size]
+                    placeholders = ','.join('?' * len(chunk))
+                    cursor.execute(f"DELETE FROM player_rankings WHERE id IN ({placeholders})", chunk)
+                deleted_total += len(to_delete)
+                if HAS_TQDM:
+                    _ = iterator.set_postfix(deleted=deleted_total)
+    except Exception:
+        conn.rollback()
+        raise
 
     conn.commit()
 
-    # 鑾峰彇浼樺寲鍚庣殑璁板綍鎬绘暟鍜屾枃浠跺ぇ灏?
+    # Collect row count and file size after optimization.
     cursor.execute("SELECT COUNT(*) FROM player_rankings")
     after_count = cursor.fetchone()[0]
-    # 鎵ц VACUUM 浠ュ帇缂╂暟鎹簱
+    # Run VACUUM to reclaim freed database space.
     conn.execute("VACUUM")
     after_size = os.path.getsize(DB_FILE)
 
-    # 璁＄畻鍙樺寲
+    # Compute optimization deltas and ratios.
     delta_count = before_count - after_count
     delta_size = before_size - after_size
     count_ratio = (delta_count / before_count * 100) if before_count > 0 else 0
     size_ratio = (delta_size / before_size * 100) if before_size > 0 else 0
 
-    # 鎵撳嵃鎶ュ憡
+    # Print optimization report.
     print("\n" + "="*50)
-    print("鏁版嵁搴撲紭鍖栧畬鎴?")
+    print("数据库优化完成")
     print("="*50)
-    print(f"浼樺寲鍓嶈褰曟暟: {before_count}")
-    print(f"浼樺寲鍚庤褰曟暟: {after_count}")
-    print(f"鍒犻櫎璁板綍鏁? {delta_count} ({count_ratio:.2f}%)")
-    print(f"浼樺寲鍓嶆枃浠跺ぇ灏? {before_size/1024:.2f} KB")
-    print(f"浼樺寲鍚庢枃浠跺ぇ灏? {after_size/1024:.2f} KB")
-    print(f"鑺傜渷绌洪棿: {delta_size/1024:.2f} KB ({size_ratio:.2f}%)")
+    print(f"优化前记录数: {before_count}")
+    print(f"优化后记录数: {after_count}")
+    print(f"删除记录数: {delta_count} ({count_ratio:.2f}%)")
+    print(f"修复LV异常: {lv_repaired_total} 条边界记录")
+    print(f"优化前文件大小: {before_size/1024:.2f} KB")
+    print(f"优化后文件大小: {after_size/1024:.2f} KB")
+    print(f"节省空间: {delta_size/1024:.2f} KB ({size_ratio:.2f}%)")
     print("="*50)
 
-    logger.info("鏁版嵁搴撲紭鍖栧畬鎴? 鍒犻櫎 %d 鏉¤褰? 鑺傜渷 %.2f KB", delta_count, delta_size/1024)
+    logger.info(
+        "数据库优化完成: 删除 %d 条记录，修复LV异常 %d 条边界记录，节省 %.2f KB",
+        delta_count,
+        lv_repaired_total,
+        delta_size / 1024,
+    )
     return delta_count
 
 
@@ -2989,14 +3045,14 @@ def parse_arguments():
     return parser.parse_args()
 
 def run_players_only():
-    """鍙繍琛岀帺瀹朵富椤电埇鍙栵紙浠呮秷璐归厤缃枃浠朵腑鐨勭帺瀹讹紝涓嶆秹鍙婃帓琛屾锛?"""
+    """Run player-profile crawling only (no leaderboard crawling)."""
     init_database()
     config_players = load_player_config()
     if config_players:
         add_players_to_queue(config_players)
         run_player_crawler()
     else:
-        logger.info("娌℃湁閰嶇疆鐜╁锛岃烦杩囩埇鍙?")
+        logger.info("没有配置玩家，跳过爬取")
     DatabaseManager().close_connection()
 
 
@@ -3009,7 +3065,7 @@ def main():
 
     init_database()
 
-    # 棰勫姞杞介厤缃枃浠剁帺瀹跺苟鍔犲叆闃熷垪锛堜粎鐢ㄤ簬棣栨杩愯鍓嶇殑闃熷垪濉厖锛屽悗缁懆鏈熶細閲嶆柊鍔犺浇锛?
+    # Preload config players once before first cycle; later cycles reload again.
     if not args.mm_only:
         config_players = load_player_config()
         if config_players:
@@ -3043,15 +3099,15 @@ def main():
             DatabaseManager().close_connection()
         return
 
-    # 纭畾鏄惁鐖彇鐜╁锛堥粯璁ゅ紑鍚紝闄ら潪琚?--no-player-crawl 鎴?--leaderboard-only 鍏抽棴锛?
+    # Decide whether player crawling is enabled for this run.
     crawl_players = True
     if args.no_player_crawl or args.leaderboard_only:
         crawl_players = False
 
-    # 纭畾鏄惁灏嗘帓琛屾鐜╁鍔犲叆闃熷垪锛堥粯璁や笉鍔犲叆锛屽彧鏈?--all 寮€鍚級
+    # Decide whether to enqueue leaderboard players (only with --all).
     crawl_leaderboard_players = args.all
 
-    # 纭畾鏄惁淇濆瓨Excel鍜屾帹閫丟it
+    # Decide whether to save Excel snapshots and push Git updates.
     save_excel = args.save_excel
     push_to_git = args.push_to_git
     mm_sync = args.mm_sync
@@ -3067,7 +3123,7 @@ def main():
             crawl_players = True
             crawl_leaderboard_players = True
             if args.no_player_crawl:
-                logger.warning("鍚屾椂鎸囧畾浜?--all 鍜?--no-player-crawl锛屼互 --all 涓哄噯锛屽皢鐖彇鐜╁")
+                logger.warning("同时指定了 --all 和 --no-player-crawl，以 --all 为准，将爬取玩家")
                 crawl_players = True
                 crawl_leaderboard_players = True
 
@@ -3090,7 +3146,7 @@ def main():
         while True:
             with stop_lock:
                 if stop_requested:
-                    logger.info("绋嬪簭琚粓姝?")
+                    logger.info("程序被终止")
                     break
 
             try:
@@ -3107,14 +3163,14 @@ def main():
                     ranking_limit=ranking_limit,
                 )
             except Exception as e:
-                logger.exception("涓诲惊鐜彂鐢熸湭澶勭悊寮傚父")
+                logger.exception("主循环发生未处理异常")
 
-            logger.info("绛夊緟30鍒嗛挓鍚庨噸鍚?..")
+            logger.info("等待30分钟后重启...")
 
             for i in range(30):
                 with stop_lock:
                     if stop_requested:
-                        logger.info("绋嬪簭琚粓姝?")
+                        logger.info("程序被终止")
                         break
                 time.sleep(60)
                 gc.collect()
@@ -3124,6 +3180,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

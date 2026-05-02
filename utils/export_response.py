@@ -4,7 +4,6 @@ from typing import BinaryIO
 import pandas as pd
 from fastapi.responses import StreamingResponse
 
-
 SUPPORTED_EXPORT_FORMATS = {"csv", "xlsx"}
 
 

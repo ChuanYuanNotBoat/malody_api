@@ -1,8 +1,7 @@
-import sys
 import os
+import sys
 from pathlib import Path
 from unittest import TestCase
-
 
 ROOT_PARENT = Path(__file__).resolve().parents[2]
 if str(ROOT_PARENT) not in sys.path:

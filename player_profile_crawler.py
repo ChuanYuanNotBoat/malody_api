@@ -7,94 +7,92 @@
 按下 Ctrl+C 会等待当前任务完成后输出统计报告再退出。
 """
 
+import argparse
+import hashlib
+import json
+import logging
+import os
+import pickle
+import queue
+import re
+import signal
+import struct
+import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from threading import Lock, Thread
+
 import requests
 from bs4 import BeautifulSoup
-import sqlite3
-import time
-import os
-import logging
-import sys
-import signal
-import threading
-from datetime import datetime, timedelta
-import re
-import json
-import argparse
-from threading import Lock, Thread
-import hashlib
-from logging.handlers import RotatingFileHandler
-import queue
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import random
-import pprint
-import pickle
-import struct
-from collections import deque
 
 # 复用现有的数据库管理器和配置
-from malody_rankings import DatabaseManager, init_database, stop_requested, stop_lock, COOKIES, HEADERS
+from malody_rankings import DatabaseManager, init_database, stop_lock, COOKIES
 # 复用主爬虫中的排名解析与存储函数
 from malody_rankings import (
-    parse_player_profile as parse_rankings,      # 解析个人页中的排名数据
-    resolve_player_identity,                      # 处理玩家身份（改名合并）
-    save_player_ranking_record                     # 智能保存单条排名记录
+  parse_player_profile as parse_rankings,  # 解析个人页中的排名数据
+  resolve_player_identity,  # 处理玩家身份（改名合并）
+  save_player_ranking_record  # 智能保存单条排名记录
 )
+
 
 # 配置日志
 def setup_detailed_logging(log_level=logging.INFO, log_file=None):
     """设置详细的日志配置"""
-    
+
     # 创建logs目录
     if not os.path.exists('logs'):
         os.makedirs('logs')
-    
+
     # 默认日志文件
     if log_file is None:
         log_file = f"logs/player_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    
+
     # 创建logger
     logger = logging.getLogger()
     logger.setLevel(log_level)
-    
+
     # 清除现有的handler
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
-    
+
     # 详细的日志格式
     detailed_formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(funcName)s - %(message)s'
     )
-    
+
     # 简化的控制台格式
     console_formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s'
     )
-    
+
     # 文件handler - 滚动日志，每个文件10MB，保留5个备份
     file_handler = RotatingFileHandler(
-        log_file, 
+        log_file,
         maxBytes=10*1024*1024,  # 10MB
         backupCount=5,
         encoding='utf-8'
     )
     file_handler.setFormatter(detailed_formatter)
     file_handler.setLevel(log_level)
-    
+
     # 控制台handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(console_formatter)
     console_handler.setLevel(log_level)
-    
+
     # 添加handler
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    
+
     logger.info("=" * 80)
     logger.info("玩家个人主页爬虫启动")
     logger.info("日志文件: %s", log_file)
     logger.info("日志级别: %s", logging.getLevelName(log_level))
     logger.info("=" * 80)
-    
+
     return logger
 
 # 颜色支持（仅在终端可用时启用）
@@ -393,12 +391,12 @@ class GlobalBitmapProgress:
 class PlayerProfileCrawler:
     def __init__(self, session=None):
         self.logger = logging.getLogger('PlayerProfileCrawler')
-        
+
         if session is None:
             # 创建新的session并复用认证配置
             self.session = requests.Session()
             self.session.cookies.update(COOKIES)
-            
+
             # 使用与主爬虫完全相同的headers
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -409,15 +407,15 @@ class PlayerProfileCrawler:
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
             }
-            
+
             # 添加CSRF token到headers
             if 'csrftoken' in COOKIES:
                 headers['X-CSRFToken'] = COOKIES['csrftoken']
                 headers['X-CSRF-Token'] = COOKIES['csrftoken']
                 headers['X-CSRFTOKEN'] = COOKIES['csrftoken']
-            
+
             self.session.headers.update(headers)
-            
+
             # 使用与主爬虫相同的适配器配置
             self.session.mount('https://', requests.adapters.HTTPAdapter(
                 max_retries=3,
@@ -426,16 +424,16 @@ class PlayerProfileCrawler:
             ))
         else:
             self.session = session
-            
+
         self.db_manager = DatabaseManager()
         # 初始化数据库时暂时禁用外键约束，避免因achievement_catalog缺失导致失败
         self.db_manager.get_connection().execute('PRAGMA foreign_keys=OFF')
         self.init_database()
-        
+
         # 用于跟踪已处理的玩家（仅用于去重，与恢复逻辑分开）
         self.processed_uids = set()
         self.rate_limiter = GlobalRequestRateLimiter(DEFAULT_SAFE_RPM)
-            
+
     def _sanitize_crawl_limits(self, max_workers, requests_per_minute):
         safe_workers = max(1, int(max_workers or 1))
         safe_rpm = int(requests_per_minute or 0)
@@ -468,7 +466,7 @@ class PlayerProfileCrawler:
     def init_database(self):
         """初始化玩家资料相关的数据库表"""
         cursor = self.db_manager.get_connection().cursor()
-        
+
         # 玩家基础资料表
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_profiles (
@@ -492,7 +490,7 @@ class PlayerProfileCrawler:
             data_hash TEXT
         )
         ''')
-        
+
         # 玩家头衔/称号表
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_titles (
@@ -504,7 +502,7 @@ class PlayerProfileCrawler:
             UNIQUE(uid, title)
         )
         ''')
-        
+
         # 玩家成就徽章表 - 适配当前数据库结构（无achievement_img_url列）
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_achievements (
@@ -515,7 +513,7 @@ class PlayerProfileCrawler:
             FOREIGN KEY (uid) REFERENCES player_profiles(uid)
         )
         ''')
-        
+
         # 爬虫状态表（增强版）
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS player_profile_crawl_status (
@@ -532,61 +530,61 @@ class PlayerProfileCrawler:
             FOREIGN KEY (uid) REFERENCES player_profiles(uid)
         )
         ''')
-        
+
         # 创建索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_titles_uid ON player_titles(uid)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_achievements_uid ON player_achievements(uid)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_status_last_crawled ON player_profile_crawl_status(last_crawled)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_status_needs_update ON player_profile_crawl_status(needs_update)')
-        
+
         self.db_manager.get_connection().commit()
         self.logger.info("玩家资料数据库表初始化完成")
-        
+
         # 确保player_identity表中有uid列
         self._ensure_uid_column()
-    
+
     def _ensure_uid_column(self):
         """确保player_identity表有uid列"""
         try:
             cursor = self.db_manager.get_connection().cursor()
             cursor.execute("PRAGMA table_info(player_identity)")
             columns = [column[1] for column in cursor.fetchall()]
-            
+
             if 'uid' not in columns:
                 cursor.execute('ALTER TABLE player_identity ADD COLUMN uid TEXT')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)')
                 self.logger.info("已添加uid字段到player_identity表")
-                
+
             self.db_manager.get_connection().commit()
         except Exception as e:
             self.logger.warning("检查player_identity表结构时出错: %s", e)
-    
+
     def generate_data_hash(self, profile_data):
         """生成玩家资料数据的哈希值"""
         # 排除动态变化的字段
         data_to_hash = {
-            k: v for k, v in profile_data.items() 
+            k: v for k, v in profile_data.items()
             if k not in ['last_crawled', 'data_hash']
         }
         data_str = json.dumps(data_to_hash, sort_keys=True, default=str)
         return hashlib.md5(data_str.encode('utf-8')).hexdigest()
-    
+
     def extract_text_from_span(self, span_element):
         """从span元素中提取文本，处理&nbsp;等特殊字符"""
         if not span_element:
             return None
-        
+
         text = span_element.get_text().strip()
         # 清理HTML实体和特殊字符
         text = text.replace('&nbsp;', ' ').strip()
         # 合并多个空格
         text = re.sub(r'\s+', ' ', text)
         return text if text else None
-    
+
     def parse_player_profile_full(self, html, uid):
         """完整解析玩家个人主页 - 简化版本"""
         soup = BeautifulSoup(html, "html.parser")
-        
+
         # 初始化profile数据
         profile = {
             "uid": uid,
@@ -608,7 +606,7 @@ class PlayerProfileCrawler:
             "titles": [],
             "achievements": []
         }
-        
+
         try:
             # 1. 提取用户名
             name_tag = soup.select_one("div.user_head .name span")
@@ -621,33 +619,33 @@ class PlayerProfileCrawler:
                 if og_title and og_title.get('content'):
                     profile["current_name"] = og_title.get('content').strip()
                     self.logger.debug("从meta标签提取用户名: %s", profile["current_name"])
-            
+
             # 如果没有用户名，返回None
             if not profile["current_name"]:
                 self.logger.warning("玩家 %s 没有用户名，可能页面无效", uid)
                 return None
-            
+
             # 2. 提取头像URL
             avatar_img = soup.select_one("div.user_head .coverb img")
             if avatar_img and 'src' in avatar_img.attrs:
                 profile["avatar_url"] = avatar_img['src']
                 self.logger.debug("提取头像URL: %s", profile["avatar_url"])
-            
+
             # 3. 直接根据HTML结构提取信息
             user_head = soup.select_one("div.user_head .right")
             if user_head:
                 # 获取所有段落
                 paragraphs = user_head.find_all('p')
-                
+
                 for p in paragraphs:
                     # 每个段落可能有多个span，直接提取所有span
                     spans = p.find_all('span')
-                    
+
                     for span in spans:
                         span_text = self.extract_text_from_span(span)
                         if not span_text:
                             continue
-                        
+
                         # 根据内容判断是什么字段
                         if span_text.startswith('Joined since:'):
                             date_str = span_text.replace('Joined since:', '').strip()
@@ -693,7 +691,7 @@ class PlayerProfileCrawler:
                             slot_text = span_text.replace('Chart slot:', '').strip()
                             if slot_text.isdigit():
                                 profile["chart_slots"] = int(slot_text)
-            
+
             # 4. 提取头衔（使用em标签）
             title_ems = soup.select("div.user_head .name em")
             for em in title_ems:
@@ -701,18 +699,18 @@ class PlayerProfileCrawler:
                 if title and title not in profile["titles"]:
                     profile["titles"].append(title)
                     self.logger.debug("提取头衔: %s", title)
-            
+
             # 5. 提取成就徽章 - 仅保存成就代码，不保存图片URL
             achievement_imgs = soup.select("div.ach img[src*='achieve']")
             for img in achievement_imgs:
                 src = img.get('src', '')
                 if not src:
                     continue
-                
+
                 # 过滤占位图
                 if 'justfyHold' in img.get('class', []):
                     continue
-                
+
                 # 从URL中提取成就代码
                 match = re.search(r'/achieve/(\d+)', src)
                 if match:
@@ -724,7 +722,7 @@ class PlayerProfileCrawler:
                             "code": achievement_code
                         })
                         self.logger.debug("提取成就: %d", achievement_code)
-            
+
             # 6. 提取个人简介
             wiki_div = soup.select_one("div.wiki.g_rblock.curr")
             if wiki_div:
@@ -734,30 +732,30 @@ class PlayerProfileCrawler:
                     bio_text = re.sub(r'\s+', ' ', bio_text)  # 合并空白字符
                     profile["bio"] = bio_text
                     self.logger.debug("提取个人简介，长度: %d", len(bio_text))
-            
-            self.logger.info("解析完成 - UID: %s, 用户名: %s, 头衔: %d个, 成就: %d个", 
+
+            self.logger.info("解析完成 - UID: %s, 用户名: %s, 头衔: %d个, 成就: %d个",
                            uid, profile["current_name"], len(profile["titles"]), len(profile["achievements"]))
-            
+
             return profile
-            
+
         except Exception as e:
             self.logger.error("解析玩家 %s 个人主页失败: %s", uid, e, exc_info=True)
-            
+
             # 即使部分失败，也返回已提取的数据
             if profile["current_name"]:
                 return profile
             return None
-    
+
     def fetch_player_profile(self, uid):
         """获取玩家个人主页HTML - 简化版本"""
         url = PLAYER_PROFILE_URL.format(uid=uid)
-        
+
         try:
             self.logger.debug("请求玩家主页: %s", url)
             self.rate_limiter.wait_for_slot()
             response = self.session.get(url, timeout=30)
             self.rate_limiter.record_request(self.logger)
-            
+
             # 检查状态码
             if response.status_code == 404:
                 self.logger.info("玩家 %s 不存在 (404)", uid)
@@ -765,22 +763,22 @@ class PlayerProfileCrawler:
             elif response.status_code != 200:
                 self.logger.warning("玩家 %s 返回状态码: %d", uid, response.status_code)
                 return None
-            
+
             # 检查页面内容是否有效
             if len(response.content) < 100:
                 self.logger.warning("玩家 %s 页面内容过短，可能无效", uid)
                 return None
-            
+
             # 直接返回HTML，让解析函数处理
             return response.text
-            
+
         except requests.exceptions.RequestException as e:
             self.logger.error("请求失败获取玩家 %s: %s", uid, e)
             return None
         except Exception as e:
             self.logger.error("获取玩家 %s 数据时出错: %s", uid, e)
             return None
-    
+
     def save_player_profile(self, profile_data):
         """
         保存玩家资料到数据库
@@ -788,23 +786,23 @@ class PlayerProfileCrawler:
         """
         if not profile_data:
             return None
-        
+
         cursor = self.db_manager.get_connection().cursor()
         crawl_time = datetime.now()
-        
+
         try:
             uid = profile_data["uid"]
-            
+
             # 生成数据哈希
             data_hash = self.generate_data_hash(profile_data)
-            
+
             # 检查是否需要更新（数据是否有变化）
             cursor.execute(
                 "SELECT data_hash FROM player_profiles WHERE uid = ?",
                 (uid,)
             )
             result = cursor.fetchone()
-            
+
             if result and result[0] == data_hash:
                 self.logger.debug("玩家 %s 数据未变化，跳过保存", uid)
                 # 只更新最后爬取时间
@@ -812,26 +810,26 @@ class PlayerProfileCrawler:
                     "UPDATE player_profiles SET last_crawled = ? WHERE uid = ?",
                     (crawl_time, uid)
                 )
-                
+
                 # 更新爬虫状态
                 cursor.execute('''
-                INSERT OR REPLACE INTO player_profile_crawl_status 
-                (uid, last_crawled, last_success, crawl_count, success_count, error_count, 
+                INSERT OR REPLACE INTO player_profile_crawl_status
+                (uid, last_crawled, last_success, crawl_count, success_count, error_count,
                  last_error, data_hash, needs_update, next_crawl_time)
-                VALUES (?, ?, ?, 
-                       COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1, 
+                VALUES (?, ?, ?,
+                       COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
                        COALESCE((SELECT success_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
                        COALESCE((SELECT error_count FROM player_profile_crawl_status WHERE uid = ?), 0),
                        NULL, ?, 0, ?)
                 ''', (
-                    uid, crawl_time, crawl_time, uid, uid, uid, 
+                    uid, crawl_time, crawl_time, uid, uid, uid,
                     data_hash, crawl_time + timedelta(days=30)
                 ))
-                
+
                 self.db_manager.get_connection().commit()
                 self.logger.info("玩家 %s 数据未变化，仅更新时间", uid)
                 return 'unchanged'
-            
+
             # 准备数据，确保数据类型正确
             stable_charts = profile_data.get("stable_charts", 0)
             if not isinstance(stable_charts, int):
@@ -839,30 +837,30 @@ class PlayerProfileCrawler:
                     stable_charts = int(stable_charts)
                 except:
                     stable_charts = 0
-            
+
             unstable_charts = profile_data.get("unstable_charts", 0)
             if not isinstance(unstable_charts, int):
                 try:
                     unstable_charts = int(unstable_charts)
                 except:
                     unstable_charts = 0
-            
+
             chart_slots = profile_data.get("chart_slots", 0)
             if not isinstance(chart_slots, int):
                 try:
                     chart_slots = int(chart_slots)
                 except:
                     chart_slots = 0
-            
+
             # 保存到player_profiles表
             cursor.execute('''
-            INSERT OR REPLACE INTO player_profiles 
+            INSERT OR REPLACE INTO player_profiles
             (uid, current_name, avatar_url, join_date, last_play_date, total_play_time,
              gender, age, location, bio, gold, income, charts_played_time,
              stable_charts, unstable_charts, chart_slots, last_crawled, data_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                profile_data["uid"], 
+                profile_data["uid"],
                 profile_data.get("current_name", ""),
                 profile_data.get("avatar_url"),
                 profile_data.get("join_date"),
@@ -878,13 +876,13 @@ class PlayerProfileCrawler:
                 stable_charts,
                 unstable_charts,
                 chart_slots,
-                crawl_time, 
+                crawl_time,
                 data_hash
             ))
-            
+
             # 删除旧的头衔记录，然后重新插入
             cursor.execute("DELETE FROM player_titles WHERE uid = ?", (uid,))
-            
+
             # 保存头衔
             if profile_data.get("titles"):
                 for title in profile_data["titles"]:
@@ -892,10 +890,10 @@ class PlayerProfileCrawler:
                         cursor.execute('''
                         INSERT INTO player_titles (uid, title) VALUES (?, ?)
                         ''', (uid, title))
-            
+
             # 删除旧的成就记录，然后重新插入
             cursor.execute("DELETE FROM player_achievements WHERE uid = ?", (uid,))
-            
+
             # 保存成就 - 适配当前表结构（无achievement_img_url列）
             if profile_data.get("achievements"):
                 for achievement in profile_data["achievements"]:
@@ -904,43 +902,43 @@ class PlayerProfileCrawler:
                         INSERT INTO player_achievements (uid, achievement_code)
                         VALUES (?, ?)
                         ''', (uid, achievement["code"]))
-            
+
             # 更新爬虫状态
             cursor.execute('''
-            INSERT OR REPLACE INTO player_profile_crawl_status 
-            (uid, last_crawled, last_success, crawl_count, success_count, error_count, 
+            INSERT OR REPLACE INTO player_profile_crawl_status
+            (uid, last_crawled, last_success, crawl_count, success_count, error_count,
              last_error, data_hash, needs_update, next_crawl_time)
-            VALUES (?, ?, ?, 
-                   COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1, 
+            VALUES (?, ?, ?,
+                   COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
                    COALESCE((SELECT success_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
                    COALESCE((SELECT error_count FROM player_profile_crawl_status WHERE uid = ?), 0),
                    NULL, ?, 0, ?)
             ''', (
-                uid, crawl_time, crawl_time, uid, uid, uid, 
+                uid, crawl_time, crawl_time, uid, uid, uid,
                 data_hash, crawl_time + timedelta(days=30)
             ))
-            
+
             self.db_manager.get_connection().commit()
             self.logger.info("✓ 玩家 %s 资料保存成功", uid)
-            
+
             # 判断是新增还是更新
             if result is None:
                 return 'new'
             else:
                 return 'updated'
-            
+
         except Exception as e:
             self.logger.error("保存玩家 %s 资料失败: %s", profile_data.get("uid", "未知"), e, exc_info=True)
-            
+
             # 记录错误状态
             try:
                 cursor.execute('''
-                INSERT OR REPLACE INTO player_profile_crawl_status 
-                (uid, last_crawled, last_success, crawl_count, success_count, error_count, 
+                INSERT OR REPLACE INTO player_profile_crawl_status
+                (uid, last_crawled, last_success, crawl_count, success_count, error_count,
                  last_error, data_hash, needs_update, next_crawl_time)
-                VALUES (?, ?, 
+                VALUES (?, ?,
                        (SELECT last_success FROM player_profile_crawl_status WHERE uid = ?),
-                       COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1, 
+                       COALESCE((SELECT crawl_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
                        COALESCE((SELECT success_count FROM player_profile_crawl_status WHERE uid = ?), 0),
                        COALESCE((SELECT error_count FROM player_profile_crawl_status WHERE uid = ?), 0) + 1,
                        ?, NULL, 1, ?)
@@ -951,47 +949,47 @@ class PlayerProfileCrawler:
                 self.db_manager.get_connection().commit()
             except Exception as e2:
                 self.logger.error("更新爬虫状态失败: %s", e2)
-            
+
             self.db_manager.get_connection().rollback()
             return None
-    
+
     def crawl_player_profile(self, uid, print_only=False, stats=None, stats_lock=None):
         """
         爬取单个玩家的个人主页（资料 + 排名数据）
         如果提供了 stats 和 stats_lock，则会累加统计信息
         """
         self.logger.info("开始爬取玩家: %s", uid)
-        
+
         # 检查是否已处理过
         if not print_only and uid in self.processed_uids:
             self.logger.debug("玩家 %s 已处理过，跳过", uid)
             return True
-        
+
         try:
             # 获取HTML页面
             html = self.fetch_player_profile(uid)
             if not html:
                 self.logger.info("玩家 %s 页面获取失败或无数据，跳过", uid)
                 return False
-            
+
             # 1. 解析并保存玩家资料
             profile_data = self.parse_player_profile_full(html, uid)
             if not profile_data:
                 self.logger.info("玩家 %s 资料解析失败，跳过", uid)
                 return False
-            
+
             # 如果是仅打印模式
             if print_only:
                 self.print_profile_data(profile_data)
                 return True
-            
+
             # 保存资料到数据库，获取操作类型
             profile_op = self.save_player_profile(profile_data)
-            
+
             # 2. 解析并保存排名数据（复用主爬虫逻辑）
             crawl_time = datetime.now()
             rank_data_list = parse_rankings(html, uid)  # 返回列表，每个元素包含 mode, rank, name, lv, exp, acc, combo, pc
-            
+
             # MODIFIED: 增加 update_fill 统计
             rank_stats = {'new':0, 'diff_insert':0, 'same_insert':0, 'update':0, 'update_fill':0}
             if rank_data_list:
@@ -1024,7 +1022,7 @@ class PlayerProfileCrawler:
                 self.logger.info("已保存玩家 %s 的 %d 条排名记录", uid, len(rank_data_list))
             else:
                 self.logger.info("玩家 %s 没有排名数据", uid)
-            
+
             # 累加统计信息（如果提供了stats字典）
             if stats is not None and stats_lock is not None:
                 with stats_lock:
@@ -1041,37 +1039,37 @@ class PlayerProfileCrawler:
                     stats['rank_same_insert'] += rank_stats['same_insert']
                     stats['rank_update'] += rank_stats['update']
                     stats['rank_update_fill'] += rank_stats['update_fill']   # MODIFIED: 累加 update_fill
-            
+
             self.processed_uids.add(uid)
             return True
-                
+
         except Exception as e:
             self.logger.error("爬取玩家 %s 时出错: %s", uid, e, exc_info=True)
             return False
-    
+
     def print_profile_data(self, profile_data):
         """在终端打印解析出的玩家数据"""
         print("\n" + "="*80)
         print("玩家资料解析结果 (仅打印，不保存)")
         print("="*80)
-        
+
         # 基本信息
         print(f"UID: {profile_data.get('uid', 'N/A')}")
         print(f"用户名: {profile_data.get('current_name', 'N/A')}")
         print(f"头像URL: {profile_data.get('avatar_url', 'N/A')[:50]}..." if profile_data.get('avatar_url') else "头像URL: N/A")
-        
+
         # 日期信息
         print(f"\n时间信息:")
         print(f"  加入日期: {profile_data.get('join_date', 'N/A')}")
         print(f"  最后游玩: {profile_data.get('last_play_date', 'N/A')}")
         print(f"  总游玩时长: {profile_data.get('total_play_time', 'N/A')}")
-        
+
         # 个人信息
         print(f"\n个人信息:")
         print(f"  性别: {profile_data.get('gender', 'N/A')}")
         print(f"  年龄: {profile_data.get('age', 'N/A')}")
         print(f"  地区: {profile_data.get('location', 'N/A')}")
-        
+
         # 游戏数据
         print(f"\n游戏数据:")
         print(f"  金币: {profile_data.get('gold', 'N/A')}")
@@ -1080,7 +1078,7 @@ class PlayerProfileCrawler:
         print(f"  稳定谱面: {profile_data.get('stable_charts', 'N/A')}")
         print(f"  不稳定谱面: {profile_data.get('unstable_charts', 'N/A')}")
         print(f"  谱面槽位: {profile_data.get('chart_slots', 'N/A')}")
-        
+
         # 头衔
         titles = profile_data.get('titles', [])
         if titles:
@@ -1089,7 +1087,7 @@ class PlayerProfileCrawler:
                 print(f"  {i}. {title}")
         else:
             print(f"\n头衔: 无")
-        
+
         # 成就 - 只显示成就代码，无图片URL
         achievements = profile_data.get('achievements', [])
         if achievements:
@@ -1098,7 +1096,7 @@ class PlayerProfileCrawler:
                 print(f"  {i}. 成就代码: {achievement.get('code', 'N/A')}")
         else:
             print(f"\n成就徽章: 无")
-        
+
         # 个人简介
         bio = profile_data.get('bio', '')
         if bio:
@@ -1110,31 +1108,31 @@ class PlayerProfileCrawler:
                 print(f"  {bio}")
         else:
             print(f"\n个人简介: 无")
-        
+
         # 数据哈希
         data_hash = self.generate_data_hash(profile_data)
         print(f"\n数据哈希: {data_hash[:16]}...")
-        
+
         print("\n" + "="*80)
-        
+
         return True
-    
+
     def test_parse_and_print(self, uid):
         """测试解析并打印单个玩家的数据"""
         self.logger.info("测试解析玩家: %s", uid)
-        
+
         # 获取HTML页面
         html = self.fetch_player_profile(uid)
         if not html:
             self.logger.error("获取玩家 %s 页面失败或无数据", uid)
             return False
-        
+
         # 解析HTML
         profile_data = self.parse_player_profile_full(html, uid)
         if not profile_data:
             self.logger.error("解析玩家 %s 数据失败", uid)
             return False
-        
+
         # 打印数据
         self.print_profile_data(profile_data)
         return True
@@ -1291,12 +1289,12 @@ class PlayerProfileCrawler:
         print("\n" + "="*70)
         print(colorize("                    爬取统计报告", "1;36"))
         print("="*70)
-        
+
         # 玩家处理概况
         print(f"总计玩家: {total_players}")
         print(f"成功: {colorize(str(success), '92')} | 失败: {colorize(str(failed), '91')}")
         print("-"*70)
-        
+
         # 资料统计
         print(colorize("玩家资料变动详情:", "1;33"))
         total_profile = stats['profile_new'] + stats['profile_updated'] + stats['profile_unchanged']
@@ -1305,7 +1303,7 @@ class PlayerProfileCrawler:
         print(f"  未变化:   {colorize(str(stats['profile_unchanged']), '94')} (仅更新时间)")
         print(f"  失败:     {colorize(str(stats['profile_failed']), '91')}")
         print()
-        
+
         # 排名记录统计
         print(colorize("玩家排名记录变动详情:", "1;33"))
         print(f"  首次插入:   {colorize(str(stats['rank_new']), '92')} (新模式首次记录)")
@@ -1316,94 +1314,94 @@ class PlayerProfileCrawler:
         total_rank = stats['rank_new'] + stats['rank_diff_insert'] + stats['rank_same_insert'] + stats['rank_update'] + stats['rank_update_fill']
         print(f"  总计操作:   {total_rank} 条")
         print("="*70)
-    
+
     def crawl_from_database(self, limit=None, days_since_last_crawl=30):
         """从数据库中获取需要更新的玩家UID"""
         cursor = self.db_manager.get_connection().cursor()
-        
+
         try:
             # 获取需要更新的玩家
             cutoff_date = datetime.now() - timedelta(days=days_since_last_crawl)
-            
+
             query = '''
-            SELECT uid FROM player_profile_crawl_status 
+            SELECT uid FROM player_profile_crawl_status
             WHERE (needs_update = 1 OR last_crawled IS NULL OR last_crawled < ?)
             ORDER BY last_crawled ASC NULLS FIRST
             '''
-            
+
             params = [cutoff_date]
-            
+
             if limit:
                 query += " LIMIT ?"
                 params.append(limit)
-            
+
             cursor.execute(query, params)
             results = cursor.fetchall()
-            
+
             uid_list = [row[0] for row in results]
             self.logger.info("从数据库找到 %d 个需要更新的玩家", len(uid_list))
             return uid_list
-            
+
         except Exception as e:
             self.logger.error("从数据库获取待爬取玩家失败: %s", e)
             return []
-    
+
     def crawl_from_leaderboard(self, mode=0, limit=100):
         """从排行榜获取玩家UID"""
-        from malody_rankings import crawl_mode_player, parse_player_list
-        
+        from malody_rankings import parse_player_list
+
         try:
             self.logger.info("从排行榜模式 %d 获取玩家", mode)
-            
+
             # 直接使用排行榜的session
             url = f"https://m.mugzone.net/page/all/player?from=0&mode={mode}"
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
-            
+
             # 使用现有的解析函数
             players = parse_player_list(response.text)
-            
+
             # 提取有效的UID
             uid_list = []
             for player in players:
                 if player.get('player_id'):
                     uid_list.append(player['player_id'])
-            
+
             # 去重和限制数量
             uid_list = list(set(uid_list))
             if limit and len(uid_list) > limit:
                 uid_list = uid_list[:limit]
-            
+
             self.logger.info("从排行榜获取到 %d 个玩家UID", len(uid_list))
             return uid_list
-            
+
         except Exception as e:
             self.logger.error("从排行榜获取玩家失败: %s", e)
             return []
-    
+
     def crawl_by_uid_range(self, start_uid, end_uid, step=1, print_only=False):
         """按UID范围爬取（旧方法，保留兼容性，但推荐使用 crawl_uid_range）"""
         uid_list = list(range(start_uid, end_uid + 1, step))
         self.logger.info("按UID范围爬取: %d-%d (共 %d 个)", start_uid, end_uid, len(uid_list))
         return self.crawl_players_batch(uid_list, print_only=print_only)
-    
+
     def get_progress_status(self):
         """获取当前爬取状态"""
         with progress_lock:
             if not crawl_progress:
                 return "无进度信息"
-            
+
             return (
                 f"当前进度: {crawl_progress.get('current', 0)}/{crawl_progress.get('total', 0)}\n"
                 f"成功: {crawl_progress.get('success', 0)}\n"
                 f"失败: {crawl_progress.get('fail', 0)}"
             )
-    
+
     def test_connection(self):
         """测试连接"""
         test_uid = "858752"  # 使用之前成功的UID作为测试
         self.logger.info("测试连接，爬取玩家: %s", test_uid)
-        
+
         success = self.crawl_player_profile(test_uid)
         if success:
             self.logger.info("连接测试成功")
@@ -1443,7 +1441,7 @@ def read_uid_file(file_path):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='玩家个人主页资料爬虫')
-    
+
     # 爬取源选项
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument('--uid', type=str, help='单个玩家UID')
@@ -1453,42 +1451,42 @@ def main():
     source_group.add_argument('--from-db', action='store_true', help='从数据库获取需要更新的玩家')
     source_group.add_argument('--from-leaderboard', action='store_true', help='从排行榜获取玩家')
     source_group.add_argument('--leaderboard-mode', type=int, default=0, help='排行榜模式 (默认: 0)')
-    
+
     # 控制选项
     parser.add_argument('--limit', type=int, help='最大爬取数量')
-    parser.add_argument('--days-since-update', type=int, default=30, 
+    parser.add_argument('--days-since-update', type=int, default=30,
                        help='多少天未更新视为需要更新 (默认: 30天)')
-    parser.add_argument('--max-workers', type=int, default=3, 
+    parser.add_argument('--max-workers', type=int, default=3,
                        help='最大并发线程数 (默认: 3)')
-    parser.add_argument('--rpm', type=int, default=15, 
+    parser.add_argument('--rpm', type=int, default=15,
                        help='每分钟请求数 (默认: 15)')
     parser.add_argument('--test', action='store_true', help='测试连接')
-    parser.add_argument('--print-only', action='store_true', 
+    parser.add_argument('--print-only', action='store_true',
                        help='仅解析并打印数据，不保存到数据库')
     parser.add_argument('--status', action='store_true', help='显示数据库状态')
-    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        default='INFO', help='日志级别 (默认: INFO)')
     parser.add_argument('--log-file', help='指定日志文件路径')
     # 新增参数：禁用默认读取players.txt
     parser.add_argument('--no-default-players', action='store_true',
                        help='不自动使用默认的players.txt文件作为UID源')
-    
+
     # 中断恢复相关参数
     parser.add_argument('--resume-file', type=str, default='global_progress.bin',
                        help='全局进度文件 (默认: global_progress.bin)')
     parser.add_argument('--save-interval', type=int, default=10,
                        help='进度保存间隔(秒) (默认: 10)')
-    
+
     args = parser.parse_args()
-    
+
     # 设置信号处理器
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     # 设置日志
     log_level = getattr(logging, args.log_level)
     setup_detailed_logging(log_level=log_level, log_file=args.log_file)
-    
+
     logger = logging.getLogger(__name__)
     if args.max_workers < 1:
         logger.warning("max_workers=%d 非法，已重置为 1", args.max_workers)
@@ -1508,36 +1506,36 @@ def main():
         logger.warning("rpm=%d 超过安全阈值，已下调为 %d", args.rpm, MAX_SAFE_RPM)
         args.rpm = MAX_SAFE_RPM
     logger.info("玩家个人主页爬虫启动，参数: %s", vars(args))
-    
+
     # 初始化数据库（如果需要保存的话）
     if not args.print_only:
         init_database()
-    
+
     # 创建爬虫实例
     crawler = PlayerProfileCrawler()
-    
+
     # 显示状态
     if args.status:
         if not args.print_only:
             cursor = crawler.db_manager.get_connection().cursor()
             cursor.execute("SELECT COUNT(*) FROM player_profiles")
             profile_count = cursor.fetchone()[0]
-            
+
             cursor.execute("SELECT COUNT(*) FROM player_titles")
             title_count = cursor.fetchone()[0]
-            
+
             cursor.execute("SELECT COUNT(*) FROM player_achievements")
             achievement_count = cursor.fetchone()[0]
-            
+
             cursor.execute('''
-            SELECT 
+            SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN needs_update = 1 THEN 1 ELSE 0 END) as need_update,
                 SUM(CASE WHEN last_crawled IS NULL THEN 1 ELSE 0 END) as never_crawled
             FROM player_profile_crawl_status
             ''')
             status_result = cursor.fetchone()
-            
+
             print("玩家资料数据库状态:")
             print(f"  玩家资料数: {profile_count}")
             print(f"  头衔记录数: {title_count}")
@@ -1548,7 +1546,7 @@ def main():
         else:
             print("在 --print-only 模式下无法显示数据库状态")
         return
-    
+
     # 测试连接
     if args.test:
         if crawler.test_connection():
@@ -1556,16 +1554,16 @@ def main():
         else:
             logger.error("连接测试失败")
         return
-    
+
     # 准备UID列表
     uid_list = []
-    
+
     # 检查是否指定了任何UID源
     has_source = any([
-        args.uid, args.uid_list, args.uid_range, 
+        args.uid, args.uid_list, args.uid_range,
         args.uid_file, args.from_db, args.from_leaderboard
     ])
-    
+
     # 如果没有指定任何源且没有禁用默认players.txt，则自动使用默认文件
     if not has_source and not args.no_default_players:
         default_file = "players.txt"
@@ -1575,26 +1573,26 @@ def main():
         else:
             logger.error("未指定任何UID源，且默认文件 %s 不存在，请指定源或创建文件", default_file)
             return
-    
+
     # 按优先级处理各源
     if args.uid:
         uid_list = [args.uid.strip()]
         success, fail = crawler.crawl_players_batch(
-            uid_list, 
+            uid_list,
             max_workers=args.max_workers,
             requests_per_minute=args.rpm,
             print_only=args.print_only
         )
-    
+
     elif args.uid_list:
         uid_list = [uid.strip() for uid in args.uid_list.split(',') if uid.strip()]
         success, fail = crawler.crawl_players_batch(
-            uid_list, 
+            uid_list,
             max_workers=args.max_workers,
             requests_per_minute=args.rpm,
             print_only=args.print_only
         )
-    
+
     elif args.uid_range:
         try:
             start_str, end_str = args.uid_range.split('-')
@@ -1612,28 +1610,28 @@ def main():
         except ValueError:
             logger.error("UID范围格式错误，应为: start-end (如: 1000-2000)")
             return
-    
+
     elif args.uid_file:
         # 使用增强的文件读取函数，支持注释和空行过滤
         uid_list = read_uid_file(args.uid_file)
         if uid_list is None:
             return
         success, fail = crawler.crawl_players_batch(
-            uid_list, 
+            uid_list,
             max_workers=args.max_workers,
             requests_per_minute=args.rpm,
             print_only=args.print_only
         )
-    
+
     elif args.from_db and not args.print_only:
         # 仅当需要保存时才从数据库获取
         uid_list = crawler.crawl_from_database(
-            limit=args.limit, 
+            limit=args.limit,
             days_since_last_crawl=args.days_since_update
         )
         if uid_list:
             success, fail = crawler.crawl_players_batch(
-                uid_list, 
+                uid_list,
                 max_workers=args.max_workers,
                 requests_per_minute=args.rpm,
                 print_only=args.print_only
@@ -1641,7 +1639,7 @@ def main():
         else:
             logger.info("没有需要更新的玩家")
             return
-    
+
     elif args.from_leaderboard:
         uid_list = crawler.crawl_from_leaderboard(
             mode=args.leaderboard_mode,
@@ -1649,7 +1647,7 @@ def main():
         )
         if uid_list:
             success, fail = crawler.crawl_players_batch(
-                uid_list, 
+                uid_list,
                 max_workers=args.max_workers,
                 requests_per_minute=args.rpm,
                 print_only=args.print_only
@@ -1657,16 +1655,16 @@ def main():
         else:
             logger.info("从排行榜未获取到有效玩家")
             return
-    
+
     # 如果没有获取到任何UID，给出提示
     if not uid_list and args.uid is None and args.uid_range is None and args.uid_file is None and args.uid_list is None:
         logger.warning("没有找到需要爬取的玩家")
         return
-    
+
     # 非范围源的处理已经在各分支中完成，这里只记录完成信息
     if not args.print_only and args.uid_range is None:  # 范围源已经在方法内部输出统计
         logger.info("爬取完成: 成功 %d, 失败 %d", success, fail)
-        
+
         # 显示最终状态
         cursor = crawler.db_manager.get_connection().cursor()
         cursor.execute("SELECT COUNT(*) FROM player_profiles")

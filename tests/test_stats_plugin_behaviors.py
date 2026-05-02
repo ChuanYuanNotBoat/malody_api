@@ -4,14 +4,21 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 
 ROOT_PARENT = Path(__file__).resolve().parents[2]
 if str(ROOT_PARENT) not in sys.path:
     sys.path.insert(0, str(ROOT_PARENT))
 
-from malody_api.stats_cli.plugins import export_plugin, help_plugin, update_plugin, utility_plugin  # noqa: E402
+from malody_api.stats_cli.plugins import (  # noqa: E402
+    export_plugin,
+    help_plugin,
+    optimize_plugin,
+    repair_plugin,
+    update_plugin,
+    utility_plugin,
+)
 
 
 def _colorize(text: str, _color: str) -> str:
@@ -80,6 +87,14 @@ class TestStatsPluginBehaviors(TestCase):
             colors=colors,
             get_separator=_separator,
             get_subseparator=_separator,
+        )
+        optimize_plugin.install(_ShellStub, colorize=_colorize, colors=colors, base_dir=".")
+        repair_plugin.install(
+            _ShellStub,
+            colorize=_colorize,
+            colors=colors,
+            db_safe_operation=_db_safe_operation,
+            get_separator=_separator,
         )
 
     def test_update_command_skips_when_split_fails(self):
@@ -309,3 +324,37 @@ class TestStatsPluginBehaviors(TestCase):
         self.assertIn("mm_top=1", output)
         self.assertNotIn("mm_top=2", output)
         conn.close()
+
+    def test_repair_command_fixes_known_status_mismatch(self):
+        shell = _ShellStub()
+        conn = sqlite3.connect(":memory:")
+        cursor = conn.cursor()
+        cursor.executescript(
+            """
+            CREATE TABLE charts (
+                cid INTEGER PRIMARY KEY,
+                status INTEGER
+            );
+            INSERT INTO charts (cid, status) VALUES (139970, 0);
+            """
+        )
+        conn.commit()
+        shell.conn = conn
+
+        with patch("sys.stdout", new_callable=io.StringIO):
+            shell.do_repair("")
+
+        cursor.execute("SELECT status FROM charts WHERE cid = 139970")
+        self.assertEqual(cursor.fetchone()[0], 1)
+        conn.close()
+
+    def test_optimize_command_ignores_argument_and_uses_base_dir_as_cwd(self):
+        shell = _ShellStub()
+        with patch("malody_api.stats_cli.plugins.optimize_plugin.os.path.exists", return_value=True), patch(
+            "malody_api.stats_cli.plugins.optimize_plugin.subprocess.run"
+        ) as run_mock, patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            shell.do_optimize("extra")
+
+        run_mock.assert_called_once()
+        self.assertEqual(run_mock.call_args.kwargs["cwd"], ".")
+        self.assertIn("已忽略", stdout.getvalue())

@@ -1,13 +1,12 @@
 # malody_api/routers/players.py
-from fastapi import APIRouter, Query, HTTPException
-from typing import List, Optional, Literal
 from datetime import datetime, timedelta
-import re
+from typing import Optional, Literal
 
+from fastapi import APIRouter, Query, HTTPException
+from malody_api.core.models import APIResponse, Player, PlayerDetail, PlayerHistoryPoint
 # 改为绝对导入
 from malody_api.core.services import PlayerService
 from malody_api.utils.selector import MCSelector
-from malody_api.core.models import APIResponse, Player, PlayerDetail, PlayerHistoryPoint
 
 router = APIRouter(prefix="/players", tags=["players"])
 player_service = PlayerService()
@@ -19,26 +18,26 @@ def create_selector_from_query(
 ) -> MCSelector:
     """从查询参数创建选择器"""
     selector = MCSelector()
-    
+
     if players:
         selector.set_filters(players=players.split(','))
-    
+
     if modes:
         try:
             mode_list = [int(m.strip()) for m in modes.split(',')]
             selector.set_filters(modes=mode_list)
         except ValueError:
             pass
-    
+
     if time_range:
         selector.set_filters(time_range=parse_time_range(time_range))
-    
+
     return selector
 
 def parse_time_range(time_range: str) -> dict:
     """解析时间范围参数"""
     now = datetime.now()
-    
+
     try:
         if time_range.endswith('d'):
             days = int(time_range[:-1])
@@ -69,20 +68,20 @@ async def get_top_players(
     """获取顶级玩家排名"""
     try:
         selector = create_selector_from_query(players=players, time_range=time_range)
-        
+
         if mode is not None:
             selector.set_filters(modes=[mode])
             selector.current_mode = mode
-        
+
         players_data = player_service.get_top_players(selector, limit, rank_type=rank_type)
-        
+
         return APIResponse(
             success=True,
             data=players_data,
             message=f"找到 {len(players_data)} 名玩家",
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,
@@ -127,18 +126,18 @@ async def get_player_info(
         if mode is not None:
             selector.set_filters(modes=[mode])
             selector.current_mode = mode
-        
+
         player_info = player_service.get_player_info(player_identifier, selector, rank_type=rank_type)
-        
+
         if "error" in player_info:
             raise HTTPException(status_code=404, detail=player_info["error"])
-        
+
         return APIResponse(
             success=True,
             data=player_info,
             timestamp=datetime.now()
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -175,16 +174,16 @@ async def get_player_history(
             selector.current_mode = mode
         elif metric != "mmr":
             selector.current_mode = 0
-        
+
         history_data = player_service.get_player_history(player_name, selector, days, metric=metric)
-        
+
         return APIResponse(
             success=True,
             data=history_data,
             message=f"找到 {len(history_data)} 条历史记录",
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,
@@ -204,16 +203,16 @@ async def search_players(
         if mode is not None:
             selector.set_filters(modes=[mode])
             selector.current_mode = mode
-        
+
         search_results = player_service.search_players(keyword, selector, limit)
-        
+
         return APIResponse(
             success=True,
             data=search_results,
             message=f"找到 {len(search_results)} 个匹配玩家",
             timestamp=datetime.now()
         )
-        
+
     except Exception as e:
         return APIResponse(
             success=False,

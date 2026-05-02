@@ -4,7 +4,6 @@ from pathlib import Path
 
 import requests
 
-
 BASE_URL = "https://m.mugzone.net"
 
 
