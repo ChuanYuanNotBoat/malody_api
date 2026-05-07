@@ -1,8 +1,12 @@
 import json
 import os
 import sys
+import threading
+from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, Literal, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from malody_api.core.models import APIResponse
@@ -17,6 +21,14 @@ router = APIRouter(
 
 MAX_SAFE_PLAYER_WORKERS = 8
 MAX_SAFE_RPM = 120
+SOURCE_HEALTH_TTL_SECONDS = 60
+
+_source_health_cache: Dict[str, Any] = {
+    "checked_at": None,
+    "data": None,
+}
+_source_health_lock = threading.Lock()
+_source_health_refreshing = False
 
 
 def _safe_read_json(path: str) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -36,6 +48,154 @@ def _file_meta(path: str) -> Dict[str, Any]:
         "size": stat.st_size,
         "updated_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
     }
+
+
+def _ping_url(url: str, timeout_seconds: float = 5.0) -> Dict[str, Any]:
+    req = Request(url, method="GET", headers={"User-Agent": "malody-api-health-check"})
+    started_at = datetime.now()
+    try:
+        with urlopen(req, timeout=timeout_seconds) as resp:
+            code = getattr(resp, "status", 200)
+            ok = 200 <= code < 400
+            return {
+                "ok": ok,
+                "status_code": code,
+                "latency_ms": int((datetime.now() - started_at).total_seconds() * 1000),
+                "error": None,
+            }
+    except HTTPError as e:
+        return {
+            "ok": False,
+            "status_code": e.code,
+            "latency_ms": int((datetime.now() - started_at).total_seconds() * 1000),
+            "error": f"http_error:{e.code}",
+        }
+    except URLError as e:
+        return {
+            "ok": False,
+            "status_code": None,
+            "latency_ms": int((datetime.now() - started_at).total_seconds() * 1000),
+            "error": f"network_error:{e.reason}",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "status_code": None,
+            "latency_ms": int((datetime.now() - started_at).total_seconds() * 1000),
+            "error": f"unknown_error:{e}",
+        }
+
+
+def _extract_failure_category(lines: list[str]) -> str:
+    haystack = "\n".join(lines).lower()
+    if any(key in haystack for key in ["401", "403", "unauthorized", "forbidden", "cookie", "auth"]):
+        return "auth"
+    if any(
+        key in haystack
+        for key in ["timeout", "connection", "dns", "socket", "ssl", "reset by peer", "network", "urlopen"]
+    ):
+        return "network"
+    if any(
+        key in haystack
+        for key in ["parse", "selector", "xpath", "missing", "not found", "schema", "unexpected structure", "json decode"]
+    ):
+        return "structure"
+    return "unknown"
+
+
+def _build_failure_stats() -> Dict[str, Any]:
+    failed_tasks = crawler_task_service.list_tasks(status="failed", limit=50)
+    counts = Counter()
+    samples: Dict[str, Dict[str, Any]] = {}
+    for task in failed_tasks:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            continue
+        log_data = crawler_task_service.read_task_log(task_id, tail=30)
+        lines = log_data.get("lines") or []
+        category = _extract_failure_category(lines)
+        counts[category] += 1
+        if category not in samples:
+            samples[category] = {
+                "task_id": task_id,
+                "crawler_type": task.get("crawler_type"),
+            }
+    return {
+        "counts": {
+            "network": counts.get("network", 0),
+            "structure": counts.get("structure", 0),
+            "auth": counts.get("auth", 0),
+            "unknown": counts.get("unknown", 0),
+        },
+        "sample_tasks": samples,
+    }
+
+
+def _collect_data_source_health(now: datetime) -> Dict[str, Any]:
+    checks = {
+        "home": _ping_url("https://m.mugzone.net/"),
+        "latest": _ping_url("https://m.mugzone.net/charts/latest"),
+        "api": _ping_url("https://m.mugzone.net/api"),
+    }
+    failure_stats = _build_failure_stats()
+    healthy_count = sum(1 for item in checks.values() if item.get("ok"))
+    overall = "healthy" if healthy_count == len(checks) else "degraded" if healthy_count > 0 else "unavailable"
+
+    data = {
+        "overall": overall,
+        "checked_at": now.isoformat(),
+        "ttl_seconds": SOURCE_HEALTH_TTL_SECONDS,
+        "sources": checks,
+        "failure_categories": failure_stats,
+    }
+
+
+def _refresh_source_health_cache_background() -> None:
+    global _source_health_refreshing
+    try:
+        now = datetime.now()
+        data = _collect_data_source_health(now)
+        with _source_health_lock:
+            _source_health_cache["checked_at"] = now.timestamp()
+            _source_health_cache["data"] = data
+    finally:
+        with _source_health_lock:
+            _source_health_refreshing = False
+
+
+def _build_data_source_health(force_refresh: bool = False) -> Dict[str, Any]:
+    global _source_health_refreshing
+    now = datetime.now()
+    now_ts = now.timestamp()
+    with _source_health_lock:
+        checked_at = _source_health_cache.get("checked_at")
+        cached_data = _source_health_cache.get("data")
+        refreshing = _source_health_refreshing
+        if (
+            not force_refresh
+            and isinstance(checked_at, (int, float))
+            and cached_data is not None
+            and now_ts - checked_at < SOURCE_HEALTH_TTL_SECONDS
+        ):
+            return cached_data
+
+        if not force_refresh and cached_data is not None:
+            if not refreshing:
+                _source_health_refreshing = True
+                thread = threading.Thread(target=_refresh_source_health_cache_background, daemon=True)
+                thread.start()
+            stale_view = dict(cached_data)
+            stale_view["refresh_in_progress"] = True
+            stale_view["stale_seconds"] = int(max(0, now_ts - checked_at)) if isinstance(checked_at, (int, float)) else None
+            return stale_view
+
+    data = _collect_data_source_health(now)
+    with _source_health_lock:
+        _source_health_cache["checked_at"] = now_ts
+        _source_health_cache["data"] = data
+        _source_health_refreshing = False
+
+    return data
 
 
 @router.post("/run", response_model=APIResponse)
@@ -231,6 +391,7 @@ async def get_crawler_status():
             }
 
     status["tasks"] = crawler_task_service.summarize()
+    status["data_source_health"] = _build_data_source_health()
     return APIResponse(success=True, data=status, timestamp=datetime.now())
 
 
@@ -264,4 +425,3 @@ async def get_crawler_task_log(
     if not data.get("found"):
         raise HTTPException(status_code=404, detail="task not found")
     return APIResponse(success=True, data=data, timestamp=datetime.now())
-

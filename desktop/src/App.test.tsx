@@ -3,7 +3,7 @@ import {beforeEach, describe, expect, it, vi} from "vitest";
 import {render, screen, waitFor} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {QueryClient, QueryClientProvider} from "@tanstack/react-query";
-import App from "./App";
+import App, {buildCrawlerRunParams} from "./App";
 import * as api from "./api";
 
 vi.mock("echarts-for-react", () => ({
@@ -30,6 +30,12 @@ vi.mock("./api", () => {
     getDbHealth: vi.fn().mockResolvedValue({ db_path: "x", file_size_bytes: 1024, fragmentation_ratio: 0, quick_check: "ok" }),
     getDbMaintenanceHistory: vi.fn().mockResolvedValue({ history: [] }),
     getPlugins: vi.fn().mockResolvedValue({ plugins: [] }),
+    getPredefinedQueries: vi.fn().mockResolvedValue({}),
+    executeAdvancedQuery: vi.fn().mockResolvedValue([]),
+    getModeComparison: vi.fn().mockResolvedValue([]),
+    getPlayerCompare: vi.fn().mockResolvedValue({ players: [] }),
+    getChartTrends: vi.fn().mockResolvedValue([]),
+    getChartExportUrl: vi.fn().mockReturnValue("http://127.0.0.1:18765/charts/export/charts?format=csv"),
     getQualityReport: vi.fn().mockResolvedValue({ score: 90, severity: "low", trend: "stable", issues: [] }),
     runCrawler: vi.fn().mockResolvedValue({ command: [], task: { task_id: "t1" } }),
     runDbMaintenance: vi.fn().mockResolvedValue({ action: "analyze", success: true }),
@@ -131,5 +137,103 @@ describe("App GUI flow", () => {
     expect(screen.getByText(/request failed \(HTTP 500\)/i)).toBeInTheDocument();
     expect(screen.getByText("View technical details")).toBeInTheDocument();
     expect(screen.getByText(/\/plugins - boom/i)).toBeInTheDocument();
+  });
+
+  it("runs analytics mode comparison", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Analytics"));
+    await userEvent.click((await screen.findAllByRole("button", { name: "Run" }))[0]);
+    await waitFor(() => expect(api.getModeComparison).toHaveBeenCalled());
+    expect(vi.mocked(api.getModeComparison).mock.calls[0][0]).toBe("0,1,2,3");
+  });
+
+  it("executes predefined query and renders result", async () => {
+    vi.mocked(api.getPredefinedQueries).mockResolvedValueOnce({
+      top_players_by_mode: {
+        parameters: {
+          table: "player_rankings",
+          columns: ["mode", "rank", "name"],
+          filters: [{ field: "rank", operator: "<=", value: 10 }],
+          order_by: ["mode", "rank"],
+          group_by: ["mode"],
+          limit: 50
+        }
+      }
+    } as never);
+    vi.mocked(api.executeAdvancedQuery).mockResolvedValueOnce([{ mode: 0, rank: 1, name: "Alice" }] as never);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Query & Export"));
+    await userEvent.click(await screen.findByRole("button", { name: "Run Task" }));
+
+    await waitFor(() => expect(api.executeAdvancedQuery).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.executeAdvancedQuery).mock.calls[0][0]).toEqual({
+      table: "player_rankings",
+      columns: ["mode", "rank", "name"],
+      filters: [{ field: "rank", operator: "<=", value: 10 }],
+      order_by: ["mode", "rank"],
+      group_by: ["mode"],
+      having: [],
+      limit: 50,
+      offset: 0,
+      distinct: false
+    });
+    expect(await screen.findByText("Alice")).toBeInTheDocument();
+  });
+
+  it("runs plugin with schema-driven payload", async () => {
+    vi.mocked(api.getPlugins).mockResolvedValueOnce({
+      plugins: [
+        {
+          id: "analysis.quality_snapshot",
+          name: "Quality Snapshot",
+          version: "1.0.0",
+          capabilities: ["analysis"],
+          run_schema: {
+            type: "object",
+            properties: {
+              stale_hours: { type: "integer", default: 24, minimum: 1, maximum: 168 },
+              include_history: { type: "boolean", default: true }
+            }
+          }
+        }
+      ]
+    } as never);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Plugins"));
+    await userEvent.click(await screen.findByRole("button", { name: "Config" }));
+    await userEvent.click((await screen.findAllByRole("button", { name: "Run" }))[0]);
+
+    await waitFor(() =>
+      expect(api.runPlugin).toHaveBeenCalledWith("analysis.quality_snapshot", {
+        payload: { stale_hours: 24, include_history: true }
+      })
+    );
+  });
+
+  it("buildCrawlerRunParams keeps params isolated by crawler type", () => {
+    const leaderboard = buildCrawlerRunParams({
+      crawler_type: "leaderboard",
+      source: "newapi",
+      limit: 100,
+      uid: "1001",
+      from_db: true
+    });
+    expect(leaderboard.get("crawler_type")).toBe("leaderboard");
+    expect(leaderboard.get("source")).toBe("newapi");
+    expect(leaderboard.get("uid")).toBeNull();
+    expect(leaderboard.get("from_db")).toBeNull();
+
+    const player = buildCrawlerRunParams({
+      crawler_type: "player",
+      uid: "1001",
+      from_db: true,
+      cid_crawl: true
+    });
+    expect(player.get("crawler_type")).toBe("player");
+    expect(player.get("uid")).toBe("1001");
+    expect(player.get("from_db")).toBe("true");
+    expect(player.get("cid_crawl")).toBeNull();
   });
 });

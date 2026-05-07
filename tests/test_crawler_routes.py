@@ -113,3 +113,32 @@ class TestCrawlerRoutes(TestCase):
         ):
             resp = self.client.get("/crawler/tasks/missing-task")
         self.assertEqual(resp.status_code, 404)
+
+    def test_status_includes_data_source_health(self):
+        fake_health = {
+            "overall": "healthy",
+            "checked_at": "2026-01-01T00:00:00",
+            "ttl_seconds": 60,
+            "sources": {
+                "home": {"ok": True, "status_code": 200, "latency_ms": 10, "error": None},
+                "latest": {"ok": True, "status_code": 200, "latency_ms": 12, "error": None},
+                "api": {"ok": True, "status_code": 200, "latency_ms": 15, "error": None},
+            },
+            "failure_categories": {
+                "counts": {"network": 0, "structure": 0, "auth": 0, "unknown": 0},
+                "sample_tasks": {},
+            },
+        }
+        with patch(
+            "malody_api.routers.crawler._build_data_source_health",
+            return_value=fake_health,
+        ):
+            resp = self.client.get("/crawler/status")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertIn("cid", body["data"])
+        self.assertIn("sid", body["data"])
+        self.assertIn("global", body["data"])
+        self.assertIn("data_source_health", body["data"])
+        self.assertEqual(body["data"]["data_source_health"]["overall"], "healthy")

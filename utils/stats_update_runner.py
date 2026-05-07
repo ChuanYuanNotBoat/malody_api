@@ -2,50 +2,92 @@ import os
 import re
 import shlex
 import subprocess
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 
 ColorizeFn = Callable[[str, str], str]
 
-PLAYER_ALLOWED_FLAGS = {
-    "--uid",
-    "--uid-list",
-    "--uid-range",
-    "--uid-file",
-    "--from-db",
-    "--from-leaderboard",
-    "--leaderboard-mode",
-    "--limit",
-    "--days-since-update",
-    "--max-workers",
-    "--rpm",
-    "--test",
-    "--print-only",
-    "--status",
-    "--log-level",
-    "--log-file",
-    "--no-default-players",
-    "--resume-file",
-    "--save-interval",
-    "--once",
-}
 
-STB_ALLOWED_FLAGS = {
-    "--once",
-    "--limit",
-    "--rpm",
-    "--source",
-    "--cid-crawl",
-    "--sid-crawl",
-    "--retry-failed",
-    "--start",
-    "--end",
-    "--resume",
-    "--no-resume",
-    "--max-retries",
-    "--skip-test",
-    "--log-level",
-    "--log-file",
+@dataclass(frozen=True)
+class FlagSpec:
+    flag: str
+    value_type: str  # bool | str | int | enum
+    target: Optional[str] = None
+    enum_values: Optional[List[str]] = None
+    minimum: Optional[int] = None
+    maximum: Optional[int] = None
+    normalize_upper: bool = False
+
+
+UPDATE_OPTION_SCHEMAS: Dict[str, Dict[str, object]] = {
+    "leaderboard": {
+        "script": "malody_rankings.py",
+        "flags": {
+            "--once": FlagSpec(flag="--once", value_type="bool", target="--once"),
+        },
+        "defaults": ["--once"],
+    },
+    "player": {
+        "script": "player_profile_crawler.py",
+        "flags": {
+            "--uid": FlagSpec(flag="--uid", value_type="str"),
+            "--uid-list": FlagSpec(flag="--uid-list", value_type="str"),
+            "--uid-range": FlagSpec(flag="--uid-range", value_type="str"),
+            "--uid-file": FlagSpec(flag="--uid-file", value_type="str"),
+            "--log-level": FlagSpec(
+                flag="--log-level",
+                value_type="enum",
+                enum_values=["DEBUG", "INFO", "WARNING", "ERROR"],
+                normalize_upper=False,
+            ),
+            "--log-file": FlagSpec(flag="--log-file", value_type="str"),
+            "--resume-file": FlagSpec(flag="--resume-file", value_type="str"),
+            "--leaderboard-mode": FlagSpec(flag="--leaderboard-mode", value_type="int", minimum=1),
+            "--limit": FlagSpec(flag="--limit", value_type="int", minimum=1),
+            "--days-since-update": FlagSpec(flag="--days-since-update", value_type="int", minimum=1),
+            "--max-workers": FlagSpec(flag="--max-workers", value_type="int", minimum=1),
+            "--rpm": FlagSpec(flag="--rpm", value_type="int", minimum=1),
+            "--save-interval": FlagSpec(flag="--save-interval", value_type="int", minimum=1),
+            "--from-db": FlagSpec(flag="--from-db", value_type="bool"),
+            "--from-leaderboard": FlagSpec(flag="--from-leaderboard", value_type="bool"),
+            "--test": FlagSpec(flag="--test", value_type="bool"),
+            "--print-only": FlagSpec(flag="--print-only", value_type="bool"),
+            "--status": FlagSpec(flag="--status", value_type="bool"),
+            "--no-default-players": FlagSpec(flag="--no-default-players", value_type="bool"),
+            "--once": FlagSpec(flag="--once", value_type="bool"),
+        },
+        "ignored_flags": ["--once"],
+    },
+    "stb": {
+        "script": "stb_crawler.py",
+        "flags": {
+            "--once": FlagSpec(flag="--once", value_type="bool"),
+            "--skip-test": FlagSpec(flag="--skip-test", value_type="bool"),
+            "--source": FlagSpec(
+                flag="--source",
+                value_type="enum",
+                enum_values=["all", "home", "latest", "api"],
+            ),
+            "--limit": FlagSpec(flag="--limit", value_type="int", target="--max-charts", minimum=1),
+            "--rpm": FlagSpec(flag="--rpm", value_type="int", minimum=1),
+            "--max-retries": FlagSpec(flag="--max-retries", value_type="int", minimum=1),
+            "--cid-crawl": FlagSpec(flag="--cid-crawl", value_type="bool"),
+            "--sid-crawl": FlagSpec(flag="--sid-crawl", value_type="bool"),
+            "--retry-failed": FlagSpec(flag="--retry-failed", value_type="bool"),
+            "--start": FlagSpec(flag="--start", value_type="int", minimum=1),
+            "--end": FlagSpec(flag="--end", value_type="int", minimum=1),
+            "--resume": FlagSpec(flag="--resume", value_type="str"),
+            "--no-resume": FlagSpec(flag="--no-resume", value_type="bool"),
+            "--log-level": FlagSpec(
+                flag="--log-level",
+                value_type="enum",
+                enum_values=["DEBUG", "INFO", "WARNING", "ERROR"],
+                normalize_upper=True,
+            ),
+            "--log-file": FlagSpec(flag="--log-file", value_type="str"),
+        },
+    },
 }
 
 
@@ -85,131 +127,86 @@ def parse_positive_int(name: str, value: str, colorize: ColorizeFn, red: str) ->
         return None
 
 
-def build_update_command(
-    tokens: List[str],
-    base_dir: str,
-    python_executable: str,
+def _validate_and_append_flag(
+    cmd: List[str],
+    flag: str,
+    raw_value: object,
+    spec: FlagSpec,
     colorize: ColorizeFn,
     red: str,
-    yellow: str,
-) -> Optional[List[str]]:
-    crawler_flags = ["--leaderboard", "--player", "--stb"]
-    selected = [f for f in crawler_flags if f in tokens]
-    if len(selected) > 1:
-        print(colorize("错误: --leaderboard/--player/--stb 只能选一个", red))
-        return None
-    crawler_type = selected[0] if selected else "--leaderboard"
-    filtered_tokens = [t for t in tokens if t not in crawler_flags]
-    options = parse_cli_options(filtered_tokens, colorize, red)
-    if options is None:
-        return None
+) -> bool:
+    target = spec.target or flag
 
-    if crawler_type == "--leaderboard":
-        script = os.path.join(base_dir, "malody_rankings.py")
-        cmd = [python_executable, script]
-        allow = {"--once"}
-        unknown = [k for k in options.keys() if k not in allow]
-        if unknown:
-            print(colorize(f"leaderboard 不支持参数: {', '.join(unknown)}", red))
-            return None
-        if options.get("--once") is True or not tokens:
-            cmd.append("--once")
-        return cmd
+    if spec.value_type == "bool":
+        if raw_value is True:
+            cmd.append(target)
+        return True
 
-    if crawler_type == "--player":
-        script = os.path.join(base_dir, "player_profile_crawler.py")
-        cmd = [python_executable, script]
-        unknown = [k for k in options.keys() if k not in PLAYER_ALLOWED_FLAGS]
-        if unknown:
-            print(colorize(f"player 不支持参数: {', '.join(unknown)}", red))
-            return None
+    if not isinstance(raw_value, str):
+        print(colorize(f"参数 {flag} 需要值", red))
+        return False
 
-        if options.get("--once"):
-            print(colorize("提示: player_profile_crawler.py 不支持 --once，已忽略", yellow))
+    if spec.value_type == "str":
+        cmd.extend([target, raw_value])
+        return True
 
-        value_flags = ["--uid", "--uid-list", "--uid-range", "--uid-file", "--log-level", "--log-file", "--resume-file"]
-        int_flags = ["--leaderboard-mode", "--limit", "--days-since-update", "--max-workers", "--rpm", "--save-interval"]
-        bool_flags = ["--from-db", "--from-leaderboard", "--test", "--print-only", "--status", "--no-default-players"]
-
-        for f in value_flags:
-            v = options.get(f)
-            if isinstance(v, str):
-                cmd.extend([f, v])
-
-        for f in int_flags:
-            v = options.get(f)
-            if isinstance(v, str):
-                iv = parse_positive_int(f, v, colorize, red)
-                if iv is None:
-                    return None
-                cmd.extend([f, str(iv)])
-
-        for f in bool_flags:
-            if options.get(f) is True:
-                cmd.append(f)
-        return cmd
-
-    script = os.path.join(base_dir, "stb_crawler.py")
-    cmd = [python_executable, script]
-    unknown = [k for k in options.keys() if k not in STB_ALLOWED_FLAGS]
-    if unknown:
-        print(colorize(f"stb 不支持参数: {', '.join(unknown)}", red))
-        return None
-
-    if options.get("--once") is True:
-        cmd.append("--once")
-    if options.get("--skip-test") is True:
-        cmd.append("--skip-test")
-
-    if isinstance(options.get("--source"), str):
-        source = options["--source"]
-        if source not in ["all", "home", "latest", "api"]:
-            print(colorize("--source 仅支持 all/home/latest/api", red))
-            return None
-        cmd.extend(["--source", source])
-
-    if isinstance(options.get("--limit"), str):
-        iv = parse_positive_int("--limit", options["--limit"], colorize, red)
+    if spec.value_type == "int":
+        iv = parse_positive_int(flag, raw_value, colorize, red)
         if iv is None:
-            return None
-        cmd.extend(["--max-charts", str(iv)])
+            return False
+        if spec.minimum is not None and iv < spec.minimum:
+            print(colorize(f"参数 {flag} 不能小于 {spec.minimum}", red))
+            return False
+        if spec.maximum is not None and iv > spec.maximum:
+            print(colorize(f"参数 {flag} 不能大于 {spec.maximum}", red))
+            return False
+        cmd.extend([target, str(iv)])
+        return True
 
-    if isinstance(options.get("--rpm"), str):
-        iv = parse_positive_int("--rpm", options["--rpm"], colorize, red)
-        if iv is None:
-            return None
-        cmd.extend(["--rpm", str(iv)])
+    if spec.value_type == "enum":
+        enum_values = spec.enum_values or []
+        if spec.normalize_upper:
+            normalized = raw_value.upper()
+            candidate = normalized
+            valid_pool = enum_values
+        else:
+            normalized = raw_value
+            candidate = raw_value.lower()
+            valid_pool = [item.lower() for item in enum_values]
+        if candidate not in valid_pool:
+            print(colorize(f"{flag} 仅支持: {'/'.join(enum_values)}", red))
+            return False
+        cmd.extend([target, normalized])
+        return True
 
-    if isinstance(options.get("--max-retries"), str):
-        iv = parse_positive_int("--max-retries", options["--max-retries"], colorize, red)
-        if iv is None:
-            return None
-        cmd.extend(["--max-retries", str(iv)])
+    print(colorize(f"参数 {flag} 的规则类型无效: {spec.value_type}", red))
+    return False
 
+
+def _apply_stb_range_mapping(
+    cmd: List[str],
+    options: Dict[str, object],
+    colorize: ColorizeFn,
+    red: str,
+) -> bool:
     cid_crawl = options.get("--cid-crawl") is True
     sid_crawl = options.get("--sid-crawl") is True
-    retry_failed = options.get("--retry-failed") is True
-    if cid_crawl:
-        cmd.append("--cid-crawl")
-    if sid_crawl:
-        cmd.append("--sid-crawl")
-    if retry_failed:
-        cmd.append("--retry-failed")
 
     start_value = options.get("--start")
-    end_value = options.get("--end")
     if isinstance(start_value, str):
         sv = parse_positive_int("--start", start_value, colorize, red)
         if sv is None:
-            return None
+            return False
         if cid_crawl or (not sid_crawl):
             cmd.extend(["--start-cid", str(sv)])
         if sid_crawl:
             cmd.extend(["--start-sid", str(sv)])
+
+    end_value = options.get("--end")
     if isinstance(end_value, str):
         ev = parse_positive_int("--end", end_value, colorize, red)
         if ev is None:
-            return None
+            return False
         if cid_crawl or (not sid_crawl):
             cmd.extend(["--end-cid", str(ev)])
         if sid_crawl:
@@ -223,16 +220,67 @@ def build_update_command(
             cmd.append("--no-resume")
         elif rv not in ["true", "1", "yes", "y"]:
             print(colorize("--resume 仅支持 true/false", red))
+            return False
+
+    return True
+
+
+def build_update_command(
+    tokens: List[str],
+    base_dir: str,
+    python_executable: str,
+    colorize: ColorizeFn,
+    red: str,
+    yellow: str,
+) -> Optional[List[str]]:
+    crawler_flags = ["--leaderboard", "--player", "--stb"]
+    selected = [f for f in crawler_flags if f in tokens]
+    if len(selected) > 1:
+        print(colorize("错误: --leaderboard/--player/--stb 只能选一个", red))
+        return None
+
+    crawler_type = selected[0].lstrip("-") if selected else "leaderboard"
+    schema = UPDATE_OPTION_SCHEMAS[crawler_type]
+    script = os.path.join(base_dir, str(schema["script"]))
+    cmd = [python_executable, script]
+
+    filtered_tokens = [t for t in tokens if t not in crawler_flags]
+    options = parse_cli_options(filtered_tokens, colorize, red)
+    if options is None:
+        return None
+
+    flag_specs: Dict[str, FlagSpec] = schema["flags"]  # type: ignore[assignment]
+    unknown = [k for k in options.keys() if k not in flag_specs]
+    if unknown:
+        print(colorize(f"{crawler_type} 不支持参数: {', '.join(unknown)}", red))
+        return None
+
+    ignored_flags = set(schema.get("ignored_flags", []))
+    for flag in ignored_flags:
+        if options.get(flag) is True:
+            print(colorize(f"提示: {crawler_type} 忽略参数 {flag}", yellow))
+
+    for flag in flag_specs.keys():
+        if flag not in options:
+            continue
+        raw_value = options[flag]
+        if flag in ignored_flags:
+            continue
+        if crawler_type == "stb" and flag in {"--start", "--end", "--resume", "--no-resume"}:
+            continue
+        spec = flag_specs[flag]
+        if not _validate_and_append_flag(cmd, flag, raw_value, spec, colorize, red):
             return None
 
-    if isinstance(options.get("--log-level"), str):
-        level = str(options["--log-level"]).upper()
-        if level not in ["DEBUG", "INFO", "WARNING", "ERROR"]:
-            print(colorize("--log-level 仅支持 DEBUG/INFO/WARNING/ERROR", red))
+    if crawler_type == "stb":
+        if not _apply_stb_range_mapping(cmd, options, colorize, red):
             return None
-        cmd.extend(["--log-level", level])
-    if isinstance(options.get("--log-file"), str):
-        cmd.extend(["--log-file", options["--log-file"]])
+
+    if not options:
+        defaults = schema.get("defaults", [])
+        for flag in defaults:
+            cmd.append(str(flag))
+
     return cmd
 
 

@@ -16,6 +16,16 @@ TimeRangeParserFn = Callable[[str], Optional[dict]]
 FilenameFn = Callable[[str, str], str]
 
 SUPPORTED_EXPORT_FORMATS = {"csv", "xlsx"}
+SUPPORTED_EXPORT_TYPES = {"top", "history", "chart", "song", "profile"}
+EXPORT_OPTION_RULES = {
+    "--mode": "int",
+    "--limit": "int",
+    "--players": "str",
+    "--time-range": "str",
+    "--format": "enum",
+    "--with-summary": "bool",
+    "--with-metadata": "bool",
+}
 
 
 def _build_player_lookup_filter(players: list[str], table_alias: str) -> tuple[str, list[object]]:
@@ -108,8 +118,15 @@ def parse_export_request(
         return None
 
     export_type = args[0].lower()
+    if export_type not in SUPPORTED_EXPORT_TYPES:
+        print(colorize(f"Error: unsupported export type '{export_type}'", red))
+        return None
     opts = parse_cli_options(args[1:], colorize, red)
     if opts is None:
+        return None
+    unknown = [key for key in opts.keys() if key not in EXPORT_OPTION_RULES]
+    if unknown:
+        print(colorize(f"Error: unsupported export options: {', '.join(unknown)}", red))
         return None
 
     mode = None

@@ -1,5 +1,13 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
-import {API_BASE, getPlugins, getQualityCheckJob, runDbMaintenance, startQualityCheckJob} from "./api";
+import {
+  API_BASE,
+  executeAdvancedQuery,
+  getChartExportUrl,
+  getPlugins,
+  getQualityCheckJob,
+  runDbMaintenance,
+  startQualityCheckJob
+} from "./api";
 
 describe("api request edge cases", () => {
   beforeEach(() => {
@@ -78,5 +86,37 @@ describe("api request edge cases", () => {
     );
 
     await expect(getPlugins()).rejects.toThrow("HTTP 500 /plugins: unknown error");
+  });
+
+  it("builds advanced query endpoint with list params", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ success: true, data: [{ id: 1 }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+
+    const out = await executeAdvancedQuery({
+      table: "charts",
+      columns: ["cid", "mode"],
+      filters: [{ field: "mode", operator: "=", value: 0 }],
+      order_by: ["cid DESC"],
+      group_by: ["mode"],
+      limit: 10,
+      offset: 0,
+      distinct: false
+    });
+
+    expect(out).toHaveLength(1);
+    const calledUrl = vi.mocked(globalThis.fetch).mock.calls[0][0] as string;
+    expect(calledUrl).toContain("/query/execute?");
+    expect(calledUrl).toContain("table=charts");
+    expect(calledUrl).toContain("columns=cid");
+    expect(calledUrl).toContain("columns=mode");
+  });
+
+  it("builds chart export url", () => {
+    const url = getChartExportUrl({ mode: 0, creators: "Alice", statuses: "2", format: "xlsx" });
+    expect(url).toBe(`${API_BASE}/charts/export/charts?mode=0&creators=Alice&statuses=2&format=xlsx`);
   });
 });

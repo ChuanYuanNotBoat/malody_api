@@ -78,3 +78,14 @@ desktop/.tauri/
 desktop/*.tsbuildinfo
 desktop/vite.config.js
 desktop/vite.config.d.ts
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage/
+htmlcov/
+
+# Python tool caches
+.ruff_cache/
+.mypy_cache/

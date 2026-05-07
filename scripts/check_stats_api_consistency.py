@@ -12,7 +12,7 @@ import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import requests
 
@@ -101,12 +101,54 @@ def api_get(base_url: str, path: str, params: Dict[str, Any]) -> Any:
     return payload.get("data")
 
 
-def compare_values(name: str, baseline: Any, api_value: Any) -> Dict[str, Any]:
+def _calc_delta(baseline: Any, api_value: Any) -> Any:
+    if isinstance(baseline, (int, float)) and isinstance(api_value, (int, float)):
+        return api_value - baseline
+    return None
+
+
+def _rule_threshold(check_name: str, default_threshold: float, rules: Dict[str, float]) -> float:
+    if check_name in rules:
+        return rules[check_name]
+    best_prefix = ""
+    best_threshold = default_threshold
+    for prefix, threshold in rules.items():
+        if check_name.startswith(prefix) and len(prefix) > len(best_prefix):
+            best_prefix = prefix
+            best_threshold = threshold
+    return best_threshold
+
+
+def _is_blocking_check(check_name: str, block_on_prefixes: Sequence[str]) -> bool:
+    if not block_on_prefixes:
+        return False
+    if "*" in block_on_prefixes:
+        return True
+    return any(check_name.startswith(prefix) for prefix in block_on_prefixes)
+
+
+def compare_values(
+    name: str,
+    baseline: Any,
+    api_value: Any,
+    default_threshold: float,
+    threshold_rules: Dict[str, float],
+    block_on_prefixes: Sequence[str],
+) -> Dict[str, Any]:
+    equal = baseline == api_value
+    delta = _calc_delta(baseline, api_value)
+    threshold = _rule_threshold(name, default_threshold, threshold_rules)
+    exceeded = (abs(delta) > threshold) if delta is not None else (not equal)
+    blocking = exceeded and _is_blocking_check(name, block_on_prefixes)
     return {
         "name": name,
         "baseline": baseline,
         "api": api_value,
-        "equal": baseline == api_value,
+        "equal": equal,
+        "delta": delta,
+        "threshold": threshold,
+        "threshold_exceeded": exceeded,
+        "blocking": blocking,
     }
 
 
@@ -116,7 +158,18 @@ def parse_csv_ints(raw: str) -> List[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
 
-def run_consistency_case(conn: sqlite3.Connection, base_url: str, mode: int, limit: int) -> Dict[str, Any]:
+def run_consistency_case(
+    conn: sqlite3.Connection,
+    base_url: str,
+    mode: int,
+    limit: int,
+    *,
+    default_threshold: float = 0,
+    threshold_rules: Optional[Dict[str, float]] = None,
+    block_on_prefixes: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    threshold_rules = threshold_rules or {}
+    block_on_prefixes = block_on_prefixes or ["*"]
     summary_base = calc_summary_baseline(conn, mode)
     quality_base = calc_quality_baseline(conn, mode)
     top_base = calc_top_stabilizers_baseline(conn, mode, limit)
@@ -126,28 +179,112 @@ def run_consistency_case(conn: sqlite3.Connection, base_url: str, mode: int, lim
     top_api = api_get(base_url, "/charts/stabilizers/top", {"mode": mode, "limit": limit})
 
     checks: List[Dict[str, Any]] = []
-    checks.append(compare_values("summary.total_charts", summary_base["total_charts"], summary_api.get("total_charts")))
-    checks.append(compare_values("summary.unique_songs", summary_base["unique_songs"], summary_api.get("unique_songs")))
-    checks.append(compare_values("summary.unique_creators", summary_base["unique_creators"], summary_api.get("unique_creators")))
     checks.append(
-        compare_values("quality.total_charts_checked", quality_base["total_charts_checked"], quality_api.get("total_charts_checked"))
+        compare_values(
+            "summary.total_charts",
+            summary_base["total_charts"],
+            summary_api.get("total_charts"),
+            default_threshold,
+            threshold_rules,
+            block_on_prefixes,
+        )
+    )
+    checks.append(
+        compare_values(
+            "summary.unique_songs",
+            summary_base["unique_songs"],
+            summary_api.get("unique_songs"),
+            default_threshold,
+            threshold_rules,
+            block_on_prefixes,
+        )
+    )
+    checks.append(
+        compare_values(
+            "summary.unique_creators",
+            summary_base["unique_creators"],
+            summary_api.get("unique_creators"),
+            default_threshold,
+            threshold_rules,
+            block_on_prefixes,
+        )
+    )
+    checks.append(
+        compare_values(
+            "quality.total_charts_checked",
+            quality_base["total_charts_checked"],
+            quality_api.get("total_charts_checked"),
+            default_threshold,
+            threshold_rules,
+            block_on_prefixes,
+        )
     )
     for key, val in quality_base["issues"].items():
         api_count = (quality_api.get("issues", {}).get(key) or {}).get("count")
-        checks.append(compare_values(f"quality.issues.{key}.count", val, api_count))
+        checks.append(
+            compare_values(
+                f"quality.issues.{key}.count",
+                val,
+                api_count,
+                default_threshold,
+                threshold_rules,
+                block_on_prefixes,
+            )
+        )
 
     baseline_top_pairs = [(x["stabilizer_name"], x["stable_count"]) for x in top_base]
     api_top_pairs = [(x.get("stabilizer_name"), x.get("stable_count")) for x in top_api]
-    checks.append(compare_values("top_stabilizers.rank_pairs", baseline_top_pairs, api_top_pairs))
+    checks.append(
+        compare_values(
+            "top_stabilizers.rank_pairs",
+            baseline_top_pairs,
+            api_top_pairs,
+            default_threshold,
+            threshold_rules,
+            block_on_prefixes,
+        )
+    )
 
     failed = [x for x in checks if not x["equal"]]
+    blocked = [x for x in checks if x["blocking"]]
+    exceeded = [x for x in checks if x["threshold_exceeded"]]
     return {
         "mode": mode,
         "limit": limit,
         "checks": checks,
-        "summary": {"total_checks": len(checks), "failed_checks": len(failed)},
+        "summary": {
+            "total_checks": len(checks),
+            "failed_checks": len(failed),
+            "threshold_exceeded_checks": len(exceeded),
+            "blocking_checks": len(blocked),
+        },
         "failed_items": [x["name"] for x in failed],
+        "blocking_items": [x["name"] for x in blocked],
     }
+
+
+def _parse_threshold_rules(raw: str) -> Dict[str, float]:
+    text = raw.strip()
+    if not text:
+        return {}
+    if text.startswith("@"):
+        payload = Path(text[1:]).read_text(encoding="utf-8")
+        data = json.loads(payload)
+    else:
+        data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("threshold rules must be a JSON object")
+    parsed: Dict[str, float] = {}
+    for key, val in data.items():
+        parsed[str(key)] = float(val)
+    return parsed
+
+
+def _parse_prefixes(raw: str) -> List[str]:
+    text = raw.strip()
+    if not text:
+        return ["*"]
+    return [item.strip() for item in text.split(",") if item.strip()]
 
 
 def main():
@@ -158,6 +295,22 @@ def main():
     parser.add_argument("--modes", default="", help="Comma-separated mode list. If set, overrides --mode.")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--limits", default="", help="Comma-separated limit list. If set, overrides --limit.")
+    parser.add_argument(
+        "--default-threshold",
+        type=float,
+        default=0,
+        help="Default allowed absolute delta for numeric checks.",
+    )
+    parser.add_argument(
+        "--threshold-rules",
+        default="",
+        help="JSON object or @file path mapping check name/prefix to threshold, e.g. '{\"quality.issues.\":2}'.",
+    )
+    parser.add_argument(
+        "--block-on",
+        default="*",
+        help="Comma-separated check name prefixes that should block when threshold exceeded. '*' means all checks.",
+    )
     parser.add_argument(
         "--fail-threshold",
         type=int,
@@ -175,11 +328,23 @@ def main():
             raise ValueError("No mode provided. Set --mode or --modes.")
         if not limits:
             raise ValueError("No limit provided. Set --limit or --limits.")
+        threshold_rules = _parse_threshold_rules(args.threshold_rules)
+        block_on_prefixes = _parse_prefixes(args.block_on)
 
         cases: List[Dict[str, Any]] = []
         for mode in modes:
             for limit in limits:
-                cases.append(run_consistency_case(conn, args.base_url, mode=mode, limit=limit))
+                cases.append(
+                    run_consistency_case(
+                        conn,
+                        args.base_url,
+                        mode=mode,
+                        limit=limit,
+                        default_threshold=args.default_threshold,
+                        threshold_rules=threshold_rules,
+                        block_on_prefixes=block_on_prefixes,
+                    )
+                )
 
         report = {
             "generated_at": datetime.now().isoformat(),
@@ -191,12 +356,17 @@ def main():
                 "base_url": args.base_url,
                 "db_path": args.db_path,
                 "fail_threshold": args.fail_threshold,
+                "default_threshold": args.default_threshold,
+                "threshold_rules": threshold_rules,
+                "block_on": block_on_prefixes,
             },
             "cases": cases,
             "summary": {
                 "total_cases": len(cases),
                 "failed_cases": sum(1 for case in cases if case["summary"]["failed_checks"] > 0),
                 "max_failed_checks": max((case["summary"]["failed_checks"] for case in cases), default=0),
+                "threshold_exceeded_cases": sum(1 for case in cases if case["summary"]["threshold_exceeded_checks"] > 0),
+                "blocking_cases": sum(1 for case in cases if case["summary"]["blocking_checks"] > 0),
             },
         }
 
@@ -212,7 +382,8 @@ def main():
             "Cases: "
             f"{report['summary']['total_cases']}, "
             f"failed cases: {report['summary']['failed_cases']}, "
-            f"max failed checks: {report['summary']['max_failed_checks']}"
+            f"max failed checks: {report['summary']['max_failed_checks']}, "
+            f"blocking cases: {report['summary']['blocking_cases']}"
         )
         for case in cases:
             if case["summary"]["failed_checks"] > 0:
@@ -225,6 +396,9 @@ def main():
                 f"Consistency gate failed: max_failed_checks={report['summary']['max_failed_checks']} "
                 f"> threshold={args.fail_threshold}"
             )
+            sys.exit(1)
+        if report["summary"]["blocking_cases"] > 0:
+            print(f"Consistency gate failed: blocking_cases={report['summary']['blocking_cases']} > 0")
             sys.exit(1)
     finally:
         conn.close()

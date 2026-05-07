@@ -274,3 +274,57 @@ Runtime files still expected in root for now:
 - `config.yaml`
 - `cookies.local.json`
 - `malody_rankings.db`
+
+## Merge Gates / DoD
+
+Before merging changes, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/run_pre_merge_gate.ps1
+```
+
+This enforces:
+- unit tests
+- compile check
+- stats/api consistency gate
+
+DoD and gate details:
+- `docs/DELIVERY_GATES.md`
+
+## External Data Source Troubleshooting
+
+Quick checks:
+1. `GET /crawler/status` and inspect `data_source_health`.
+2. Confirm source-level status for:
+   - `home`
+   - `latest`
+   - `api`
+3. Inspect failure category counters:
+   - `network`
+   - `structure`
+   - `auth`
+   - `unknown`
+
+If structure failures rise, prioritize parser compatibility validation.
+
+## Local Deployment Checklist
+
+1. Python and dependencies installed.
+2. `malody_rankings.db` available.
+3. Optional API key configured:
+   - `MALODY_API_KEY` or `MALODY_API_TOKEN`
+4. Optional crawler/session files:
+   - `cookies.local.json`
+   - `config.yaml`
+5. Optional scheduled consistency task:
+   - `powershell -ExecutionPolicy Bypass -File scripts/install_consistency_task.ps1`
+
+## Rollback & Emergency
+
+See:
+- `docs/OPERATIONS_RUNBOOK.md`
+
+This includes:
+- failure category handling
+- rollback steps
+- recovery verification flow

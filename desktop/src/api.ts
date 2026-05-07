@@ -117,3 +117,60 @@ export async function runDbMaintenance(action: "analyze" | "vacuum", confirm = t
 export async function getDbMaintenanceHistory() {
   return request<any>("/system/db/maintain/history?limit=20");
 }
+
+export async function getPredefinedQueries() {
+  return request<Record<string, any>>("/query/predefined-queries");
+}
+
+type AdvancedQueryPayload = {
+  table: string;
+  columns?: string[];
+  filters?: Array<Record<string, unknown>>;
+  order_by?: string[];
+  group_by?: string[];
+  having?: Array<Record<string, unknown>>;
+  limit?: number;
+  offset?: number;
+  distinct?: boolean;
+};
+
+export async function executeAdvancedQuery(payload: AdvancedQueryPayload) {
+  const params = new URLSearchParams();
+  params.set("table", payload.table);
+  (payload.columns ?? []).forEach((col) => params.append("columns", col));
+  (payload.order_by ?? []).forEach((order) => params.append("order_by", order));
+  (payload.group_by ?? []).forEach((group) => params.append("group_by", group));
+  params.set("limit", String(payload.limit ?? 100));
+  params.set("offset", String(payload.offset ?? 0));
+  params.set("distinct", String(Boolean(payload.distinct)));
+  return request<any>(`/query/execute?${params.toString()}`, {
+    method: "POST",
+    body: JSON.stringify({
+      filters: payload.filters ?? null,
+      having: payload.having ?? null
+    })
+  });
+}
+
+export async function getModeComparison(modes: string) {
+  return request<any>(`/analytics/mode-comparison?modes=${encodeURIComponent(modes)}`);
+}
+
+export async function getPlayerCompare(players: string, mode: number, days: number) {
+  return request<any>(
+    `/analytics/player-compare?players=${encodeURIComponent(players)}&mode=${mode}&days=${days}`
+  );
+}
+
+export async function getChartTrends(mode: number, period: "days" | "months") {
+  return request<any>(`/analytics/chart-trends?mode=${mode}&period=${period}`);
+}
+
+export function getChartExportUrl(params: { mode?: number; creators?: string; statuses?: string; format?: "csv" | "xlsx" }) {
+  const search = new URLSearchParams();
+  if (typeof params.mode === "number") search.set("mode", String(params.mode));
+  if (params.creators) search.set("creators", params.creators);
+  if (params.statuses) search.set("statuses", params.statuses);
+  if (params.format) search.set("format", params.format);
+  return `${API_BASE}/charts/export/charts?${search.toString()}`;
+}
