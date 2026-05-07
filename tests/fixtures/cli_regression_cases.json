@@ -1,0 +1,51 @@
+{
+  "update_cases": [
+    {
+      "name": "leaderboard_default",
+      "tokens": [],
+      "expected_command_suffix": ["malody_rankings.py", "--once"]
+    },
+    {
+      "name": "player_basic",
+      "tokens": ["--player", "--uid", "1001", "--limit", "20", "--rpm", "60"],
+      "expected_command_suffix": ["player_profile_crawler.py", "--uid", "1001", "--limit", "20", "--rpm", "60"]
+    },
+    {
+      "name": "stb_sid_range_no_resume",
+      "tokens": ["--stb", "--sid-crawl", "--start", "10", "--end", "20", "--limit", "30", "--resume", "false"],
+      "expected_command_suffix": [
+        "stb_crawler.py",
+        "--max-charts",
+        "30",
+        "--sid-crawl",
+        "--start-sid",
+        "10",
+        "--end-sid",
+        "20",
+        "--no-resume"
+      ]
+    }
+  ],
+  "export_cases": [
+    {
+      "name": "top_csv",
+      "arg": "top --mode 0 --limit 50 --players Alice,Bob",
+      "expected": {
+        "export_type": "top",
+        "mode": 0,
+        "limit": 50,
+        "output_format": "csv"
+      }
+    },
+    {
+      "name": "chart_xlsx_with_summary",
+      "arg": "chart --format xlsx --with-summary --with-metadata",
+      "expected": {
+        "export_type": "chart",
+        "output_format": "xlsx",
+        "with_summary": true,
+        "with_metadata": true
+      }
+    }
+  ]
+}

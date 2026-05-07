@@ -16,6 +16,12 @@ class TestStatsConsistencyScript(TestCase):
         self.assertEqual(consistency.parse_csv_ints(""), [])
         self.assertEqual(consistency.parse_csv_ints("0, 1,2"), [0, 1, 2])
 
+    def test_parse_threshold_rules_and_prefixes(self):
+        rules = consistency._parse_threshold_rules('{"quality.issues.": 2, "summary.total_charts": 0}')
+        self.assertEqual(rules["quality.issues."], 2.0)
+        self.assertEqual(rules["summary.total_charts"], 0.0)
+        self.assertEqual(consistency._parse_prefixes("summary.,quality."), ["summary.", "quality."])
+
     @patch("malody_api.scripts.check_stats_api_consistency.api_get")
     @patch("malody_api.scripts.check_stats_api_consistency.calc_top_stabilizers_baseline")
     @patch("malody_api.scripts.check_stats_api_consistency.calc_quality_baseline")
@@ -41,5 +47,32 @@ class TestStatsConsistencyScript(TestCase):
 
         case = consistency.run_consistency_case(conn=None, base_url="http://localhost:8000", mode=0, limit=20)
         self.assertEqual(case["summary"]["failed_checks"], 0)
+        self.assertEqual(case["summary"]["blocking_checks"], 0)
         self.assertEqual(case["mode"], 0)
         self.assertEqual(case["limit"], 20)
+
+    def test_threshold_exceeded_not_blocking_when_prefix_not_selected(self):
+        check = consistency.compare_values(
+            name="summary.total_charts",
+            baseline=100,
+            api_value=103,
+            default_threshold=1,
+            threshold_rules={},
+            block_on_prefixes=["quality."],
+        )
+        self.assertFalse(check["equal"])
+        self.assertTrue(check["threshold_exceeded"])
+        self.assertFalse(check["blocking"])
+
+    def test_non_numeric_diff_is_exceeded_even_with_positive_threshold(self):
+        check = consistency.compare_values(
+            name="top_stabilizers.rank_pairs",
+            baseline=[("Alice", 3)],
+            api_value=[("Alice", 4)],
+            default_threshold=10,
+            threshold_rules={},
+            block_on_prefixes=["top_stabilizers."],
+        )
+        self.assertFalse(check["equal"])
+        self.assertTrue(check["threshold_exceeded"])
+        self.assertTrue(check["blocking"])

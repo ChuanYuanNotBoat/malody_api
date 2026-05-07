@@ -65,6 +65,14 @@ class TestStatsExportRunner(TestCase):
         req = parse_export_request("top --format pdf", _parse_time_range_ok, _colorize, "RED")
         self.assertIsNone(req)
 
+    def test_parse_export_request_rejects_unknown_option(self):
+        req = parse_export_request("top --foo bar", _parse_time_range_ok, _colorize, "RED")
+        self.assertIsNone(req)
+
+    def test_parse_export_request_rejects_unknown_type(self):
+        req = parse_export_request("abc --limit 10", _parse_time_range_ok, _colorize, "RED")
+        self.assertIsNone(req)
+
     def test_run_export_unknown_type_returns_false(self):
         ok = run_export(
             request=ExportRequest(export_type="unknown", mode=None, limit=1, players=[], time_range=None),

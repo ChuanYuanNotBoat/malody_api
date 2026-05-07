@@ -28,10 +28,16 @@ import {
   getCrawlerStatus,
   getCrawlerTaskLog,
   getCrawlerTasks,
+  getChartExportUrl,
+  getChartTrends,
   getDashboardOverview,
   getDbHealth,
   getDbMaintenanceHistory,
+  getModeComparison,
+  getPlayerCompare,
+  getPredefinedQueries,
   getPlugins,
+  executeAdvancedQuery,
   getQualityCheckJob,
   getQualityReport,
   runCrawler,
@@ -82,13 +88,291 @@ type ActionContext = {
   detail: string;
 };
 
+type SchemaProperty = {
+  type?: string;
+  minimum?: number;
+  maximum?: number;
+  enum?: string[];
+  default?: unknown;
+  description?: string;
+};
+
+type PluginSchema = {
+  type?: string;
+  properties?: Record<string, SchemaProperty>;
+};
+
+type PluginRow = {
+  id: string;
+  name: string;
+  version: string;
+  capabilities?: string[];
+  config_schema?: PluginSchema;
+  run_schema?: PluginSchema;
+};
+
+type CrawlerFormValues = {
+  crawler_type: "leaderboard" | "player" | "stb";
+  once?: boolean;
+  limit?: number;
+  source?: string;
+  rpm?: number;
+  uid?: string;
+  uid_range?: string;
+  max_workers?: number;
+  days_since_update?: number;
+  from_db?: boolean;
+  cid_crawl?: boolean;
+  sid_crawl?: boolean;
+  retry_failed?: boolean;
+  start?: number;
+  end?: number;
+  resume?: boolean;
+};
+
+type QueryTemplateParameters = {
+  table: string;
+  columns?: string[];
+  filters?: Array<Record<string, unknown>>;
+  order_by?: string[];
+  group_by?: string[];
+  having?: Array<Record<string, unknown>>;
+  limit?: number;
+  offset?: number;
+  distinct?: boolean;
+};
+
+type QueryTemplateDefinition = {
+  description?: string;
+  endpoint?: string;
+  method?: string;
+  parameters?: QueryTemplateParameters;
+};
+
+type QueryTemplateField = {
+  name: string;
+  labelKey: string;
+  type: "text" | "number" | "select";
+  min?: number;
+  max?: number;
+  placeholder?: string;
+  options?: Array<{ value: string | number; label: string }>;
+  defaultValue?: string | number;
+};
+
+type QueryTemplateUiConfig = {
+  titleKey: string;
+  descriptionKey: string;
+  fields: QueryTemplateField[];
+};
+
+const QUERY_TEMPLATE_UI: Record<string, QueryTemplateUiConfig> = {
+  top_players_by_mode: {
+    titleKey: "query_template_top_players_title",
+    descriptionKey: "query_template_top_players_desc",
+    fields: [
+      { name: "mode", labelKey: "mode", type: "number", min: 0, max: 9, placeholder: "0" },
+      { name: "maxRank", labelKey: "query_field_max_rank", type: "number", min: 1, max: 100, defaultValue: 10 },
+      { name: "limit", labelKey: "limit", type: "number", min: 1, max: 1000 }
+    ]
+  },
+  chart_statistics_by_status: {
+    titleKey: "query_template_chart_status_title",
+    descriptionKey: "query_template_chart_status_desc",
+    fields: [
+      {
+        name: "status",
+        labelKey: "query_field_status",
+        type: "select",
+        defaultValue: 2,
+        options: [
+          { value: 0, label: "status=0" },
+          { value: 1, label: "status=1" },
+          { value: 2, label: "status=2" }
+        ]
+      }
+    ]
+  },
+  player_ranking_history: {
+    titleKey: "query_template_player_history_title",
+    descriptionKey: "query_template_player_history_desc",
+    fields: [
+      { name: "playerName", labelKey: "query_field_player_name", type: "text", defaultValue: "Zani", placeholder: "Alice" },
+      { name: "limit", labelKey: "limit", type: "number", min: 1, max: 1000 }
+    ]
+  },
+  top_creators_by_stable_charts: {
+    titleKey: "query_template_creator_title",
+    descriptionKey: "query_template_creator_desc",
+    fields: [
+      { name: "creatorName", labelKey: "query_field_creator", type: "text", placeholder: "Alice" },
+      { name: "limit", labelKey: "limit", type: "number", min: 1, max: 1000 }
+    ]
+  }
+};
+
+function cloneTemplateParams(params?: QueryTemplateParameters): QueryTemplateParameters {
+  if (!params) {
+    return { table: "", columns: [], filters: [], order_by: [], group_by: [], having: [], limit: 100, offset: 0, distinct: false };
+  }
+  return {
+    table: String(params.table ?? ""),
+    columns: [...(params.columns ?? [])],
+    filters: [...(params.filters ?? [])],
+    order_by: [...(params.order_by ?? [])],
+    group_by: [...(params.group_by ?? [])],
+    having: [...(params.having ?? [])],
+    limit: params.limit,
+    offset: params.offset,
+    distinct: params.distinct
+  };
+}
+
+function upsertFilter(
+  filters: Array<Record<string, unknown>>,
+  next: { field: string; operator: string; value?: unknown },
+  removeWhenEmpty = false
+): Array<Record<string, unknown>> {
+  const out = filters.filter((item) => !(item.field === next.field && item.operator === next.operator));
+  const isEmpty = next.value === undefined || next.value === null || next.value === "";
+  if (!removeWhenEmpty || !isEmpty) {
+    out.push({
+      field: next.field,
+      operator: next.operator,
+      value: next.value ?? null
+    });
+  }
+  return out;
+}
+
+function buildQueryPayloadFromTemplate(
+  queryKey: string,
+  definition: QueryTemplateDefinition | undefined,
+  formValues: Record<string, unknown>
+) {
+  const params = cloneTemplateParams(definition?.parameters);
+  let filters = [...(params.filters ?? [])];
+
+  const limit = typeof formValues.limit === "number" ? formValues.limit : undefined;
+  if (typeof limit === "number") {
+    params.limit = limit;
+  }
+
+  if (queryKey === "top_players_by_mode") {
+    if (typeof formValues.maxRank === "number") {
+      filters = upsertFilter(filters, { field: "rank", operator: "<=", value: formValues.maxRank });
+    }
+    if (typeof formValues.mode === "number") {
+      filters = upsertFilter(filters, { field: "mode", operator: "=", value: formValues.mode }, true);
+    }
+  }
+
+  if (queryKey === "chart_statistics_by_status") {
+    if (typeof formValues.status === "number") {
+      filters = upsertFilter(filters, { field: "status", operator: "=", value: formValues.status }, true);
+    }
+  }
+
+  if (queryKey === "player_ranking_history") {
+    filters = upsertFilter(filters, { field: "name", operator: "LIKE", value: formValues.playerName }, true);
+  }
+
+  if (queryKey === "top_creators_by_stable_charts") {
+    if (typeof formValues.creatorName === "string" && formValues.creatorName.trim()) {
+      filters = upsertFilter(filters, { field: "creator_name", operator: "LIKE", value: formValues.creatorName.trim() });
+    }
+  }
+
+  return {
+    table: params.table,
+    columns: params.columns ?? [],
+    filters,
+    order_by: params.order_by ?? [],
+    group_by: params.group_by ?? [],
+    having: params.having ?? [],
+    limit: params.limit ?? 100,
+    offset: params.offset ?? 0,
+    distinct: Boolean(params.distinct)
+  };
+}
+
+function exportRowsToCsv(rows: Record<string, unknown>[], filename: string) {
+  if (!rows.length) return;
+  const headers = Object.keys(rows[0]);
+  const escapeCsv = (value: unknown): string => {
+    const raw = String(value ?? "");
+    if (raw.includes(",") || raw.includes('"') || raw.includes("\n")) {
+      return `"${raw.replace(/"/g, '""')}"`;
+    }
+    return raw;
+  };
+  const lines = [headers.join(",")];
+  rows.forEach((row) => {
+    lines.push(headers.map((key) => escapeCsv(row[key])).join(","));
+  });
+  const blob = new Blob([`\uFEFF${lines.join("\n")}`], { type: "text/csv;charset=utf-8;" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(link.href);
+}
+
+export function buildCrawlerRunParams(values: CrawlerFormValues): URLSearchParams {
+  const params = new URLSearchParams();
+  const crawlerType = values.crawler_type;
+  params.set("crawler_type", crawlerType);
+
+  if (crawlerType === "leaderboard") {
+    params.set("once", String(values.once ?? true));
+    if (values.limit) params.set("limit", String(values.limit));
+    if (values.source) params.set("source", values.source);
+    return params;
+  }
+
+  if (crawlerType === "player") {
+    if (values.limit) params.set("limit", String(values.limit));
+    if (values.rpm) params.set("rpm", String(values.rpm));
+    if (values.uid) params.set("uid", String(values.uid));
+    if (values.uid_range) params.set("uid_range", String(values.uid_range));
+    if (values.max_workers) params.set("max_workers", String(values.max_workers));
+    if (values.days_since_update) params.set("days_since_update", String(values.days_since_update));
+    if (values.from_db) params.set("from_db", "true");
+    return params;
+  }
+
+  params.set("once", String(values.once ?? true));
+  if (values.limit) params.set("limit", String(values.limit));
+  if (values.source) params.set("source", values.source);
+  if (values.rpm) params.set("rpm", String(values.rpm));
+  if (values.cid_crawl) params.set("cid_crawl", "true");
+  if (values.sid_crawl) params.set("sid_crawl", "true");
+  if (values.retry_failed) params.set("retry_failed", "true");
+  if (values.start) params.set("start", String(values.start));
+  if (values.end) params.set("end", String(values.end));
+  if (values.resume === false) params.set("resume", "false");
+  return params;
+}
+
 function App() {
   const queryClient = useQueryClient();
+  const [queryTaskForm] = Form.useForm();
   const [selectedTaskId, setSelectedTaskId] = useState<string>("");
   const [actionLogs, setActionLogs] = useState<ActionLogRow[]>([]);
   const [qualityJobId, setQualityJobId] = useState<string>("");
   const [qualityJobStatus, setQualityJobStatus] = useState<string>("");
   const [qualityJobNotifiedStatus, setQualityJobNotifiedStatus] = useState<string>("");
+  const [crawlerType, setCrawlerType] = useState<"leaderboard" | "player" | "stb">("leaderboard");
+  const [selectedPluginId, setSelectedPluginId] = useState<string>("");
+  const [pluginPayload, setPluginPayload] = useState<Record<string, unknown>>({});
+  const [selectedQueryKey, setSelectedQueryKey] = useState<string>("");
+  const [queryResultRows, setQueryResultRows] = useState<Record<string, unknown>[]>([]);
+  const [queryResultTitle, setQueryResultTitle] = useState<string>("");
+  const [modeCompareRows, setModeCompareRows] = useState<Record<string, unknown>[]>([]);
+  const [playerCompareRows, setPlayerCompareRows] = useState<Record<string, unknown>[]>([]);
+  const [chartTrendRows, setChartTrendRows] = useState<Record<string, unknown>[]>([]);
   const [locale, setLocale] = useState<AppLocale>(() => {
     const raw = localStorage.getItem("app.locale");
     return raw === "en-US" || raw === "zh-CN" ? raw : "zh-CN";
@@ -131,6 +415,8 @@ function App() {
       "db-health": t("scope_db_health"),
       "db-history": t("scope_db_history"),
       plugins: t("scope_plugins"),
+      query: t("tab_query"),
+      analytics: t("tab_analytics"),
       crawler: t("tab_crawler"),
       quality: t("tab_quality"),
       db: t("tab_db"),
@@ -156,6 +442,30 @@ function App() {
     if (typeof ms !== "number" || Number.isNaN(ms)) return "-";
     if (ms < 1000) return `${ms} ms`;
     return `${(ms / 1000).toFixed(2)} s`;
+  };
+
+  const buildDefaultPayload = (schema?: PluginSchema): Record<string, unknown> => {
+    const props = schema?.properties ?? {};
+    const out: Record<string, unknown> = {};
+    Object.entries(props).forEach(([key, def]) => {
+      if (typeof def.default !== "undefined") {
+        out[key] = def.default;
+        return;
+      }
+      if (def.type === "boolean") out[key] = false;
+      else if (def.type === "integer" || def.type === "number") out[key] = def.minimum ?? 0;
+      else out[key] = "";
+    });
+    return out;
+  };
+
+  const toNumber = (value: unknown): number | undefined => {
+    if (typeof value === "number") return value;
+    if (typeof value === "string" && value.trim() !== "") {
+      const parsed = Number(value);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+    return undefined;
   };
 
   useEffect(() => {
@@ -242,6 +552,32 @@ function App() {
     queryKey: ["plugins"],
     queryFn: getPlugins
   });
+  const predefinedQuery = useQuery({
+    queryKey: ["query-predefined"],
+    queryFn: getPredefinedQueries
+  });
+  const predefinedTemplates = useMemo(
+    () => Object.entries((predefinedQuery.data ?? {}) as Record<string, QueryTemplateDefinition>),
+    [predefinedQuery.data]
+  );
+  const selectedQueryDefinition = useMemo(
+    () => predefinedTemplates.find(([key]) => key === selectedQueryKey)?.[1],
+    [predefinedTemplates, selectedQueryKey]
+  );
+  const selectedQueryInitialValues = useMemo(() => {
+    if (!selectedQueryKey) return {};
+    const config = QUERY_TEMPLATE_UI[selectedQueryKey];
+    const defaults: Record<string, unknown> = {};
+    (config?.fields ?? []).forEach((field) => {
+      if (typeof field.defaultValue !== "undefined") {
+        defaults[field.name] = field.defaultValue;
+      }
+    });
+    if (typeof selectedQueryDefinition?.parameters?.limit === "number") {
+      defaults.limit = selectedQueryDefinition.parameters.limit;
+    }
+    return defaults;
+  }, [selectedQueryKey, selectedQueryDefinition]);
 
   const runCrawlerMutation = useMutation({
     mutationFn: runCrawler,
@@ -300,8 +636,8 @@ function App() {
   });
 
   const pluginRunMutation = useMutation({
-    mutationFn: ({ pluginId }: { pluginId: string }) =>
-      runPlugin(pluginId, { payload: { stale_hours: 72, include_history: true } }),
+    mutationFn: ({ pluginId, payload }: { pluginId: string; payload: Record<string, unknown> }) =>
+      runPlugin(pluginId, { payload }),
     onMutate: (vars) => startAction("plugin", vars.pluginId, t("op_running_plugin")),
     onSuccess: (_, __, ctx) => {
       message.success({ content: t("plugin_done"), key: ctx?.messageKey });
@@ -312,6 +648,38 @@ function App() {
       message.error({ content: msg, key: ctx?.messageKey });
       finishAction(ctx, t("op_failed"), msg);
     }
+  });
+
+  const executeQueryMutation = useMutation({
+    mutationFn: executeAdvancedQuery,
+    onMutate: () => startAction("query", t("tab_query"), t("tab_query")),
+    onSuccess: (data, _, ctx) => {
+      const rows = Array.isArray(data) ? data : [];
+      setQueryResultRows(rows);
+      message.success({ content: `${t("run")}: ${rows.length} rows`, key: ctx?.messageKey });
+      finishAction(ctx, t("op_succeeded"), `rows=${rows.length}`);
+    },
+    onError: (error: Error, _, ctx) => {
+      const msg = formatError(error);
+      message.error({ content: msg, key: ctx?.messageKey });
+      finishAction(ctx, t("op_failed"), msg);
+    }
+  });
+
+  const modeCompareMutation = useMutation({
+    mutationFn: getModeComparison,
+    onSuccess: (data) => setModeCompareRows(Array.isArray(data) ? data : [])
+  });
+
+  const playerCompareMutation = useMutation({
+    mutationFn: ({ players, mode, days }: { players: string; mode: number; days: number }) =>
+      getPlayerCompare(players, mode, days),
+    onSuccess: (data) => setPlayerCompareRows((data?.players as Record<string, unknown>[]) ?? [])
+  });
+
+  const chartTrendMutation = useMutation({
+    mutationFn: ({ mode, period }: { mode: number; period: "days" | "months" }) => getChartTrends(mode, period),
+    onSuccess: (data) => setChartTrendRows(Array.isArray(data) ? data : [])
   });
 
   useEffect(() => {
@@ -380,7 +748,8 @@ function App() {
         { scope: "quality-job", error: qualityJobQuery.error as Error | null },
         { scope: "db-health", error: dbHealthQuery.error as Error | null },
         { scope: "db-history", error: dbHistoryQuery.error as Error | null },
-        { scope: "plugins", error: pluginsQuery.error as Error | null }
+        { scope: "plugins", error: pluginsQuery.error as Error | null },
+        { scope: "query", error: predefinedQuery.error as Error | null }
       ].filter((item) => !!item.error),
     [
       overviewQuery.error,
@@ -391,7 +760,8 @@ function App() {
       qualityJobQuery.error,
       dbHealthQuery.error,
       dbHistoryQuery.error,
-      pluginsQuery.error
+      pluginsQuery.error,
+      predefinedQuery.error
     ]
   );
 
@@ -412,6 +782,24 @@ function App() {
       ]
     };
   }, [crawlerStatusQuery.data, locale]);
+
+  const plugins = (pluginsQuery.data?.plugins ?? []) as PluginRow[];
+  const selectedPlugin = plugins.find((item) => item.id === selectedPluginId);
+
+  useEffect(() => {
+    if (!selectedPlugin) return;
+    setPluginPayload(buildDefaultPayload(selectedPlugin.run_schema));
+  }, [selectedPluginId, pluginsQuery.data]);
+
+  useEffect(() => {
+    if (!selectedQueryKey && predefinedTemplates.length > 0) {
+      setSelectedQueryKey(predefinedTemplates[0][0]);
+      return;
+    }
+    if (selectedQueryKey && !predefinedTemplates.some(([key]) => key === selectedQueryKey)) {
+      setSelectedQueryKey(predefinedTemplates[0]?.[0] ?? "");
+    }
+  }, [predefinedTemplates, selectedQueryKey]);
 
   return (
     <ConfigProvider locale={locale === "zh-CN" ? zhCN : enUS}>
@@ -508,8 +896,133 @@ function App() {
                         <Descriptions.Item label={t("quick_check")}>
                           {overviewQuery.data?.database?.quick_check ?? "-"}
                         </Descriptions.Item>
+                        <Descriptions.Item label="source_health">
+                          {crawlerStatusQuery.data?.data_source_health?.overall ?? "-"}
+                        </Descriptions.Item>
                         <Descriptions.Item label={t("generated_at")}>{overviewQuery.data?.generated_at ?? "-"}</Descriptions.Item>
                       </Descriptions>
+                    </Card>
+                  </Space>
+                )
+              },
+              {
+                key: "analytics",
+                label: t("tab_analytics"),
+                children: (
+                  <Space direction="vertical" style={{ width: "100%" }} size={16}>
+                    <Card title={t("analytics_mode_compare")}>
+                      <Form
+                        layout="inline"
+                        onFinish={(values) => modeCompareMutation.mutate(values.modes)}
+                        initialValues={{ modes: "0,1,2,3" }}
+                      >
+                        <Form.Item name="modes" label={t("modes")}>
+                          <Input style={{ width: 220 }} placeholder="0,1,2" />
+                        </Form.Item>
+                        <Form.Item>
+                          <Button htmlType="submit" loading={modeCompareMutation.isPending}>
+                            {t("run")}
+                          </Button>
+                        </Form.Item>
+                      </Form>
+                      <Table
+                        rowKey={(row: Record<string, unknown>) => String(row.mode ?? JSON.stringify(row))}
+                        dataSource={modeCompareRows}
+                        size="small"
+                        pagination={{ pageSize: 6 }}
+                        locale={{ emptyText: t("no_data") }}
+                        columns={[
+                          { title: "mode", dataIndex: "mode" },
+                          { title: "total_charts", dataIndex: "total_charts" },
+                          { title: "stable_charts", dataIndex: "stable_charts" },
+                          { title: "avg_heat", dataIndex: "avg_heat" }
+                        ]}
+                      />
+                    </Card>
+                    <Card title={t("analytics_player_compare")}>
+                      <Form
+                        layout="inline"
+                        onFinish={(values) =>
+                          playerCompareMutation.mutate({
+                            players: values.players,
+                            mode: values.mode,
+                            days: values.days
+                          })
+                        }
+                        initialValues={{ players: "alice,bob", mode: 0, days: 30 }}
+                      >
+                        <Form.Item name="players" label={t("players")}>
+                          <Input style={{ width: 220 }} placeholder="alice,bob" />
+                        </Form.Item>
+                        <Form.Item name="mode" label={t("mode")}>
+                          <InputNumber min={0} max={9} />
+                        </Form.Item>
+                        <Form.Item name="days" label={t("days")}>
+                          <InputNumber min={1} max={365} />
+                        </Form.Item>
+                        <Form.Item>
+                          <Button htmlType="submit" loading={playerCompareMutation.isPending}>
+                            {t("run")}
+                          </Button>
+                        </Form.Item>
+                      </Form>
+                      <Table
+                        rowKey={(row: Record<string, unknown>) =>
+                          String(row.player_identifier ?? row.name ?? JSON.stringify(row))
+                        }
+                        dataSource={playerCompareRows}
+                        size="small"
+                        pagination={{ pageSize: 6 }}
+                        locale={{ emptyText: t("no_data") }}
+                        columns={[
+                          { title: "player", dataIndex: "player_identifier" },
+                          { title: "start_rank", dataIndex: "start_rank" },
+                          { title: "end_rank", dataIndex: "end_rank" },
+                          { title: "rank_change", dataIndex: "rank_change" }
+                        ]}
+                      />
+                    </Card>
+                    <Card title={t("analytics_chart_trends")}>
+                      <Form
+                        layout="inline"
+                        onFinish={(values) =>
+                          chartTrendMutation.mutate({
+                            mode: values.mode,
+                            period: values.period
+                          })
+                        }
+                        initialValues={{ mode: 0, period: "months" }}
+                      >
+                        <Form.Item name="mode" label={t("mode")}>
+                          <InputNumber min={0} max={9} />
+                        </Form.Item>
+                        <Form.Item name="period" label={t("period")}>
+                          <Select
+                            options={[
+                              { value: "days", label: "days" },
+                              { value: "months", label: "months" }
+                            ]}
+                            style={{ width: 140 }}
+                          />
+                        </Form.Item>
+                        <Form.Item>
+                          <Button htmlType="submit" loading={chartTrendMutation.isPending}>
+                            {t("run")}
+                          </Button>
+                        </Form.Item>
+                      </Form>
+                      <Table
+                        rowKey={(row: Record<string, unknown>) => String(row.period ?? JSON.stringify(row))}
+                        dataSource={chartTrendRows}
+                        size="small"
+                        pagination={{ pageSize: 6 }}
+                        locale={{ emptyText: t("no_data") }}
+                        columns={[
+                          { title: "period", dataIndex: "period" },
+                          { title: "total", dataIndex: "count" },
+                          { title: "stable", dataIndex: "stable_count" }
+                        ]}
+                      />
                     </Card>
                   </Space>
                 )
@@ -523,11 +1036,7 @@ function App() {
                       <Form
                         layout="inline"
                         onFinish={(values) => {
-                          const params = new URLSearchParams();
-                          params.set("crawler_type", values.crawler_type);
-                          params.set("once", String(values.once ?? true));
-                          if (values.limit) params.set("limit", String(values.limit));
-                          if (values.source) params.set("source", values.source);
+                          const params = buildCrawlerRunParams(values as CrawlerFormValues);
                           runCrawlerMutation.mutate(params);
                         }}
                         initialValues={{ crawler_type: "leaderboard", once: true }}
@@ -540,6 +1049,7 @@ function App() {
                               { value: "stb", label: "stb" }
                             ]}
                             style={{ width: 150 }}
+                            onChange={(value: "leaderboard" | "player" | "stb") => setCrawlerType(value)}
                           />
                         </Form.Item>
                         <Form.Item name="source" label={t("source")}>
@@ -548,6 +1058,80 @@ function App() {
                         <Form.Item name="limit" label={t("limit")}>
                           <InputNumber min={1} />
                         </Form.Item>
+                        <Form.Item name="rpm" label="rpm">
+                          <InputNumber min={1} />
+                        </Form.Item>
+                        {crawlerType === "player" ? (
+                          <>
+                            <Form.Item name="uid" label="uid">
+                              <Input style={{ width: 140 }} />
+                            </Form.Item>
+                            <Form.Item name="uid_range" label="uid_range">
+                              <Input style={{ width: 140 }} placeholder="1000-2000" />
+                            </Form.Item>
+                            <Form.Item name="from_db" label="from_db">
+                              <Select
+                                style={{ width: 110 }}
+                                options={[
+                                  { value: false, label: "false" },
+                                  { value: true, label: "true" }
+                                ]}
+                              />
+                            </Form.Item>
+                            <Form.Item name="max_workers" label="max_workers">
+                              <InputNumber min={1} max={8} />
+                            </Form.Item>
+                            <Form.Item name="days_since_update" label="days_since_update">
+                              <InputNumber min={1} />
+                            </Form.Item>
+                          </>
+                        ) : null}
+                        {crawlerType === "stb" ? (
+                          <>
+                            <Form.Item name="cid_crawl" label="cid_crawl">
+                              <Select
+                                style={{ width: 110 }}
+                                options={[
+                                  { value: false, label: "false" },
+                                  { value: true, label: "true" }
+                                ]}
+                              />
+                            </Form.Item>
+                            <Form.Item name="sid_crawl" label="sid_crawl">
+                              <Select
+                                style={{ width: 110 }}
+                                options={[
+                                  { value: false, label: "false" },
+                                  { value: true, label: "true" }
+                                ]}
+                              />
+                            </Form.Item>
+                            <Form.Item name="retry_failed" label="retry_failed">
+                              <Select
+                                style={{ width: 120 }}
+                                options={[
+                                  { value: false, label: "false" },
+                                  { value: true, label: "true" }
+                                ]}
+                              />
+                            </Form.Item>
+                            <Form.Item name="start" label="start">
+                              <InputNumber min={1} />
+                            </Form.Item>
+                            <Form.Item name="end" label="end">
+                              <InputNumber min={1} />
+                            </Form.Item>
+                            <Form.Item name="resume" label="resume">
+                              <Select
+                                style={{ width: 110 }}
+                                options={[
+                                  { value: true, label: "true" },
+                                  { value: false, label: "false" }
+                                ]}
+                              />
+                            </Form.Item>
+                          </>
+                        ) : null}
                         <Form.Item>
                           <Button type="primary" htmlType="submit" loading={runCrawlerMutation.isPending}>
                             {t("run")}
@@ -699,7 +1283,7 @@ function App() {
                     <Alert type="info" message={t("plugin_hint_title")} description={t("plugin_hint_desc")} />
                     <Table
                       rowKey="id"
-                      dataSource={pluginsQuery.data?.plugins ?? []}
+                      dataSource={plugins}
                       pagination={false}
                       locale={{ emptyText: t("no_data") }}
                       columns={[
@@ -713,14 +1297,92 @@ function App() {
                         },
                         {
                           title: t("action"),
-                          render: (_, row: { id: string }) => (
-                            <Button size="small" loading={pluginRunMutation.isPending} onClick={() => pluginRunMutation.mutate({ pluginId: row.id })}>
-                              {t("run")}
+                          render: (_, row: PluginRow) => (
+                            <Button size="small" onClick={() => setSelectedPluginId(row.id)}>
+                              {t("config")}
                             </Button>
                           )
                         }
                       ]}
                     />
+                    {selectedPlugin ? (
+                      <Card title={`${t("plugin_runner")}: ${selectedPlugin.name}`}>
+                        <Space direction="vertical" style={{ width: "100%" }}>
+                          {Object.entries(selectedPlugin.run_schema?.properties ?? {}).map(([key, schema]) => {
+                            const value = pluginPayload[key];
+                            if (schema.type === "boolean") {
+                              return (
+                                <Space key={key}>
+                                  <Typography.Text>{key}</Typography.Text>
+                                  <Select
+                                    style={{ width: 160 }}
+                                    value={Boolean(value)}
+                                    options={[
+                                      { value: true, label: "true" },
+                                      { value: false, label: "false" }
+                                    ]}
+                                    onChange={(next) => setPluginPayload((prev) => ({ ...prev, [key]: next }))}
+                                  />
+                                </Space>
+                              );
+                            }
+                            if (schema.type === "integer" || schema.type === "number") {
+                              return (
+                                <Space key={key}>
+                                  <Typography.Text>{key}</Typography.Text>
+                                  <InputNumber
+                                    min={schema.minimum}
+                                    max={schema.maximum}
+                                    value={toNumber(value)}
+                                    onChange={(next) => setPluginPayload((prev) => ({ ...prev, [key]: next ?? 0 }))}
+                                  />
+                                </Space>
+                              );
+                            }
+                            if ((schema.enum ?? []).length > 0) {
+                              return (
+                                <Space key={key}>
+                                  <Typography.Text>{key}</Typography.Text>
+                                  <Select
+                                    style={{ width: 220 }}
+                                    value={String(value ?? "")}
+                                    options={(schema.enum ?? []).map((item) => ({ value: item, label: item }))}
+                                    onChange={(next) => setPluginPayload((prev) => ({ ...prev, [key]: next }))}
+                                  />
+                                </Space>
+                              );
+                            }
+                            return (
+                              <Space key={key}>
+                                <Typography.Text>{key}</Typography.Text>
+                                <Input
+                                  style={{ width: 260 }}
+                                  value={String(value ?? "")}
+                                  onChange={(e) => setPluginPayload((prev) => ({ ...prev, [key]: e.target.value }))}
+                                />
+                              </Space>
+                            );
+                          })}
+                          <Space>
+                            <Button
+                              type="primary"
+                              loading={pluginRunMutation.isPending}
+                              onClick={() =>
+                                pluginRunMutation.mutate({
+                                  pluginId: selectedPlugin.id,
+                                  payload: pluginPayload
+                                })
+                              }
+                            >
+                              {t("run")}
+                            </Button>
+                            <Button onClick={() => setPluginPayload(buildDefaultPayload(selectedPlugin.run_schema))}>
+                              {t("reset")}
+                            </Button>
+                          </Space>
+                        </Space>
+                      </Card>
+                    ) : null}
                     {pluginRunMutation.data ? (
                       <Card title={t("latest_plugin_result")}>
                         <pre>{JSON.stringify(pluginRunMutation.data, null, 2)}</pre>
@@ -733,9 +1395,167 @@ function App() {
                 key: "query",
                 label: t("tab_query"),
                 children: (
-                  <Card>
-                    <Typography.Paragraph>{t("query_placeholder")}</Typography.Paragraph>
-                  </Card>
+                  <Space direction="vertical" style={{ width: "100%" }} size={16}>
+                    <Alert type="info" message={t("query_workflow_title")} description={t("query_workflow_desc")} />
+                    <Row gutter={16}>
+                      <Col xs={24} lg={9}>
+                        <Card title={t("query_task_templates")}>
+                          <Space direction="vertical" style={{ width: "100%" }} size={10}>
+                            {predefinedTemplates.map(([key, queryDef]) => {
+                              const config = QUERY_TEMPLATE_UI[key];
+                              return (
+                                <Card key={key} size="small" style={selectedQueryKey === key ? { borderColor: "#1677ff" } : undefined}>
+                                  <Space direction="vertical" style={{ width: "100%" }} size={8}>
+                                    <Typography.Text strong>{t(config?.titleKey ?? key)}</Typography.Text>
+                                    <Typography.Text type="secondary">
+                                      {t(config?.descriptionKey ?? "query_template_generic_desc")}
+                                    </Typography.Text>
+                                    <Space size={6} wrap>
+                                      <Tag>{String(queryDef.parameters?.table ?? "-")}</Tag>
+                                      <Tag>{`limit=${String(queryDef.parameters?.limit ?? 100)}`}</Tag>
+                                    </Space>
+                                    <Button
+                                      block
+                                      type={selectedQueryKey === key ? "primary" : "default"}
+                                      onClick={() => setSelectedQueryKey(key)}
+                                    >
+                                      {t("query_use_template")}
+                                    </Button>
+                                  </Space>
+                                </Card>
+                              );
+                            })}
+                            {predefinedTemplates.length === 0 ? <Typography.Text type="secondary">{t("no_data")}</Typography.Text> : null}
+                          </Space>
+                        </Card>
+                      </Col>
+                      <Col xs={24} lg={15}>
+                        <Card title={t("query_task_runner")}>
+                          {selectedQueryKey ? (
+                            <Space direction="vertical" style={{ width: "100%" }} size={12}>
+                              <Typography.Text strong>
+                                {t(QUERY_TEMPLATE_UI[selectedQueryKey]?.titleKey ?? selectedQueryKey)}
+                              </Typography.Text>
+                              <Typography.Text type="secondary">
+                                {t(QUERY_TEMPLATE_UI[selectedQueryKey]?.descriptionKey ?? "query_template_generic_desc")}
+                              </Typography.Text>
+                              <Form
+                                key={selectedQueryKey}
+                                form={queryTaskForm}
+                                layout="vertical"
+                                initialValues={selectedQueryInitialValues}
+                                onFinish={(values) => {
+                                  const payload = buildQueryPayloadFromTemplate(selectedQueryKey, selectedQueryDefinition, values);
+                                  setQueryResultTitle(t(QUERY_TEMPLATE_UI[selectedQueryKey]?.titleKey ?? selectedQueryKey));
+                                  executeQueryMutation.mutate(payload);
+                                }}
+                              >
+                                <Row gutter={12}>
+                                  {(QUERY_TEMPLATE_UI[selectedQueryKey]?.fields ?? []).map((field) => (
+                                    <Col span={12} key={field.name}>
+                                      <Form.Item name={field.name} label={t(field.labelKey)}>
+                                        {field.type === "number" ? (
+                                          <InputNumber min={field.min} max={field.max} style={{ width: "100%" }} />
+                                        ) : field.type === "select" ? (
+                                          <Select options={field.options ?? []} />
+                                        ) : (
+                                          <Input placeholder={field.placeholder} />
+                                        )}
+                                      </Form.Item>
+                                    </Col>
+                                  ))}
+                                </Row>
+                                <Space>
+                                  <Button type="primary" htmlType="submit" loading={executeQueryMutation.isPending}>
+                                    {t("query_run_task")}
+                                  </Button>
+                                  <Button onClick={() => queryTaskForm.resetFields()}>{t("reset")}</Button>
+                                </Space>
+                              </Form>
+                            </Space>
+                          ) : (
+                            <Typography.Text type="secondary">{t("no_data")}</Typography.Text>
+                          )}
+                        </Card>
+                        <Card title={t("query_export")} style={{ marginTop: 16 }}>
+                          <Form
+                            layout="inline"
+                            onFinish={(values) => {
+                              const statuses = Array.isArray(values.statuses)
+                                ? values.statuses.map((item: string | number) => String(item)).join(",")
+                                : undefined;
+                              const url = getChartExportUrl({
+                                mode: typeof values.mode === "number" ? values.mode : undefined,
+                                creators: values.creators,
+                                statuses,
+                                format: values.format
+                              });
+                              window.open(url, "_blank");
+                            }}
+                            initialValues={{ format: "csv", statuses: [2] }}
+                          >
+                            <Form.Item name="mode" label={t("mode")}>
+                              <InputNumber min={0} max={9} />
+                            </Form.Item>
+                            <Form.Item name="creators" label={t("query_field_creator")}>
+                              <Input style={{ width: 180 }} placeholder="Alice,Bob" />
+                            </Form.Item>
+                            <Form.Item name="statuses" label={t("query_field_status")}>
+                              <Select
+                                mode="multiple"
+                                style={{ width: 180 }}
+                                options={[
+                                  { value: 0, label: "0" },
+                                  { value: 1, label: "1" },
+                                  { value: 2, label: "2" }
+                                ]}
+                              />
+                            </Form.Item>
+                            <Form.Item name="format" label="format">
+                              <Select
+                                style={{ width: 120 }}
+                                options={[
+                                  { value: "csv", label: "csv" },
+                                  { value: "xlsx", label: "xlsx" }
+                                ]}
+                              />
+                            </Form.Item>
+                            <Form.Item>
+                              <Button htmlType="submit">{t("export")}</Button>
+                            </Form.Item>
+                          </Form>
+                        </Card>
+                      </Col>
+                    </Row>
+                    <Card
+                      title={`${t("query_result")} ${queryResultTitle ? `(${queryResultTitle})` : ""}`}
+                      extra={
+                        <Button
+                          size="small"
+                          disabled={queryResultRows.length === 0}
+                          onClick={() => exportRowsToCsv(queryResultRows, "query_result.csv")}
+                        >
+                          {t("query_export_result_csv")}
+                        </Button>
+                      }
+                    >
+                      <Space style={{ marginBottom: 12 }}>
+                        <Tag>{`${t("query_rows_count")}: ${queryResultRows.length}`}</Tag>
+                        <Tag>{`${t("query_columns_count")}: ${Object.keys(queryResultRows[0] ?? {}).length}`}</Tag>
+                      </Space>
+                      <Table
+                        rowKey={(row: Record<string, unknown>) => String(Object.values(row).join("|"))}
+                        dataSource={queryResultRows}
+                        pagination={{ pageSize: 8 }}
+                        locale={{ emptyText: t("no_data") }}
+                        columns={Object.keys(queryResultRows[0] ?? {}).map((key) => ({
+                          title: key,
+                          dataIndex: key,
+                          render: (value: unknown) => String(value ?? "")
+                        }))}
+                      />
+                    </Card>
+                  </Space>
                 )
               }
             ]}
@@ -771,5 +1591,3 @@ function App() {
 }
 
 export default App;
-
-
