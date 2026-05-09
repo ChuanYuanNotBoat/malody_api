@@ -39,6 +39,25 @@ def _normalize_player_name(name):
     return (name or "").strip().casefold()
 
 
+def _normalize_uid(uid):
+    text = str(uid or "").strip()
+    if not text or text == "0":
+        return None
+    return text
+
+
+def _get_table_columns(cursor, table_name):
+    try:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return {str(row[1]) for row in cursor.fetchall() if len(row) > 1 and row[1]}
+    except Exception:
+        return set()
+
+
+def _table_has_column(cursor, table_name, column_name):
+    return column_name in _get_table_columns(cursor, table_name)
+
+
 def _load_tracked_tokens(filepath: str = "players.txt") -> list[str]:
     tokens: list[str] = []
     if not os.path.exists(filepath):
@@ -112,6 +131,95 @@ def _load_player_uids(cursor, player_ids: set[int]) -> dict[int, str]:
             # Keep stable deterministic choice if duplicates exist.
             mapping[key] = min(current, value)
     return mapping
+
+
+def _sync_trend_aliases_for_rename(
+    cursor,
+    player_links,
+    start_player_id,
+    end_player_id,
+    start_name,
+    end_name,
+    seen_time,
+):
+    if not start_name or not end_name or start_name == end_name:
+        return False
+
+    target_player_id = end_player_id if end_player_id is not None else start_player_id
+    if target_player_id is None:
+        return False
+
+    start_link = player_links.get(start_player_id, {"uids": set()})
+    end_link = player_links.get(end_player_id, {"uids": set()})
+    uid_candidates = sorted((start_link.get("uids", set()) | end_link.get("uids", set())))
+    uid_value = uid_candidates[0] if uid_candidates else None
+
+    identity_columns = _get_table_columns(cursor, "player_identity")
+    alias_columns = _get_table_columns(cursor, "player_aliases")
+    if not alias_columns:
+        return False
+
+    # Keep player_identity current_name aligned with latest observed name.
+    if identity_columns and "current_name" in identity_columns:
+        set_parts = ["current_name = ?"]
+        params = [end_name]
+        if uid_value and "uid" in identity_columns:
+            set_parts.append("uid = COALESCE(uid, ?)")
+            params.append(uid_value)
+        if seen_time is not None and "last_seen" in identity_columns:
+            set_parts.append("last_seen = ?")
+            params.append(seen_time)
+        params.append(target_player_id)
+        cursor.execute(
+            f"UPDATE player_identity SET {', '.join(set_parts)} WHERE player_id = ?",
+            params,
+        )
+
+    changed = False
+    for alias in {start_name, end_name}:
+        cursor.execute(
+            "SELECT 1 FROM player_aliases WHERE player_id = ? AND alias = ? LIMIT 1",
+            (target_player_id, alias),
+        )
+        exists = cursor.fetchone() is not None
+        if exists:
+            update_parts = []
+            params = []
+            if uid_value and "uid" in alias_columns:
+                update_parts.append("uid = COALESCE(uid, ?)")
+                params.append(uid_value)
+            if seen_time is not None and "last_seen" in alias_columns:
+                update_parts.append("last_seen = ?")
+                params.append(seen_time)
+            if update_parts:
+                params.extend([target_player_id, alias])
+                cursor.execute(
+                    f"UPDATE player_aliases SET {', '.join(update_parts)} WHERE player_id = ? AND alias = ?",
+                    params,
+                )
+                changed = True
+            continue
+
+        columns = ["player_id", "alias"]
+        values = [target_player_id, alias]
+        if uid_value and "uid" in alias_columns:
+            columns.append("uid")
+            values.append(uid_value)
+        if seen_time is not None and "first_seen" in alias_columns:
+            columns.append("first_seen")
+            values.append(seen_time)
+        if seen_time is not None and "last_seen" in alias_columns:
+            columns.append("last_seen")
+            values.append(seen_time)
+
+        placeholders = ",".join(["?"] * len(values))
+        cursor.execute(
+            f"INSERT INTO player_aliases ({', '.join(columns)}) VALUES ({placeholders})",
+            values,
+        )
+        changed = True
+
+    return changed
 
 
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
@@ -341,14 +449,13 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         window_start = end_point - match_window
 
         # 构建基础模式条件
-        mode_condition = "mode = ?" if mode != -1 else "1=1"
-        params_start = [mode] if mode != -1 else []
-        params_end = [mode] if mode != -1 else []
+        rankings_has_uid = _table_has_column(cursor, "player_rankings", "uid")
+        ranking_uid_select = ", pr.uid" if rankings_has_uid else ", NULL AS uid"
 
         # 起始快照：起始日期之前最近一条记录（不考虑窗口，仅用于对比）
         if mode != -1:
-            cursor.execute("""
-                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc
+            cursor.execute(f"""
+                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc{ranking_uid_select}
                 FROM player_rankings pr
                 INNER JOIN (
                     SELECT player_id, MAX(crawl_time) as max_time
@@ -359,8 +466,8 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 WHERE pr.mode = ?
             """, (mode, start_date, mode))
         else:
-            cursor.execute("""
-                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc
+            cursor.execute(f"""
+                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc{ranking_uid_select}
                 FROM player_rankings pr
                 INNER JOIN (
                     SELECT player_id, MAX(crawl_time) as max_time
@@ -370,14 +477,16 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 ) latest ON pr.player_id = latest.player_id AND pr.crawl_time = latest.max_time
             """, (start_date,))
         start_players = {}
+        snapshot_uids = {}
         for row in cursor.fetchall():
             pid = row[0]
             start_players[pid] = (row[1], row[2], row[3], row[4], row[5], row[6], row[7])
+            snapshot_uids[pid] = _normalize_uid(row[8]) if len(row) > 8 else None
 
         # 结束快照：匹配窗口内最新记录（窗口内无记录视为掉出榜）
         if mode != -1:
-            cursor.execute("""
-                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc, pr.crawl_time
+            cursor.execute(f"""
+                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc, pr.crawl_time{ranking_uid_select}
                 FROM player_rankings pr
                 INNER JOIN (
                     SELECT player_id, MAX(crawl_time) as max_time
@@ -388,8 +497,8 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 WHERE pr.mode = ?
             """, (mode, window_start, end_point, mode))
         else:
-            cursor.execute("""
-                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc, pr.crawl_time
+            cursor.execute(f"""
+                SELECT pr.player_id, pr.name, pr.rank, pr.lv, pr.exp, pr.acc, pr.combo, pr.pc, pr.crawl_time{ranking_uid_select}
                 FROM player_rankings pr
                 INNER JOIN (
                     SELECT player_id, MAX(crawl_time) as max_time
@@ -404,6 +513,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             pid = row[0]
             end_players[pid] = (row[1], row[2], row[3], row[4], row[5], row[6], row[7])
             latest_times[pid] = row[8]
+            snapshot_uids[pid] = snapshot_uids.get(pid) or (_normalize_uid(row[9]) if len(row) > 9 else None)
 
         start_players_all = dict(start_players)
         end_players_all = dict(end_players)
@@ -440,11 +550,16 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             )
 
         # 分析变化
-        player_links = self._load_trend_player_links(cursor, set(start_players.keys()) | set(end_players.keys()))
+        player_links = self._load_trend_player_links(
+            cursor,
+            set(start_players.keys()) | set(end_players.keys()),
+            snapshot_uids=snapshot_uids,
+        )
         renamed_matches = self._match_renamed_players(start_players, end_players, player_links)
         processed_start_ids = set()
         processed_end_ids = set()
         all_player_ids = set(start_players.keys()) | set(end_players.keys())
+        alias_sync_changed = False
 
         trend_data = []
 
@@ -453,6 +568,18 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             end_data = end_players[end_player_id]
             start_name, start_rank, start_lv, start_exp, start_acc, start_combo, start_pc = start_data
             end_name, end_rank, end_lv, end_exp, end_acc, end_combo, end_pc = end_data
+            try:
+                alias_sync_changed = _sync_trend_aliases_for_rename(
+                    cursor,
+                    player_links,
+                    start_player_id,
+                    end_player_id,
+                    start_name,
+                    end_name,
+                    latest_times.get(end_player_id) or end_point,
+                ) or alias_sync_changed
+            except Exception:
+                pass
 
             field_has_changes = False
             for field in display_fields:
@@ -522,6 +649,19 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 start_name, start_rank, start_lv, start_exp, start_acc, start_combo, start_pc = start_data
                 end_name, end_rank, end_lv, end_exp, end_acc, end_combo, end_pc = end_data
                 current_name = end_name if end_name != start_name else start_name
+                if start_name != end_name:
+                    try:
+                        alias_sync_changed = _sync_trend_aliases_for_rename(
+                            cursor,
+                            player_links,
+                            player_id,
+                            player_id,
+                            start_name,
+                            end_name,
+                            latest_times.get(player_id) or end_point,
+                        ) or alias_sync_changed
+                    except Exception:
+                        pass
 
                 # 检查指定字段是否有变化
                 field_has_changes = False
@@ -642,6 +782,12 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     'original_name': end_name,
                     'current_name': end_name,
                 })
+
+        if alias_sync_changed:
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
 
         uid_map = _load_player_uids(cursor, {int(p["player_id"]) for p in trend_data if p.get("player_id") is not None})
         for player in trend_data:
@@ -893,7 +1039,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         print(colorize(f"\n已导出趋势数据({ext.upper()}): {filepath}", Colors.GREEN))
     
 
-    def _load_trend_player_links(self, cursor, player_ids):
+    def _load_trend_player_links(self, cursor, player_ids, snapshot_uids=None):
         links = {
             player_id: {"uids": set(), "names": set(), "aliases": set()}
             for player_id in player_ids
@@ -921,6 +1067,13 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             bucket = links.setdefault(player_id, {"uids": set(), "names": set(), "aliases": set()})
             if alias:
                 bucket["aliases"].add(_normalize_player_name(alias))
+        if snapshot_uids:
+            for player_id, uid in snapshot_uids.items():
+                normalized_uid = _normalize_uid(uid)
+                if not normalized_uid:
+                    continue
+                bucket = links.setdefault(player_id, {"uids": set(), "names": set(), "aliases": set()})
+                bucket["uids"].add(normalized_uid)
         return links
 
     def _match_renamed_players(self, start_players, end_players, player_links):

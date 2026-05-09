@@ -1,15 +1,12 @@
-import io
+﻿import io
 import sqlite3
 import sys
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
-
-from openpyxl import load_workbook
 
 ROOT_PARENT = Path(__file__).resolve().parents[2]
 if str(ROOT_PARENT) not in sys.path:
@@ -47,7 +44,7 @@ class _TrendShellStub:
         return f"{Path(base).stem}.{ext}"
 
 
-class TestStatsTrendRenames(TestCase):
+class TestStatsTrendUidInRankings(TestCase):
     @classmethod
     def setUpClass(cls):
         colors = SimpleNamespace(RED="RED", YELLOW="YELLOW", GREEN="GREEN", CYAN="CYAN", BLUE="BLUE", BOLD="BOLD")
@@ -67,6 +64,7 @@ class TestStatsTrendRenames(TestCase):
             """
             CREATE TABLE player_rankings (
                 player_id INTEGER,
+                uid TEXT,
                 name TEXT,
                 rank INTEGER,
                 lv INTEGER,
@@ -79,7 +77,7 @@ class TestStatsTrendRenames(TestCase):
             );
             CREATE TABLE player_identity (
                 player_id INTEGER,
-                uid INTEGER,
+                uid TEXT,
                 current_name TEXT
             );
             CREATE TABLE player_aliases (
@@ -91,19 +89,19 @@ class TestStatsTrendRenames(TestCase):
         cursor.executemany(
             """
             INSERT INTO player_rankings
-            (player_id, name, rank, lv, exp, acc, combo, pc, mode, crawl_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (player_id, uid, name, rank, lv, exp, acc, combo, pc, mode, crawl_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                (1, "OldName", 5, 10, 1000, 95.0, 100, 10, 3, datetime(2026, 1, 1, 0, 0, 0)),
-                (2, "NewName", 3, 11, 1200, 96.5, 120, 12, 3, datetime(2026, 4, 1, 0, 0, 0)),
+                (1, "1001", "OldName", 5, 10, 1000, 95.0, 100, 10, 3, datetime(2026, 1, 1, 0, 0, 0)),
+                (2, "1001", "NewName", 3, 11, 1200, 96.5, 120, 12, 3, datetime(2026, 4, 1, 0, 0, 0)),
             ],
         )
         cursor.executemany(
             "INSERT INTO player_identity (player_id, uid, current_name) VALUES (?, ?, ?)",
             [
-                (1, 1001, "OldName"),
-                (2, 1001, "NewName"),
+                (1, "1001", "OldName"),
+                (2, None, "NewName"),
             ],
         )
         cursor.executemany(
@@ -120,7 +118,7 @@ class TestStatsTrendRenames(TestCase):
         self.conn.close()
         self.tempdir.cleanup()
 
-    def test_do_trend_treats_rename_as_same_player_not_drop_and_new(self):
+    def test_trend_uses_rankings_uid_and_auto_sync_alias(self):
         with patch("malody_api.stats_cli.plugins.trend_plugin.get_terminal_width", return_value=400), patch(
             "sys.stdout", new_callable=io.StringIO
         ) as stdout:
@@ -138,48 +136,3 @@ class TestStatsTrendRenames(TestCase):
             ("OldName",),
         )
         self.assertEqual(cursor.fetchone()[0], 1)
-
-    def test_export_trend_data_highlights_renamed_name_cell_in_blue(self):
-        trend_data = [
-            {
-                "status": "=",
-                "name": "NewName（OldName）",
-                "start_rank": 5,
-                "end_rank": 3,
-                "rank_change": -2,
-                "start_lv": 10,
-                "end_lv": 11,
-                "lv_change": 1,
-                "start_exp": 1000,
-                "end_exp": 1200,
-                "exp_change": 200,
-                "start_acc": 95.0,
-                "end_acc": 96.5,
-                "acc_change": 1.5,
-                "start_combo": 100,
-                "end_combo": 120,
-                "combo_change": 20,
-                "start_pc": 10,
-                "end_pc": 12,
-                "pc_change": 2,
-                "renamed": True,
-            }
-        ]
-
-        self.shell.export_trend_data(
-            trend_data=trend_data,
-            display_fields=["rank"],
-            mode=3,
-            start_date=datetime(2026, 1, 1),
-            end_point=datetime(2026, 4, 1),
-            export_format="xlsx",
-        )
-
-        workbook_bytes = Path(self.tempdir.name, "trend_mode3_20260101_20260401.xlsx").read_bytes()
-        workbook = load_workbook(BytesIO(workbook_bytes), read_only=True)
-        sheet = workbook["trend"]
-        self.assertEqual(sheet["B2"].value, "NewName（OldName）")
-        self.assertEqual(sheet["B2"].fill.start_color.rgb, "FFDDEBF7")
-        del sheet
-        workbook.close()
-        del workbook
