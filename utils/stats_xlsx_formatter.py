@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import unicodedata
+
 import pandas as pd
 
 
@@ -16,14 +19,35 @@ def is_rank_change_column(column_name: str) -> bool:
 
 def autosize_openpyxl_sheet(worksheet) -> None:
     try:
+        row_max_lines: dict[int, int] = {}
+
+        def _display_width(text: str) -> int:
+            width = 0
+            for ch in text:
+                width += 2 if unicodedata.east_asian_width(ch) in {"W", "F"} else 1
+            return width
+
+        def _estimate_lines(text: str, wrap_width: int = 50) -> int:
+            lines = str(text).splitlines() or [str(text)]
+            estimated = 1
+            for line in lines:
+                visual_width = max(_display_width(line), 1)
+                estimated = max(estimated, int(math.ceil(visual_width / max(wrap_width, 1))))
+            return estimated
+
         for column_cells in worksheet.columns:
             max_len = 0
             for cell in column_cells:
                 value = "" if cell.value is None else str(cell.value)
-                if len(value) > max_len:
-                    max_len = len(value)
+                visual_width = _display_width(value)
+                if visual_width > max_len:
+                    max_len = visual_width
+                row_max_lines[cell.row] = max(row_max_lines.get(cell.row, 1), _estimate_lines(value))
             column_letter = column_cells[0].column_letter
             worksheet.column_dimensions[column_letter].width = min(max(max_len + 2, 10), 60)
+
+        for row_index, line_count in row_max_lines.items():
+            worksheet.row_dimensions[row_index].height = min(max(15 * line_count + 2, 15), 180)
     except Exception:
         # Non-openpyxl worksheet engines may not expose worksheet.columns/column_dimensions.
         return
@@ -32,7 +56,7 @@ def autosize_openpyxl_sheet(worksheet) -> None:
 def apply_change_conditional_formatting(worksheet, dataframe: pd.DataFrame) -> None:
     # OpenPyXL-only enhancement: conditionally color "change" columns.
     try:
-        from openpyxl.formatting.rule import CellIsRule
+        from openpyxl.formatting.rule import FormulaRule
         from openpyxl.styles import Font, PatternFill
         from openpyxl.utils import get_column_letter
     except Exception:
@@ -56,23 +80,44 @@ def apply_change_conditional_formatting(worksheet, dataframe: pd.DataFrame) -> N
         column_letter = get_column_letter(idx)
         data_range = f"{column_letter}2:{column_letter}{len(dataframe) + 1}"
         rank_change = is_rank_change_column(str(column_name))
+        top_cell = f"{column_letter}2"
 
         if rank_change:
             # Rank number down (<0) means rank up; apply red style per spec.
             worksheet.conditional_formatting.add(
                 data_range,
-                CellIsRule(operator="lessThan", formula=["0"], stopIfTrue=False, fill=red_fill, font=red_font),
+                FormulaRule(
+                    formula=[f"AND(ISNUMBER({top_cell}),{top_cell}<0)"],
+                    stopIfTrue=False,
+                    fill=red_fill,
+                    font=red_font,
+                ),
             )
             worksheet.conditional_formatting.add(
                 data_range,
-                CellIsRule(operator="greaterThan", formula=["0"], stopIfTrue=False, fill=green_fill, font=green_font),
+                FormulaRule(
+                    formula=[f"AND(ISNUMBER({top_cell}),{top_cell}>0)"],
+                    stopIfTrue=False,
+                    fill=green_fill,
+                    font=green_font,
+                ),
             )
         else:
             worksheet.conditional_formatting.add(
                 data_range,
-                CellIsRule(operator="greaterThan", formula=["0"], stopIfTrue=False, fill=red_fill, font=red_font),
+                FormulaRule(
+                    formula=[f"AND(ISNUMBER({top_cell}),{top_cell}>0)"],
+                    stopIfTrue=False,
+                    fill=red_fill,
+                    font=red_font,
+                ),
             )
             worksheet.conditional_formatting.add(
                 data_range,
-                CellIsRule(operator="lessThan", formula=["0"], stopIfTrue=False, fill=green_fill, font=green_font),
+                FormulaRule(
+                    formula=[f"AND(ISNUMBER({top_cell}),{top_cell}<0)"],
+                    stopIfTrue=False,
+                    fill=green_fill,
+                    font=green_font,
+                ),
             )

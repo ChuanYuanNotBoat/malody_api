@@ -4,6 +4,8 @@ from typing import BinaryIO
 import pandas as pd
 from fastapi.responses import StreamingResponse
 
+from malody_api.utils.stats_xlsx_formatter import autosize_openpyxl_sheet
+
 SUPPORTED_EXPORT_FORMATS = {"csv", "xlsx"}
 
 
@@ -28,6 +30,9 @@ def _dataframe_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str) -> BinaryIO:
         try:
             with pd.ExcelWriter(stream, engine=engine) as writer:
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
+                worksheet = writer.sheets.get(sheet_name)
+                if worksheet is not None:
+                    autosize_openpyxl_sheet(worksheet)
             stream.seek(0)
             return stream
         except Exception as exc:  # pragma: no cover - fallback path

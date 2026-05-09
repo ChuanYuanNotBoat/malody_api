@@ -39,6 +39,81 @@ def _normalize_player_name(name):
     return (name or "").strip().casefold()
 
 
+def _load_tracked_tokens(filepath: str = "players.txt") -> list[str]:
+    tokens: list[str] = []
+    if not os.path.exists(filepath):
+        return tokens
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = (raw or "").strip()
+                if not line or line.startswith("#"):
+                    continue
+                tokens.append(line)
+    except Exception:
+        return []
+    return tokens
+
+
+def _resolve_player_ids(cursor, tokens: list[str]) -> set[int]:
+    player_ids: set[int] = set()
+    for token in tokens:
+        if not token:
+            continue
+        if token.isdigit():
+            numeric = int(token)
+            cursor.execute(
+                """
+                SELECT DISTINCT player_id
+                FROM player_identity
+                WHERE uid = ? OR player_id = ?
+                """,
+                (token, numeric),
+            )
+            for row in cursor.fetchall():
+                player_ids.add(int(row[0]))
+            continue
+
+        cursor.execute(
+            """
+            SELECT DISTINCT player_id
+            FROM player_identity
+            WHERE current_name = ?
+            UNION
+            SELECT DISTINCT player_id
+            FROM player_aliases
+            WHERE alias = ?
+            """,
+            (token, token),
+        )
+        for row in cursor.fetchall():
+            player_ids.add(int(row[0]))
+    return player_ids
+
+
+def _load_player_uids(cursor, player_ids: set[int]) -> dict[int, str]:
+    if not player_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(player_ids))
+    cursor.execute(
+        f"SELECT player_id, uid FROM player_identity WHERE player_id IN ({placeholders})",
+        list(player_ids),
+    )
+    mapping: dict[int, str] = {}
+    for player_id, uid in cursor.fetchall():
+        if uid is None:
+            continue
+        key = int(player_id)
+        value = str(uid)
+        current = mapping.get(key)
+        if current is None:
+            mapping[key] = value
+        else:
+            # Keep stable deterministic choice if duplicates exist.
+            mapping[key] = min(current, value)
+    return mapping
+
+
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
     def do_trend(self, arg):
@@ -46,17 +121,26 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         统计玩家数据变化趋势（参数优先）
 
         用法: trend <起始日期> [--mode 模式] [--fields 字段列表] [--match 时间窗口] [--rank-range 范围]
+                    [--players 玩家1,玩家2|UID1,UID2] [--include-tracked] [--export csv|xlsx]
+                    [--show-uid] [--export-uid]
         选项:
             --mode        模式编号，默认为当前模式
             --fields      要显示的统计项，用逗号分隔，如 rank,lv,exp,acc,combo,pc
             --match       匹配时间窗口，如 1h(1小时), 30m(30分钟), 7d(7天)，默认1h
             --rank-range  排行榜名次范围，如 1-100，默认1-50
+            --players     额外并入玩家（不会受排名范围过滤）
+            --include-tracked  额外并入 players.txt 中的追踪玩家（不会受排名范围过滤）
+            --export      直接指定导出格式（csv/xlsx），适用于非交互命令
+            --show-uid    在终端结果中显示 UID（爬取 UID）
+            --export-uid  在导出文件中增加 UID 列（爬取 UID）
 
         示例:
             trend 2024-01-01
             trend 2024-01-01 0
             trend 2024-01-01 --match 2h --rank-range 1-50
             trend 2024-01-01 --mode 0 --fields rank,exp,acc
+            trend 2024-01-01 --mode 3 --rank-range 1-50 --include-tracked --export xlsx
+            trend 2024-01-01 --mode 3 --fields rank --show-uid --export-uid --export xlsx
         """
         import re
 
@@ -89,6 +173,11 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         display_fields = valid_fields[:]  # 默认显示所有字段
         match_window = timedelta(hours=1)  # 默认1小时
         rank_range = None  # (min, max) 或 None
+        extra_players: list[str] = []
+        include_tracked = False
+        explicit_export_format = None
+        show_uid = False
+        export_uid = False
 
         # 解析位置参数和选项
         i = 0
@@ -150,6 +239,30 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                         print(colorize("错误: --rank-range 格式应为 min-max，例如 1-100", Colors.RED))
                         return
                     i += 2
+                elif token == '--players':
+                    if i+1 >= len(args_list):
+                        print(colorize("错误: --players 需要指定玩家列表", Colors.RED))
+                        return
+                    extra_players = [x.strip() for x in args_list[i+1].split(",") if x.strip()]
+                    i += 2
+                elif token == '--include-tracked':
+                    include_tracked = True
+                    i += 1
+                elif token == '--export':
+                    if i+1 >= len(args_list):
+                        print(colorize("错误: --export 需要指定 csv 或 xlsx", Colors.RED))
+                        return
+                    explicit_export_format = (args_list[i+1] or "").strip().lower()
+                    if explicit_export_format not in ("csv", "xlsx"):
+                        print(colorize("错误: --export 仅支持 csv 或 xlsx", Colors.RED))
+                        return
+                    i += 2
+                elif token == '--show-uid':
+                    show_uid = True
+                    i += 1
+                elif token == '--export-uid':
+                    export_uid = True
+                    i += 1
                 else:
                     print(colorize(f"错误: 未知选项 {token}", Colors.RED))
                     return
@@ -292,6 +405,9 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             end_players[pid] = (row[1], row[2], row[3], row[4], row[5], row[6], row[7])
             latest_times[pid] = row[8]
 
+        start_players_all = dict(start_players)
+        end_players_all = dict(end_players)
+
         # 如果指定了排名范围，过滤起始和结束玩家
         if rank_range:
             min_rank, max_rank = rank_range
@@ -304,6 +420,24 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             # 对于掉出榜的玩家（仅在start中），需要判断其起始排名是否在范围内
             # 对于新上榜的玩家（仅在end中），结束排名已在范围内
             # 对于一直在榜的玩家，起始和结束都在范围内
+        extra_tokens = list(extra_players)
+        if include_tracked:
+            extra_tokens.extend(_load_tracked_tokens("players.txt"))
+
+        forced_extra_ids: set[int] = set()
+        if extra_tokens:
+            forced_extra_ids = _resolve_player_ids(cursor, extra_tokens)
+            for pid in forced_extra_ids:
+                if pid in start_players_all:
+                    start_players[pid] = start_players_all[pid]
+                if pid in end_players_all:
+                    end_players[pid] = end_players_all[pid]
+            print(
+                colorize(
+                    f"额外玩家并入: 输入 {len(extra_tokens)} 项，命中 player_id {len(forced_extra_ids)} 个",
+                    Colors.YELLOW,
+                )
+            )
 
         # 分析变化
         player_links = self._load_trend_player_links(cursor, set(start_players.keys()) | set(end_players.keys()))
@@ -509,12 +643,17 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     'current_name': end_name,
                 })
 
+        uid_map = _load_player_uids(cursor, {int(p["player_id"]) for p in trend_data if p.get("player_id") is not None})
+        for player in trend_data:
+            pid = player.get("player_id")
+            player["uid"] = uid_map.get(int(pid)) if pid is not None else None
+
         if not trend_data:
             print(colorize(f"\n在指定的时间范围内，模式 {mode} 没有发现数据变化", Colors.YELLOW))
             return
 
-        # 按结束排名排序（掉出榜的玩家排最后）
-        trend_data.sort(key=lambda x: (x['end_rank'] is None, x['end_rank'] or 9999))
+        # 按结束排名降序排序（掉出榜的玩家排最后）
+        trend_data.sort(key=lambda x: (-1 if x['end_rank'] is None else x['end_rank']), reverse=True)
 
         # 显示结果
         mode_name = self.mode_names.get(mode, "未知")
@@ -532,6 +671,9 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         # 构建表头
         header_parts = ["状态", "玩家名"]
         format_specs = [8, 20]
+        if show_uid:
+            header_parts.append("UID")
+            format_specs.append(12)
 
         field_configs = {
             "rank": ("排名", 10, 10, 10),
@@ -575,6 +717,8 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             if len(player_name) > max_name_len:
                 player_name = player_name[:max_name_len-3] + "..."
             row_parts.extend([status_display, player_name])
+            if show_uid:
+                row_parts.append(player.get("uid") or "N/A")
 
             for field in display_fields:
                 if field == "rank":
@@ -626,7 +770,9 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         print(colorize(f"统计: 总计 {total_players} 名玩家 | 一直在榜: {stayed} | 掉出榜: {dropped} | 新上榜: {new}", Colors.YELLOW))
 
         # 导出选项：支持格式/编号/Y(询问格式)/N(skip)
-        if getattr(self, "_non_interactive", False):
+        if explicit_export_format:
+            export_choice = explicit_export_format
+        elif getattr(self, "_non_interactive", False):
             export_choice = "n"
         else:
             export_choice = _safe_input(
@@ -642,6 +788,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 start_date,
                 end_point,
                 export_format=export_format,
+                include_uid=export_uid,
             )
 
     def _resolve_trend_export_format(self, raw_choice):
@@ -669,7 +816,16 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         print(colorize("无效输入，已跳过导出。可输入 csv/xlsx/1/2/Y/N", Colors.YELLOW))
         return None
 
-    def export_trend_data(self, trend_data, display_fields, mode, start_date, end_point, export_format="csv"):
+    def export_trend_data(
+        self,
+        trend_data,
+        display_fields,
+        mode,
+        start_date,
+        end_point,
+        export_format="csv",
+        include_uid=False,
+    ):
         """导出趋势数据为 CSV/XLSX 文件"""
         # 构建数据框
         data_dict = {}
@@ -677,6 +833,8 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         # 基本字段
         data_dict['状态'] = [player['status'] for player in trend_data]
         data_dict['玩家名'] = [player['name'] for player in trend_data]
+        if include_uid:
+            data_dict['uid'] = [player.get('uid') for player in trend_data]
         
         # 根据选择的字段添加数据
         if "rank" in display_fields:
