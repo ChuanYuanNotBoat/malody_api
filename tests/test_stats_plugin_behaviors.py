@@ -19,6 +19,7 @@ from malody_api.stats_cli.plugins import (  # noqa: E402
     update_plugin,
     utility_plugin,
 )
+from stats_cli.plugins.registry import reload_plugins  # noqa: E402
 
 
 def _colorize(text: str, _color: str) -> str:
@@ -245,6 +246,99 @@ class TestStatsPluginBehaviors(TestCase):
         output = stdout.getvalue().lower()
         self.assertIn("export", output)
         self.assertIn("update", output)
+        self.assertIn("reload", output)
+
+    def test_reload_command_dispatches_by_module(self):
+        shell = _ShellStub()
+        with patch("stats_cli.plugins.registry.reload_plugins") as reload_mock, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            reload_mock.return_value = {
+                "ok": True,
+                "message": "Reloaded plugin module: stats_cli.plugins.utility_plugin",
+                "reloaded_modules": ["stats_cli.plugins.utility_plugin"],
+            }
+            shell.do_reload("module utility")
+
+        reload_mock.assert_called_once_with(shell.__class__, module_name="utility")
+
+    def test_reload_command_dispatches_by_command(self):
+        shell = _ShellStub()
+        with patch("stats_cli.plugins.registry.reload_plugins") as reload_mock, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            reload_mock.return_value = {
+                "ok": True,
+                "message": "Reloaded plugin module: stats_cli.plugins.help_plugin",
+                "reloaded_modules": ["stats_cli.plugins.help_plugin"],
+            }
+            shell.do_reload("command help")
+
+        reload_mock.assert_called_once_with(shell.__class__, command_name="help")
+
+    def test_reload_command_reports_argument_parse_failure(self):
+        shell = _ShellStub()
+        with patch("stats_cli.plugins.registry.reload_plugins") as reload_mock, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as stdout:
+            shell.do_reload('module "broken')
+
+        reload_mock.assert_not_called()
+        self.assertIn("failed to parse arguments", stdout.getvalue().lower())
+
+    def test_reload_command_supports_misspelled_module_keyword(self):
+        shell = _ShellStub()
+        with patch("stats_cli.plugins.registry.reload_plugins") as reload_mock, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            reload_mock.return_value = {
+                "ok": True,
+                "message": "Reloaded plugin module: stats_cli.plugins.help_plugin",
+                "reloaded_modules": ["stats_cli.plugins.help_plugin"],
+            }
+            shell.do_reload("moudle help")
+
+        reload_mock.assert_called_once_with(shell.__class__, module_name="help")
+
+    def test_reload_question_mark_prints_usage(self):
+        shell = _ShellStub()
+        with patch("stats_cli.plugins.registry.reload_plugins") as reload_mock, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as stdout:
+            shell.do_reload("?")
+
+        reload_mock.assert_not_called()
+        output = stdout.getvalue().lower()
+        self.assertIn("usage: reload", output)
+        self.assertIn("reload command ls", output)
+
+    def test_reload_module_unknown_command_shows_hint(self):
+        shell = _ShellStub()
+        with patch("stats_cli.plugins.registry.reload_plugins") as reload_mock, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as stdout:
+            reload_mock.return_value = {
+                "ok": False,
+                "message": "Unknown plugin module: ls",
+                "reloaded_modules": [],
+                "hints": ["'ls' looks like a command. Try: reload command ls"],
+            }
+            shell.do_reload("module ls")
+
+        reload_mock.assert_called_once_with(shell.__class__, module_name="ls")
+        self.assertIn("try: reload command ls", stdout.getvalue().lower())
+
+    def test_registry_unknown_module_suggests_command_hint(self):
+        _ShellStub._plugin_install_context = {"ready": True}
+        result = reload_plugins(_ShellStub, module_name="ls")
+        self.assertFalse(result["ok"])
+        self.assertIn("reload command ls", " ".join(result.get("hints", [])).lower())
+
+    def test_registry_unknown_module_help_token_suggests_usage(self):
+        _ShellStub._plugin_install_context = {"ready": True}
+        result = reload_plugins(_ShellStub, module_name="?")
+        self.assertFalse(result["ok"])
+        self.assertIn("reload ?", " ".join(result.get("hints", [])).lower())
 
     def test_mm_stats_command_reports_invalid_limit(self):
         shell = _ShellStub()

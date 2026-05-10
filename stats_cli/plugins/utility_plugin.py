@@ -1,4 +1,5 @@
 import os
+import shlex
 from datetime import datetime
 
 try:
@@ -69,6 +70,72 @@ def install(cls, *, colorize, colors, get_separator, db_safe_operation):
     def do_quit(self, arg):
         """退出程序"""
         return self.do_exit(arg)
+
+    def do_reload(self, arg):
+        """
+        Reload plugin modules/commands without restarting CLI.
+        Usage:
+            reload
+            reload all
+            reload module <name>
+            reload command <name>
+        """
+        from stats_cli.plugins.registry import reload_plugins
+
+        def _print_reload_usage():
+            print(colorize("Usage: reload [all|module <name>|command <name>]", colors.CYAN))
+            print("Examples:")
+            print("  reload all")
+            print("  reload module help")
+            print("  reload command ls")
+
+        raw = (arg or "").strip()
+        mode = "all"
+        target = None
+
+        if raw:
+            try:
+                tokens = shlex.split(raw)
+            except ValueError as exc:
+                print(colorize(f"Failed to parse arguments: {exc}", colors.RED))
+                return
+
+            head = tokens[0].lower() if tokens else ""
+            if head in {"?", "help", "-h", "--help"} and len(tokens) == 1:
+                _print_reload_usage()
+                return
+            if head in {"all", "*"} and len(tokens) == 1:
+                mode = "all"
+            elif head in {"module", "m", "mod", "moudle"} and len(tokens) == 2:
+                mode = "module"
+                target = tokens[1]
+            elif head in {"command", "cmd", "c"} and len(tokens) == 2:
+                mode = "command"
+                target = tokens[1]
+            elif len(tokens) == 1:
+                guess = tokens[0]
+                if hasattr(self.__class__, f"do_{guess.lower()}"):
+                    mode = "command"
+                else:
+                    mode = "module"
+                target = guess
+            else:
+                _print_reload_usage()
+                return
+
+        if mode == "all":
+            result = reload_plugins(self.__class__)
+        elif mode == "module":
+            result = reload_plugins(self.__class__, module_name=target)
+        else:
+            result = reload_plugins(self.__class__, command_name=target)
+
+        if result.get("ok"):
+            print(colorize(result.get("message", "Reload done"), colors.GREEN))
+        else:
+            print(colorize(result.get("message", "Reload failed"), colors.RED))
+            for hint in result.get("hints", []) or []:
+                print(colorize(f"Hint: {hint}", colors.YELLOW))
 
     def do_mm_stats(self, arg):
         """
@@ -269,6 +336,7 @@ def install(cls, *, colorize, colors, get_separator, db_safe_operation):
     setattr(cls, "do_mode", do_mode)
     setattr(cls, "do_exit", do_exit)
     setattr(cls, "do_quit", do_quit)
+    setattr(cls, "do_reload", do_reload)
     setattr(cls, "do_mm_stats", db_safe_operation(do_mm_stats))
     setattr(cls, "_build_mm_stats_fallback", _build_mm_stats_fallback)
     setattr(cls, "do_q", do_quit)

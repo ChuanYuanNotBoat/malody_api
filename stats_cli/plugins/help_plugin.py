@@ -59,6 +59,7 @@ def install(cls, *, colorize, colors, get_separator, get_subseparator):
 
                 # 其他命令
                 ("alias <原名> <新名>", "设置玩家别名"),
+                ("reload [all|module <name>|command <name>]", "热重载命令/模块"),
                 ("export <类型> [选项]", "导出数据为CSV/XLSX（类型：top, history, chart, song, profile）"),
                 ("help [命令]", "显示帮助信息"),
                 ("exit/quit", "退出程序")
