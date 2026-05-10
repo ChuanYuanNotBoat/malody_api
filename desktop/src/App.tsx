@@ -25,11 +25,13 @@ import {
 import zhCN from "antd/locale/zh_CN";
 import enUS from "antd/locale/en_US";
 import {
+  createSystemTask,
   getCrawlerStatus,
   getCrawlerTaskLog,
   getCrawlerTasks,
   getChartExportUrl,
   getChartTrends,
+  getAnalysisAppStatus,
   getDashboardOverview,
   getDbHealth,
   getDbMaintenanceHistory,
@@ -37,13 +39,13 @@ import {
   getPlayerCompare,
   getPredefinedQueries,
   getPlugins,
+  getSystemTaskLog,
+  getSystemTasks,
+  launchAnalysisApp,
   executeAdvancedQuery,
   getQualityCheckJob,
   getQualityReport,
-  runCrawler,
-  runDbMaintenance,
-  runPlugin,
-  startQualityCheckJob
+  runCrawler
 } from "./api";
 import {AppLocale, dictionaries} from "./i18n";
 
@@ -356,10 +358,28 @@ export function buildCrawlerRunParams(values: CrawlerFormValues): URLSearchParam
   return params;
 }
 
+function paramsToObject(params: URLSearchParams): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  params.forEach((value, key) => {
+    if (Object.prototype.hasOwnProperty.call(out, key)) {
+      const current = out[key];
+      if (Array.isArray(current)) {
+        current.push(value);
+      } else {
+        out[key] = [current, value];
+      }
+    } else {
+      out[key] = value;
+    }
+  });
+  return out;
+}
+
 function App() {
   const queryClient = useQueryClient();
   const [queryTaskForm] = Form.useForm();
   const [selectedTaskId, setSelectedTaskId] = useState<string>("");
+  const [selectedUnifiedTaskId, setSelectedUnifiedTaskId] = useState<string>("");
   const [actionLogs, setActionLogs] = useState<ActionLogRow[]>([]);
   const [qualityJobId, setQualityJobId] = useState<string>("");
   const [qualityJobStatus, setQualityJobStatus] = useState<string>("");
@@ -420,7 +440,9 @@ function App() {
       crawler: t("tab_crawler"),
       quality: t("tab_quality"),
       db: t("tab_db"),
-      plugin: t("tab_plugins")
+      plugin: t("tab_plugins"),
+      "task-center": t("tab_tasks"),
+      "analysis-app": t("analysis_app")
     };
     return mapping[scope] ?? scope;
   };
@@ -430,9 +452,10 @@ function App() {
       queued: t("status_queued"),
       running: t("status_running"),
       finished: t("status_finished"),
+      succeeded: t("op_succeeded"),
       failed: t("status_failed"),
-      started: t("op_started"),
-      succeeded: t("op_succeeded")
+      cancelled: t("status_failed"),
+      started: t("op_started")
     };
     if (!status) return "-";
     return mapping[status] ?? status;
@@ -552,6 +575,22 @@ function App() {
     queryKey: ["plugins"],
     queryFn: getPlugins
   });
+  const unifiedTasksQuery = useQuery({
+    queryKey: ["system-tasks"],
+    queryFn: () => getSystemTasks(200),
+    refetchInterval: 3000
+  });
+  const unifiedTaskLogQuery = useQuery({
+    queryKey: ["system-task-log", selectedUnifiedTaskId],
+    queryFn: () => getSystemTaskLog(selectedUnifiedTaskId, 300),
+    enabled: !!selectedUnifiedTaskId,
+    refetchInterval: 2000
+  });
+  const analysisAppStatusQuery = useQuery({
+    queryKey: ["analysis-app-status"],
+    queryFn: getAnalysisAppStatus,
+    refetchInterval: 5000
+  });
   const predefinedQuery = useQuery({
     queryKey: ["query-predefined"],
     queryFn: getPredefinedQueries
@@ -580,11 +619,14 @@ function App() {
   }, [selectedQueryKey, selectedQueryDefinition]);
 
   const runCrawlerMutation = useMutation({
-    mutationFn: runCrawler,
+    mutationFn: (params: URLSearchParams) => createSystemTask("crawler.run", paramsToObject(params)),
     onMutate: () => startAction("crawler", t("start_crawler"), t("op_running_crawler")),
-    onSuccess: async (_, __, ctx) => {
+    onSuccess: async (data, __, ctx) => {
+      const taskId = data?.task_id as string | undefined;
+      if (taskId) setSelectedUnifiedTaskId(taskId);
       message.success({ content: t("crawler_started"), key: ctx?.messageKey });
       finishAction(ctx, t("op_succeeded"), t("crawler_started"));
+      await queryClient.invalidateQueries({ queryKey: ["system-tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["crawler-tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["crawler-status"] });
     },
@@ -596,20 +638,16 @@ function App() {
   });
 
   const runQualityMutation = useMutation({
-    mutationFn: startQualityCheckJob,
+    mutationFn: (staleHours: number) => createSystemTask("quality.check", { stale_hours: staleHours }),
     onMutate: () => startAction("quality", t("run_quality_check"), t("op_running_quality")),
-    onSuccess: (data, _, ctx) => {
-      const jobId = data?.job_id as string | undefined;
-      if (!jobId) {
-        message.error({ content: "Quality job missing job_id", key: ctx?.messageKey });
-        finishAction(ctx, t("op_failed"), "missing job_id");
-        return;
+    onSuccess: async (data, _, ctx) => {
+      const taskId = data?.task_id as string | undefined;
+      if (taskId) {
+        setSelectedUnifiedTaskId(taskId);
       }
-      setQualityJobId(jobId);
-      setQualityJobStatus(String(data?.status ?? "queued"));
-      setQualityJobNotifiedStatus("");
-      message.info({ content: `${t("quality_job_submitted")}: job=${jobId}`, key: ctx?.messageKey });
-      finishAction(ctx, t("op_succeeded"), `${t("quality_job_submitted")}: job=${jobId}`);
+      message.info({ content: t("quality_job_submitted"), key: ctx?.messageKey });
+      finishAction(ctx, t("op_succeeded"), t("quality_job_submitted"));
+      await queryClient.invalidateQueries({ queryKey: ["system-tasks"] });
     },
     onError: (error: Error, _, ctx) => {
       const msg = formatError(error);
@@ -620,11 +658,14 @@ function App() {
 
   const dbMaintainMutation = useMutation({
     mutationFn: ({ action, dryRun }: { action: "analyze" | "vacuum"; dryRun: boolean }) =>
-      runDbMaintenance(action, true, dryRun),
+      createSystemTask("db.maintain", { action, dry_run: dryRun }),
     onMutate: (vars) => startAction("db", `${t("action")}: ${vars.action}`, t("op_running_maintain")),
-    onSuccess: async (_, __, ctx) => {
+    onSuccess: async (data, __, ctx) => {
+      const taskId = data?.task_id as string | undefined;
+      if (taskId) setSelectedUnifiedTaskId(taskId);
       message.success({ content: t("maintain_done"), key: ctx?.messageKey });
       finishAction(ctx, t("op_succeeded"), t("maintain_done"));
+      await queryClient.invalidateQueries({ queryKey: ["system-tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["db-health"] });
       await queryClient.invalidateQueries({ queryKey: ["db-history"] });
     },
@@ -637,11 +678,14 @@ function App() {
 
   const pluginRunMutation = useMutation({
     mutationFn: ({ pluginId, payload }: { pluginId: string; payload: Record<string, unknown> }) =>
-      runPlugin(pluginId, { payload }),
+      createSystemTask("plugin.run", { plugin_id: pluginId, payload }),
     onMutate: (vars) => startAction("plugin", vars.pluginId, t("op_running_plugin")),
-    onSuccess: (_, __, ctx) => {
+    onSuccess: async (data, __, ctx) => {
+      const taskId = data?.task_id as string | undefined;
+      if (taskId) setSelectedUnifiedTaskId(taskId);
       message.success({ content: t("plugin_done"), key: ctx?.messageKey });
       finishAction(ctx, t("op_succeeded"), t("plugin_done"));
+      await queryClient.invalidateQueries({ queryKey: ["system-tasks"] });
     },
     onError: (error: Error, _, ctx) => {
       const msg = formatError(error);
@@ -651,13 +695,17 @@ function App() {
   });
 
   const executeQueryMutation = useMutation({
-    mutationFn: executeAdvancedQuery,
+    mutationFn: (payload: Record<string, unknown>) => createSystemTask("query.execute", payload),
     onMutate: () => startAction("query", t("tab_query"), t("tab_query")),
-    onSuccess: (data, _, ctx) => {
-      const rows = Array.isArray(data) ? data : [];
-      setQueryResultRows(rows);
-      message.success({ content: `${t("run")}: ${rows.length} rows`, key: ctx?.messageKey });
-      finishAction(ctx, t("op_succeeded"), `rows=${rows.length}`);
+    onSuccess: async (data, _, ctx) => {
+      const taskId = data?.task_id as string | undefined;
+      if (taskId) {
+        setSelectedUnifiedTaskId(taskId);
+      }
+      setQueryResultRows([]);
+      message.success({ content: `${t("run")}: task created`, key: ctx?.messageKey });
+      finishAction(ctx, t("op_succeeded"), "query task created");
+      await queryClient.invalidateQueries({ queryKey: ["system-tasks"] });
     },
     onError: (error: Error, _, ctx) => {
       const msg = formatError(error);
@@ -680,6 +728,24 @@ function App() {
   const chartTrendMutation = useMutation({
     mutationFn: ({ mode, period }: { mode: number; period: "days" | "months" }) => getChartTrends(mode, period),
     onSuccess: (data) => setChartTrendRows(Array.isArray(data) ? data : [])
+  });
+  const launchAnalysisMutation = useMutation({
+    mutationFn: () =>
+      launchAnalysisApp({
+        api_base: window.localStorage.getItem("app.api_base") ?? "http://127.0.0.1:8000",
+        open_task_id: selectedUnifiedTaskId || undefined
+      }),
+    onSuccess: async (data) => {
+      if (data?.ok) {
+        message.success({ content: t("analysis_open") });
+      } else {
+        message.error({ content: String(data?.error ?? t("analysis_not_found")) });
+      }
+      await queryClient.invalidateQueries({ queryKey: ["analysis-app-status"] });
+    },
+    onError: (error: Error) => {
+      message.error({ content: formatError(error) });
+    }
   });
 
   useEffect(() => {
@@ -735,6 +801,7 @@ function App() {
   }, [qualityJobQuery.data, qualityJobNotifiedStatus, queryClient]);
 
   const taskRows: CrawlerTaskRow[] = tasksQuery.data?.tasks ?? [];
+  const unifiedTaskRows: Array<Record<string, unknown>> = unifiedTasksQuery.data?.tasks ?? [];
   const qualityIssues: QualityIssueRow[] = qualityQuery.data?.issues ?? [];
   const dbHistoryRows: DBHistoryRow[] = dbHistoryQuery.data?.history ?? [];
   const queryErrors = useMemo(
@@ -749,7 +816,9 @@ function App() {
         { scope: "db-health", error: dbHealthQuery.error as Error | null },
         { scope: "db-history", error: dbHistoryQuery.error as Error | null },
         { scope: "plugins", error: pluginsQuery.error as Error | null },
-        { scope: "query", error: predefinedQuery.error as Error | null }
+        { scope: "query", error: predefinedQuery.error as Error | null },
+        { scope: "task-center", error: unifiedTasksQuery.error as Error | null },
+        { scope: "analysis-app", error: analysisAppStatusQuery.error as Error | null }
       ].filter((item) => !!item.error),
     [
       overviewQuery.error,
@@ -761,7 +830,9 @@ function App() {
       dbHealthQuery.error,
       dbHistoryQuery.error,
       pluginsQuery.error,
-      predefinedQuery.error
+      predefinedQuery.error,
+      unifiedTasksQuery.error,
+      analysisAppStatusQuery.error
     ]
   );
 
@@ -884,6 +955,26 @@ function App() {
                         </Card>
                       </Col>
                     </Row>
+                    <Card title={t("analysis_app")}>
+                      <Space direction="vertical" style={{ width: "100%" }}>
+                        <Typography.Text>
+                          {t("analysis_path")}: {analysisAppStatusQuery.data?.root ?? "-"}
+                        </Typography.Text>
+                        <Typography.Text type={analysisAppStatusQuery.data?.entry_exists ? "success" : "danger"}>
+                          {t("analysis_status")}: {analysisAppStatusQuery.data?.entry_exists ? t("analysis_found") : t("analysis_not_found")}
+                        </Typography.Text>
+                        <Space>
+                          <Button onClick={() => analysisAppStatusQuery.refetch()}>{t("analysis_refresh")}</Button>
+                          <Button
+                            type="primary"
+                            loading={launchAnalysisMutation.isPending}
+                            onClick={() => launchAnalysisMutation.mutate()}
+                          >
+                            {t("analysis_open")}
+                          </Button>
+                        </Space>
+                      </Space>
+                    </Card>
                     <Card title={t("crawler_distribution")}>
                       <ReactECharts option={chartOption} style={{ height: 280 }} />
                     </Card>
@@ -907,7 +998,8 @@ function App() {
               },
               {
                 key: "analytics",
-                label: t("tab_analytics"),
+                label: `${t("tab_analytics")} (Legacy)`,
+                disabled: true,
                 children: (
                   <Space direction="vertical" style={{ width: "100%" }} size={16}>
                     <Card title={t("analytics_mode_compare")}>
@@ -1022,6 +1114,49 @@ function App() {
                           { title: "total", dataIndex: "count" },
                           { title: "stable", dataIndex: "stable_count" }
                         ]}
+                      />
+                    </Card>
+                  </Space>
+                )
+              },
+              {
+                key: "tasks",
+                label: t("tab_tasks"),
+                children: (
+                  <Space direction="vertical" style={{ width: "100%" }} size={16}>
+                    <Card title={t("tab_tasks")}>
+                      <Table<Record<string, unknown>>
+                        rowKey={(row) => String(row.task_id ?? "")}
+                        dataSource={unifiedTaskRows}
+                        pagination={{ pageSize: 10 }}
+                        locale={{ emptyText: t("no_data") }}
+                        onRow={(record) => ({ onClick: () => setSelectedUnifiedTaskId(String(record.task_id ?? "")) })}
+                        columns={[
+                          { title: t("task_id"), dataIndex: "task_id" },
+                          { title: t("op_scope"), dataIndex: "scope" },
+                          { title: t("action"), dataIndex: "action" },
+                          {
+                            title: t("status"),
+                            dataIndex: "status",
+                            render: (value: string) => (
+                              <Tag color={value === "failed" ? "red" : value === "running" ? "blue" : "green"}>
+                                {statusLabel(value)}
+                              </Tag>
+                            )
+                          },
+                          { title: t("started_at"), dataIndex: "started_at" },
+                          { title: t("ended_at"), dataIndex: "ended_at" }
+                        ]}
+                      />
+                    </Card>
+                    <Card title={`${t("task_log")} ${selectedUnifiedTaskId ? `(${selectedUnifiedTaskId})` : ""}`}>
+                      <Input.TextArea
+                        rows={14}
+                        readOnly
+                        placeholder={t("select_task_log")}
+                        value={(unifiedTaskLogQuery.data?.events ?? [])
+                          .map((item: Record<string, unknown>) => JSON.stringify(item))
+                          .join("\n")}
                       />
                     </Card>
                   </Space>
@@ -1393,7 +1528,8 @@ function App() {
               },
               {
                 key: "query",
-                label: t("tab_query"),
+                label: `${t("tab_query")} (Legacy)`,
+                disabled: true,
                 children: (
                   <Space direction="vertical" style={{ width: "100%" }} size={16}>
                     <Alert type="info" message={t("query_workflow_title")} description={t("query_workflow_desc")} />

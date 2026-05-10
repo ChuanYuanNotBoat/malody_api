@@ -107,6 +107,12 @@ python run.py
 #### 系统管理
 - `GET /system/health` - 健康检查
 - `GET /system/database-info` - 获取数据库信息
+- `POST /system/tasks` - 统一任务入口（crawler / quality / db / plugin / query）
+- `GET /system/tasks` - 统一任务列表
+- `GET /system/tasks/{task_id}` - 统一任务详情
+- `GET /system/tasks/{task_id}/log` - 统一任务 JSONL 事件日志（tail）
+- `GET /system/analysis-app/status` - 分析程序路径与入口检测
+- `POST /system/analysis-app/launch` - 启动外部分析程序（支持 `--api-base` / `--open-task-id`）
 
 ### 响应格式
 

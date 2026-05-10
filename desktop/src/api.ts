@@ -1,5 +1,7 @@
-export const API_BASE = "http://127.0.0.1:18765";
 const REQUEST_TIMEOUT_MS = 20_000;
+const DEFAULT_BASES = ["http://127.0.0.1:18765", "http://127.0.0.1:8000"];
+const API_BASE_KEY = "app.api_base";
+export const API_BASE = DEFAULT_BASES[0];
 
 type ApiEnvelope<T> = {
   success: boolean;
@@ -11,40 +13,72 @@ type ApiEnvelope<T> = {
 
 type RequestOptions = RequestInit & { timeoutMs?: number };
 
+function getCandidateApiBases(): string[] {
+  const preferred = typeof window !== "undefined" ? window.localStorage.getItem(API_BASE_KEY) : null;
+  const envBase =
+    (typeof import.meta !== "undefined" &&
+      (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE) ||
+    "";
+  const candidates = [preferred || "", envBase || "", ...DEFAULT_BASES]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  return [...new Set(candidates)];
+}
+
+function rememberApiBase(base: string) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(API_BASE_KEY, base);
+  } catch {
+    // ignore
+  }
+}
+
 async function request<T>(path: string, init?: RequestOptions): Promise<T> {
   const timeoutMs = init?.timeoutMs ?? REQUEST_TIMEOUT_MS;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const bases = getCandidateApiBases();
+  const perAttemptTimeoutMs = bases.length > 1 ? Math.min(timeoutMs, 5000) : timeoutMs;
+  let lastNetworkError: unknown = null;
 
-  let response: Response;
-  try {
-    response = await fetch(`${API_BASE}${path}`, {
-      headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-      ...init,
-      signal: controller.signal
-    });
-  } catch (error) {
-    clearTimeout(timeout);
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`Request timeout (${timeoutMs}ms): ${path}`);
+  for (const base of bases) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), perAttemptTimeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch(`${base}${path}`, {
+        headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+        ...init,
+        signal: controller.signal
+      });
+    } catch (error) {
+      clearTimeout(timeout);
+      lastNetworkError = error;
+      continue;
     }
-    throw error;
+
+    clearTimeout(timeout);
+
+    let json: ApiEnvelope<T> | null = null;
+    try {
+      json = (await response.json()) as ApiEnvelope<T>;
+    } catch {
+      json = null;
+    }
+
+    if (!response.ok || !json || !json.success) {
+      const detail = json?.error || json?.message || "unknown error";
+      throw new Error(`HTTP ${response.status} ${base}${path}: ${detail}`);
+    }
+
+    rememberApiBase(base);
+    return json.data as T;
   }
 
-  clearTimeout(timeout);
-
-  let json: ApiEnvelope<T> | null = null;
-  try {
-    json = (await response.json()) as ApiEnvelope<T>;
-  } catch {
-    json = null;
+  if (lastNetworkError instanceof Error && lastNetworkError.name === "AbortError") {
+    throw new Error(`Request timeout (${perAttemptTimeoutMs}ms/attempt): ${path}`);
   }
-
-  if (!response.ok || !json || !json.success) {
-    const detail = json?.error || json?.message || "unknown error";
-    throw new Error(`HTTP ${response.status} ${path}: ${detail}`);
-  }
-  return json.data as T;
+  throw new Error(`Unable to connect API for ${path}. Tried: ${bases.join(", ")}`);
 }
 
 export async function getDashboardOverview() {
@@ -98,6 +132,39 @@ export async function getPlugins() {
 
 export async function runPlugin(pluginId: string, payload?: Record<string, unknown>) {
   return request<any>(`/plugins/${encodeURIComponent(pluginId)}/run`, {
+    method: "POST",
+    body: JSON.stringify(payload ?? {})
+  });
+}
+
+export async function createSystemTask(action: string, params?: Record<string, unknown>) {
+  return request<any>("/system/tasks", {
+    method: "POST",
+    body: JSON.stringify({
+      action,
+      params: params ?? {}
+    })
+  });
+}
+
+export async function getSystemTasks(limit = 100) {
+  return request<any>(`/system/tasks?limit=${limit}`);
+}
+
+export async function getSystemTask(taskId: string) {
+  return request<any>(`/system/tasks/${encodeURIComponent(taskId)}`);
+}
+
+export async function getSystemTaskLog(taskId: string, tail = 200) {
+  return request<any>(`/system/tasks/${encodeURIComponent(taskId)}/log?tail=${tail}`);
+}
+
+export async function getAnalysisAppStatus() {
+  return request<any>("/system/analysis-app/status");
+}
+
+export async function launchAnalysisApp(payload?: { api_base?: string; open_task_id?: string }) {
+  return request<any>("/system/analysis-app/launch", {
     method: "POST",
     body: JSON.stringify(payload ?? {})
   });
@@ -167,10 +234,11 @@ export async function getChartTrends(mode: number, period: "days" | "months") {
 }
 
 export function getChartExportUrl(params: { mode?: number; creators?: string; statuses?: string; format?: "csv" | "xlsx" }) {
+  const base = getCandidateApiBases()[0] || DEFAULT_BASES[0];
   const search = new URLSearchParams();
   if (typeof params.mode === "number") search.set("mode", String(params.mode));
   if (params.creators) search.set("creators", params.creators);
   if (params.statuses) search.set("statuses", params.statuses);
   if (params.format) search.set("format", params.format);
-  return `${API_BASE}/charts/export/charts?${search.toString()}`;
+  return `${base}/charts/export/charts?${search.toString()}`;
 }

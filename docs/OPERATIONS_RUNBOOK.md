@@ -23,6 +23,7 @@
    - run with smaller `limit` and stricter `source`.
 4. Collect evidence:
    - task logs under `logs/crawler_tasks/`
+   - unified task logs under `logs/tasks/*.jsonl`
    - consistency reports under `logs/`
 
 ## Rollback
