@@ -229,6 +229,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         统计玩家数据变化趋势（参数优先）
 
         用法: trend <起始日期> [--mode 模式] [--fields 字段列表] [--match 时间窗口] [--rank-range 范围]
+                    [--sort 排序字段]
                     [--players 玩家1,玩家2|UID1,UID2] [--include-tracked] [--export csv|xlsx]
                     [--show-uid] [--export-uid]
         选项:
@@ -236,6 +237,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             --fields      要显示的统计项，用逗号分隔，如 rank,lv,exp,acc,combo,pc
             --match       匹配时间窗口，如 1h(1小时), 30m(30分钟), 7d(7天)，默认1h
             --rank-range  排行榜名次范围，如 1-100，默认1-50
+            --sort        排序字段，默认 rank（升序）
             --players     额外并入玩家（不会受排名范围过滤）
             --include-tracked  额外并入 players.txt 中的追踪玩家（不会受排名范围过滤）
             --export      直接指定导出格式（csv/xlsx），适用于非交互命令
@@ -247,6 +249,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             trend 2024-01-01 0
             trend 2024-01-01 --match 2h --rank-range 1-50
             trend 2024-01-01 --mode 0 --fields rank,exp,acc
+            trend 2024-01-01 --mode 0 --sort exp
             trend 2024-01-01 --mode 3 --rank-range 1-50 --include-tracked --export xlsx
             trend 2024-01-01 --mode 3 --fields rank --show-uid --export-uid --export xlsx
         """
@@ -254,6 +257,35 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
         # 合法字段列表
         valid_fields = ["rank", "lv", "exp", "acc", "combo", "pc"]
+        valid_sort_fields = [
+            "rank",
+            "start_rank",
+            "end_rank",
+            "rank_change",
+            "lv",
+            "start_lv",
+            "end_lv",
+            "lv_change",
+            "exp",
+            "start_exp",
+            "end_exp",
+            "exp_change",
+            "acc",
+            "start_acc",
+            "end_acc",
+            "acc_change",
+            "combo",
+            "start_combo",
+            "end_combo",
+            "combo_change",
+            "pc",
+            "start_pc",
+            "end_pc",
+            "pc_change",
+            "name",
+            "status",
+            "latest_time",
+        ]
 
         # 辅助函数：解析时间窗口字符串
         def parse_time_window(s):
@@ -286,6 +318,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         explicit_export_format = None
         show_uid = False
         export_uid = False
+        sort_field = "rank"
 
         # 解析位置参数和选项
         i = 0
@@ -371,6 +404,16 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 elif token == '--export-uid':
                     export_uid = True
                     i += 1
+                elif token == '--sort':
+                    if i+1 >= len(args_list):
+                        print(colorize("错误: --sort 需要指定排序字段", Colors.RED))
+                        return
+                    sort_field = (args_list[i+1] or "").strip().lower()
+                    if sort_field not in valid_sort_fields:
+                        print(colorize(f"错误: 无效的排序字段: {sort_field}", Colors.RED))
+                        print(colorize(f"有效排序字段: {', '.join(valid_sort_fields)}", Colors.YELLOW))
+                        return
+                    i += 2
                 else:
                     print(colorize(f"错误: 未知选项 {token}", Colors.RED))
                     return
@@ -414,31 +457,54 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
         cursor = self.conn.cursor()
 
-        # 获取数据库最新时间
+        def _to_datetime(value):
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value)
+                except ValueError:
+                    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            return value
+
+        # 获取数据库时间范围
         if mode != -1:
-            cursor.execute("SELECT MAX(crawl_time) FROM player_rankings WHERE mode = ?", (mode,))
+            cursor.execute(
+                "SELECT MIN(crawl_time), MAX(crawl_time) FROM player_rankings WHERE mode = ?",
+                (mode,),
+            )
         else:
-            cursor.execute("SELECT MAX(crawl_time) FROM player_rankings")
-        latest_time_row = cursor.fetchone()
-        if not latest_time_row or latest_time_row[0] is None:
+            cursor.execute("SELECT MIN(crawl_time), MAX(crawl_time) FROM player_rankings")
+        time_range_row = cursor.fetchone()
+        if (
+            not time_range_row
+            or len(time_range_row) < 2
+            or time_range_row[0] is None
+            or time_range_row[1] is None
+        ):
             print(colorize("错误: 数据库中没有数据，无法进行趋势分析", Colors.RED))
             return
 
-        raw_end_point = latest_time_row[0]
-        # 确保 end_point 是 datetime 类型
-        if isinstance(raw_end_point, str):
-            try:
-                end_point = datetime.fromisoformat(raw_end_point)
-            except ValueError:
-                # 尝试常见格式
-                end_point = datetime.strptime(raw_end_point, '%Y-%m-%d %H:%M:%S')
-        else:
-            end_point = raw_end_point
+        earliest_time = _to_datetime(time_range_row[0])
+        end_point = _to_datetime(time_range_row[1])
 
         # 设置默认排名范围
         if rank_range is None:
             rank_range = (1, 50)
             print(colorize("未指定排名范围，默认使用 1-50", Colors.YELLOW))
+
+        # 起始时间早于首条有效数据时，提示并自动夹到最早有效时间，避免误判为大量“新上榜”
+        if earliest_time is not None and start_date < earliest_time:
+            print(
+                colorize(
+                    f"警告: 起始日期 {start_date.strftime('%Y-%m-%d %H:%M:%S')} 早于数据库最早有效时间 "
+                    f"{earliest_time.strftime('%Y-%m-%d %H:%M:%S')}，将自动使用最早有效时间继续分析。",
+                    Colors.YELLOW,
+                )
+            )
+            start_date = earliest_time
 
         # 确保起始日期不晚于最新时间
         if start_date > end_point:
@@ -798,8 +864,76 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             print(colorize(f"\n在指定的时间范围内，模式 {mode} 没有发现数据变化", Colors.YELLOW))
             return
 
-        # 按结束排名降序排序（掉出榜的玩家排最后）
-        trend_data.sort(key=lambda x: (-1 if x['end_rank'] is None else x['end_rank']), reverse=True)
+        sort_extractors = {
+            "rank": lambda p: p.get("end_rank"),
+            "start_rank": lambda p: p.get("start_rank"),
+            "end_rank": lambda p: p.get("end_rank"),
+            "rank_change": lambda p: p.get("rank_change"),
+            "lv": lambda p: p.get("end_lv"),
+            "start_lv": lambda p: p.get("start_lv"),
+            "end_lv": lambda p: p.get("end_lv"),
+            "lv_change": lambda p: p.get("lv_change"),
+            "exp": lambda p: p.get("end_exp"),
+            "start_exp": lambda p: p.get("start_exp"),
+            "end_exp": lambda p: p.get("end_exp"),
+            "exp_change": lambda p: p.get("exp_change"),
+            "acc": lambda p: p.get("end_acc"),
+            "start_acc": lambda p: p.get("start_acc"),
+            "end_acc": lambda p: p.get("end_acc"),
+            "acc_change": lambda p: p.get("acc_change"),
+            "combo": lambda p: p.get("end_combo"),
+            "start_combo": lambda p: p.get("start_combo"),
+            "end_combo": lambda p: p.get("end_combo"),
+            "combo_change": lambda p: p.get("combo_change"),
+            "pc": lambda p: p.get("end_pc"),
+            "start_pc": lambda p: p.get("start_pc"),
+            "end_pc": lambda p: p.get("end_pc"),
+            "pc_change": lambda p: p.get("pc_change"),
+            "name": lambda p: (p.get("name") or "").casefold(),
+            "status": lambda p: p.get("status"),
+            "latest_time": lambda p: p.get("latest_time"),
+        }
+        numeric_sort_fields = {
+            "rank",
+            "start_rank",
+            "end_rank",
+            "rank_change",
+            "lv",
+            "start_lv",
+            "end_lv",
+            "lv_change",
+            "exp",
+            "start_exp",
+            "end_exp",
+            "exp_change",
+            "acc",
+            "start_acc",
+            "end_acc",
+            "acc_change",
+            "combo",
+            "start_combo",
+            "end_combo",
+            "combo_change",
+            "pc",
+            "start_pc",
+            "end_pc",
+            "pc_change",
+        }
+
+        def _trend_sort_key(player):
+            primary = sort_extractors[sort_field](player)
+            if sort_field in numeric_sort_fields:
+                # None 排最后，默认升序
+                primary_key = float("inf") if primary is None else primary
+            else:
+                primary_key = "zzzzzzzz" if primary is None else primary
+            # 次级按结束排名升序，确保输出稳定且更贴近“榜单”阅读习惯
+            end_rank = player.get("end_rank")
+            secondary_key = float("inf") if end_rank is None else end_rank
+            return (primary is None, primary_key, secondary_key)
+
+        # 默认按排名升序（可通过 --sort 覆盖）
+        trend_data.sort(key=_trend_sort_key)
 
         # 显示结果
         mode_name = self.mode_names.get(mode, "未知")
@@ -807,6 +941,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
         if rank_range:
             print(colorize(f"排名范围: {rank_range[0]} - {rank_range[1]}", Colors.YELLOW))
+        print(colorize(f"排序: {sort_field} (升序)", Colors.YELLOW))
         print(colorize(f"起始时间: {start_date.strftime('%Y-%m-%d')}", Colors.YELLOW))
         print(colorize(f"数据截止时间: {end_point.strftime('%Y-%m-%d %H:%M:%S')}", Colors.YELLOW))
         print(colorize(f"匹配窗口: {match_window} (基于数据库最新数据向前推)", Colors.YELLOW))
