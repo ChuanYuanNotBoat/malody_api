@@ -89,3 +89,11 @@ htmlcov/
 # Python tool caches
 .ruff_cache/
 .mypy_cache/
+
+
+
+# Rate limit analysis artifacts
+RATE_LIMIT_FIX.md
+RATE_LIMIT_QUICKREF.md
+RATE_LIMIT_SUMMARY.md
+RATE_LIMIT_VERIFICATION.md

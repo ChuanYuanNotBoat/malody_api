@@ -186,6 +186,11 @@ class STBCrawler:
         self.api_forbidden_detected = False
         self.home_source_unavailable = False
         self.new_api_auth = None
+        
+        # 速率限制相关
+        self._last_api_request_time = 0  # 最后一次 API 请求的时间
+        self._api_request_interval = 1.0  # 默认每次请求间隔 1 秒（可通过方法调整）
+        self._rate_limit_enabled = True  # 是否启用速率限制
 
     def setup_crawler_logging(self):
         """为爬虫设置专门的日志记录器"""
@@ -556,6 +561,35 @@ class STBCrawler:
             "Sec-Fetch-Dest": "empty",
         }
 
+    def set_api_rate_limit(self, requests_per_minute):
+        """设置 API 请求的速率限制（请求/分钟）"""
+        if requests_per_minute <= 0:
+            self._rate_limit_enabled = False
+            self.logger.info("API 速率限制已禁用")
+        else:
+            self._api_request_interval = 60.0 / requests_per_minute
+            self._rate_limit_enabled = True
+            self.logger.info("API 速率限制已设置为 %.1f 秒/请求 (%d 请求/分钟)", 
+                           self._api_request_interval, requests_per_minute)
+
+    def _apply_api_rate_limit(self):
+        """在发起 API 请求前应用速率限制"""
+        if not self._rate_limit_enabled:
+            return
+        
+        current_time = time.time()
+        time_since_last_request = current_time - self._last_api_request_time
+        
+        if time_since_last_request < self._api_request_interval:
+            wait_time = self._api_request_interval - time_since_last_request
+            # 加入 5-15% 的随机抖动，防止规律性
+            jitter = wait_time * (0.05 + 0.1 * random.random())
+            total_wait = wait_time + jitter
+            self.logger.debug("API 速率限制：等待 %.2f 秒", total_wait)
+            time.sleep(total_wait)
+        
+        self._last_api_request_time = time.time()
+
     def _new_api_ensure_guest_auth(self, force_refresh=False):
         if self.new_api_auth and not force_refresh:
             return self.new_api_auth
@@ -579,6 +613,9 @@ class STBCrawler:
         return self.new_api_auth
 
     def _new_api_get(self, path, params=None, use_store_key=False, retry_on_auth=True):
+        # 应用速率限制
+        self._apply_api_rate_limit()
+        
         auth = self._new_api_ensure_guest_auth()
         request_params = dict(params or {})
         request_params.setdefault("uid", auth["uid"])
@@ -794,10 +831,13 @@ class STBCrawler:
             self.processed_songs.add(sid)
         return success
 
-    def crawl_from_new_api(self, max_charts=100, max_songs=600):
+    def crawl_from_new_api(self, max_charts=60, max_songs=600):
         """通过新官网 API 抓取谱面（不依赖旧官网页面结构）。"""
         self.logger.info("=== 开始方式4: 通过新官网API抓取 ===")
         self.logger.info("目标: 最多 %d 个谱面, 最多扫描 %d 首歌曲", max_charts, max_songs)
+        
+        # 启用 API 速率限制（默认 60 请求/分钟）
+        self.set_api_rate_limit(requests_per_minute=60)
 
         try:
             self._new_api_ensure_guest_auth()
@@ -2726,7 +2766,7 @@ def main():
     parser.add_argument('--no-api', action='store_true', help='不使用API搜索，使用其他数据源')
     parser.add_argument('--source', choices=['all', 'home', 'latest', 'api', 'newapi'], default='all',
                        help='选择数据源: all=全部, home=主页, latest=最近变动, api=API搜索')
-    parser.add_argument('--max-charts', type=int, default=256, help='每个数据源最大爬取数量（默认256）')
+    parser.add_argument('--max-charts', type=int, default=60, help='每个数据源最大爬取数量（默认60）')
     parser.add_argument('--max-retries', type=int, default=3, help='每个数据源最大重试次数（默认3）')
     parser.add_argument('--skip-test', action='store_true', help='跳过连接测试')
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],

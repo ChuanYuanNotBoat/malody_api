@@ -64,7 +64,24 @@ def _load_cookies() -> dict:
     1) MALODY_COOKIES_JSON (full JSON string)
     2) MALODY_COOKIES_FILE (json file path, default: cookies.local.json)
     3) MALODY_SESSIONID / MALODY_CSRFTOKEN
+    
+    Supports two cookie file formats:
+    - Dict format: {"sessionid": "...", "csrftoken": "..."}
+    - Array format: [{"name": "sessionid", "value": "..."}, ...]
     """
+    def _extract_cookies_from_data(data):
+        """Extract cookies from dict or array format."""
+        if isinstance(data, dict):
+            return data
+        elif isinstance(data, list):
+            # Convert array format [{"name": "...", "value": "..."}, ...] to dict
+            result = {}
+            for item in data:
+                if isinstance(item, dict) and "name" in item and "value" in item:
+                    result[item["name"]] = item["value"]
+            return result
+        return {}
+    
     cookies = {}
 
     cookies_file = os.getenv("MALODY_COOKIES_FILE", "cookies.local.json")
@@ -72,8 +89,9 @@ def _load_cookies() -> dict:
         try:
             with open(cookies_file, "r", encoding="utf-8") as f:
                 file_cookies = json.load(f)
-            if isinstance(file_cookies, dict):
-                cookies.update(file_cookies)
+            extracted = _extract_cookies_from_data(file_cookies)
+            if extracted:
+                cookies.update(extracted)
                 logger.info("Loaded crawler cookies from %s", cookies_file)
         except Exception as e:
             logger.warning("Failed to load cookies file %s: %s", cookies_file, e)
@@ -82,8 +100,9 @@ def _load_cookies() -> dict:
     if cookies_json:
         try:
             env_cookies = json.loads(cookies_json)
-            if isinstance(env_cookies, dict):
-                cookies.update(env_cookies)
+            extracted = _extract_cookies_from_data(env_cookies)
+            if extracted:
+                cookies.update(extracted)
                 logger.info("Loaded crawler cookies from MALODY_COOKIES_JSON")
         except Exception as e:
             logger.warning("Invalid MALODY_COOKIES_JSON: %s", e)
