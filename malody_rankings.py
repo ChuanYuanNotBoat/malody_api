@@ -28,6 +28,62 @@ def colorize(text, color_code):
         return f"\033[{color_code}m{text}\033[0m"
     return text
 
+
+def notify_user(title: str, message: str, level: str = "warning"):
+    """
+    Show a non-blocking Windows toast notification.
+    Used to alert users when crawler fails to fetch data,
+    especially useful for scheduled tasks where the terminal
+    auto-closes after execution.
+
+    Args:
+        title: Notification title (e.g. "排行榜爬取异常")
+        message: Notification body with failure details
+        level: "warning" or "error" (currently unused, reserved for future styling)
+    """
+    if sys.platform != "win32":
+        logger.info("[通知] %s: %s", title, message)
+        return
+
+    # Escape XML special characters for the toast template.
+    import html as _html_mod
+    def _xml_escape(s: str) -> str:
+        return _html_mod.escape(s, quote=True)
+    safe_title = _xml_escape(title)
+    safe_message = _xml_escape(message)
+
+    ps_script = (
+        '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, '
+        'ContentType = WindowsRuntime] | Out-Null\n'
+        '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, '
+        'ContentType = WindowsRuntime] | Out-Null\n'
+        '$template = @"\n'
+        '<toast duration="long">\n'
+        '  <visual>\n'
+        '    <binding template="ToastGeneric">\n'
+        f'      <text>{safe_title}</text>\n'
+        f'      <text>{safe_message}</text>\n'
+        '    </binding>\n'
+        '  </visual>\n'
+        '</toast>\n'
+        '"@\n'
+        '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument\n'
+        '$xml.LoadXml($template)\n'
+        '$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)\n'
+        '[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Malody Rankings Crawler").Show($toast)\n'
+    )
+
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        logger.info("已发送桌面通知: %s - %s", title, message)
+    except Exception as e:
+        logger.warning("发送桌面通知失败: %s", e)
+
 # Silence Python 3.12+ SQLite datetime adapter deprecation warning.
 def adapt_datetime(dt):
     return dt.isoformat()
@@ -1062,6 +1118,7 @@ def crawl_mode_player(session, mode):
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
         logger.error("模式 %d 请求失败: %s", mode, e)
+        notify_user("排行榜爬取异常", f"模式 {mode} 请求失败: {e}", "error")
         return pd.DataFrame()
 
     players = parse_player_list(resp.text)
@@ -1494,6 +1551,7 @@ def crawl_mode_player_newapi(
         exp_rows = fetch_global_mode(session=session, mode=mode, limit=limit, mm=0)
     except Exception as e:
         logger.error("newapi exp ranking crawl failed for mode %d: %s", mode, e)
+        notify_user("排行榜API爬取失败", f"模式 {mode} newapi请求失败: {e}", "error")
         return pd.DataFrame(), []
 
     players: List[Dict[str, Any]] = []
@@ -2000,6 +2058,10 @@ def run_mm_sync_cycle(
                 error=None if stats["mmr_users_fail"] == 0 else f"failed={stats['mmr_users_fail']}",
                 state=stats,
             )
+
+        # Notify if all MM modes failed
+        if include_mm_ranking and stats.get("mm_modes_fail", 0) > 0 and stats.get("mm_modes_ok", 0) == 0:
+            notify_user("MM排行爬取失败", "所有模式的MM排行均爬取失败，可能需要更新Cookie/Token", "error")
 
         logger.info("MM sync done: %s", stats)
         return stats
@@ -2788,6 +2850,7 @@ def run_crawler_cycle(
 
             if df.empty:
                 logger.warning("Mode %d returned empty ranking data, skip.", mode)
+                notify_user("排行榜数据为空", f"模式 {mode} 返回空排行榜数据，可能需要更新Cookie/Token", "warning")
                 continue
 
             if save_excel and not check_data_changed(mode, df):
@@ -2869,6 +2932,26 @@ def run_crawler_cycle(
             logger.warning("Git推送失败，但数据已保存在本地: %s", e)
     else:
         logger.info("Git推送已禁用，数据仅保存在本地")
+
+    # Summary notification
+    total_modes = len(all_dfs)
+    empty_modes = sum(1 for df in all_dfs if df.empty)
+    successful_modes = total_modes - empty_modes
+    if empty_modes > 0:
+        if successful_modes == 0:
+            notify_user(
+                "排行榜爬取失败",
+                f"所有 {total_modes} 个模式均返回空数据，可能需要更新Cookie/Token",
+                "error"
+            )
+        else:
+            notify_user(
+                "排行榜爬取部分失败",
+                f"{empty_modes}/{total_modes} 个模式返回空数据",
+                "warning"
+            )
+    else:
+        notify_user("排行榜爬取完成", f"成功爬取 {total_modes} 个模式的数据", "info")
 
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
