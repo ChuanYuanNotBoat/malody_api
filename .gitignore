@@ -32,6 +32,7 @@ viz_output/*
 *.swp
 *.swo
 *~
+.kagent/
 
 # 备份文件
 *.bak
