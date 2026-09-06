@@ -6,6 +6,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta
@@ -25,6 +26,26 @@ from malody_rankings import (
   is_stop_requested,
   consume_skip_request,
 )
+
+if os.name == "nt":
+    try:
+        from colorama import just_fix_windows_console
+        just_fix_windows_console()
+    except (ImportError, AttributeError):
+        pass
+
+USE_COLOR = (
+    os.getenv("NO_COLOR") != "1"
+    and (os.getenv("FORCE_COLOR") == "1" or (
+        hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    ))
+)
+
+
+def colorize(text, color_code):
+        if USE_COLOR:
+                return f"\033[{color_code}m{text}\033[0m"
+        return text
 
 
 def runtime_stop_requested() -> bool:
@@ -150,7 +171,7 @@ class STBCrawler:
                 "Referer": "https://m.mugzone.net/",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Encoding": "gzip, deflate",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
             }
@@ -186,6 +207,15 @@ class STBCrawler:
         self.api_forbidden_detected = False
         self.home_source_unavailable = False
         self.new_api_auth = None
+        self.crawl_stats = {
+            "new": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "deleted": 0,
+            "empty_404": 0,
+            "failed": 0,
+        }
+        self._start_summary_hotkey_listener()
         
         # 速率限制相关
         self._last_api_request_time = 0  # 最后一次 API 请求的时间
@@ -195,6 +225,30 @@ class STBCrawler:
     def setup_crawler_logging(self):
         """为爬虫设置专门的日志记录器"""
         self.logger = logging.getLogger('STBCrawler')
+
+    def _start_summary_hotkey_listener(self):
+        """Listen for Ctrl+O in an interactive Windows console."""
+        if os.name != "nt" or not getattr(sys.stdin, "isatty", lambda: False)():
+            return
+        try:
+            import msvcrt
+        except ImportError:
+            return
+
+        def listen_for_summary():
+            while True:
+                if msvcrt.kbhit():
+                    key = msvcrt.getwch()
+                    if key == "\x0f":
+                        self.logger.info("收到 Ctrl+O，显示当前爬取统计")
+                        self.log_crawl_summary()
+                time.sleep(0.1)
+
+        threading.Thread(
+            target=listen_for_summary,
+            name="stb-summary-hotkey",
+            daemon=True,
+        ).start()
 
     def _should_stop(self) -> bool:
         return runtime_stop_requested()
@@ -226,6 +280,21 @@ class STBCrawler:
         if not html:
             return False
         return '<div id="root"></div>' in html and '/assets/index-' in html
+
+    @classmethod
+    def _is_confirmed_chart_deleted(cls, response):
+        """Return true only for a definitive chart-not-found page."""
+        if response is None or response.status_code != 404:
+            return False
+        body = response.text or ""
+        body_lower = body.lower()
+        if cls._is_login_required_page(body) or cls._is_spa_shell_page(body):
+            return False
+        if any(marker in body_lower for marker in (
+            "cloudflare", "access denied", "request blocked", "安全验证",
+        )):
+            return False
+        return bool(re.search(r"\b404\b|not found|不存在|找不到", body_lower))
 
     def log_request_details(self, url, response, method="GET"):
         """记录请求的详细信息"""
@@ -288,6 +357,8 @@ class STBCrawler:
             last_updated TIMESTAMP,
             crawl_time TIMESTAMP NOT NULL,
             data_hash TEXT,
+            server_exists INTEGER NOT NULL DEFAULT 1,
+            deleted_at TIMESTAMP,
             FOREIGN KEY (sid) REFERENCES songs (sid)
         )
         ''')
@@ -353,6 +424,12 @@ class STBCrawler:
             if 'comment_count' not in chart_columns:
                 cursor.execute('ALTER TABLE charts ADD COLUMN comment_count INTEGER DEFAULT 0')
                 self.logger.info("Added comment_count column to charts")
+            if 'server_exists' not in chart_columns:
+                cursor.execute('ALTER TABLE charts ADD COLUMN server_exists INTEGER NOT NULL DEFAULT 1')
+                self.logger.info("Added server_exists column to charts")
+            if 'deleted_at' not in chart_columns:
+                cursor.execute('ALTER TABLE charts ADD COLUMN deleted_at TIMESTAMP')
+                self.logger.info("Added deleted_at column to charts")
 
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS chart_comments (
@@ -561,6 +638,19 @@ class STBCrawler:
             "Sec-Fetch-Dest": "empty",
         }
 
+    @staticmethod
+    def _parse_new_api_json(resp, endpoint):
+        try:
+            return resp.json()
+        except ValueError as exc:
+            content_type = resp.headers.get("content-type", "unknown")
+            body_prefix = (resp.text or "")[:200].replace("\r", " ").replace("\n", " ")
+            raise RuntimeError(
+                "new API returned non-JSON response: endpoint=%s status=%s "
+                "content_type=%s body_prefix=%r"
+                % (endpoint, resp.status_code, content_type, body_prefix)
+            ) from exc
+
     def set_api_rate_limit(self, requests_per_minute):
         """设置 API 请求的速率限制（请求/分钟）"""
         if requests_per_minute <= 0:
@@ -595,9 +685,22 @@ class STBCrawler:
             return self.new_api_auth
 
         url = NEW_API_BASE_URL + "/web/auth/guest/wt"
-        resp = self.session.get(url, headers=self._new_api_headers(), timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        for attempt in range(3):
+            resp = self.session.get(url, headers=self._new_api_headers(), timeout=30)
+            resp.raise_for_status()
+            try:
+                data = self._parse_new_api_json(resp, "/web/auth/guest/wt")
+                break
+            except RuntimeError:
+                if attempt == 2:
+                    raise
+                wait_seconds = 2 * (attempt + 1)
+                self.logger.warning(
+                    "新官网API鉴权响应不是 JSON，第 %d/3 次失败，%d 秒后重试",
+                    attempt + 1,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
         if data.get("code") != 0:
             raise RuntimeError(f"guest auth failed: code={data.get('code')}")
 
@@ -624,7 +727,7 @@ class STBCrawler:
         url = NEW_API_BASE_URL + (path if path.startswith("/") else f"/{path}")
         resp = self.session.get(url, params=request_params, headers=self._new_api_headers(), timeout=30)
         resp.raise_for_status()
-        data = resp.json()
+        data = self._parse_new_api_json(resp, path)
 
         # Token expired / invalid, refresh once.
         if data.get("code") == -1000 and retry_on_auth:
@@ -1301,6 +1404,8 @@ class STBCrawler:
             self.logger.error("爬取谱面详情失败 (cid=%s): %s", cid, e)
             if hasattr(e, 'response') and e.response is not None:
                 self.log_request_details(url, e.response)
+                if self._is_confirmed_chart_deleted(e.response):
+                    self.mark_chart_deleted(cid)
             return False
 
     def crawl_chart_detail_with_retry(self, cid, retry_count=0):
@@ -1316,8 +1421,14 @@ class STBCrawler:
 
             # 检查响应状态
             if response.status_code == 404:
-                self.logger.info("CID %d 返回404，谱面不存在", cid)
-                return None  # 明确表示谱面不存在
+                if self._is_confirmed_chart_deleted(response):
+                    self.mark_chart_deleted(cid)
+                    return None  # 明确表示谱面不存在
+                else:
+                    self.crawl_stats["empty_404"] += 1
+                    self.logger.warning("CID %d 返回404，但未确认是谱面删除，不修改删除状态", cid)
+                    self.retry_queue.append((cid, retry_count + 1))
+                    return False
 
             response.raise_for_status()
 
@@ -1342,11 +1453,18 @@ class STBCrawler:
 
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
-                self.logger.info("CID %d 返回404，谱面不存在", cid)
-                return None
+                if self._is_confirmed_chart_deleted(e.response):
+                    self.mark_chart_deleted(cid)
+                    return None
+                else:
+                    self.crawl_stats["empty_404"] += 1
+                    self.logger.warning("CID %d 返回404，但未确认是谱面删除，不修改删除状态", cid)
+                    self.retry_queue.append((cid, retry_count + 1))
+                    return False
             else:
                 self.logger.warning("CID %d HTTP错误 (重试 %d/%d): %s",
                                   cid, retry_count + 1, self.max_retries, e)
+                self.crawl_stats["failed"] += 1
                 # 添加到重试队列
                 self.retry_queue.append((cid, retry_count + 1))
                 return False
@@ -1354,6 +1472,7 @@ class STBCrawler:
         except (requests.exceptions.RequestException, Exception) as e:
             self.logger.warning("CID %d 爬取失败 (重试 %d/%d): %s",
                               cid, retry_count + 1, self.max_retries, e)
+            self.crawl_stats["failed"] += 1
             # 添加到重试队列
             self.retry_queue.append((cid, retry_count + 1))
             return False
@@ -1393,6 +1512,115 @@ class STBCrawler:
         data_str = json.dumps(data, sort_keys=True, default=str)
         return hashlib.md5(data_str.encode('utf-8')).hexdigest()
 
+    @staticmethod
+    def _comparable_value(value):
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value).isoformat()
+            except ValueError:
+                pass
+        return value
+
+    def _get_chart_changes(self, cursor, cid, sid, chart_data, song_data, final_cover_url):
+        """Compare business fields only; crawl_time is intentionally excluded."""
+        changes = []
+        cursor.execute(
+            """SELECT sid, version, creator_uid, creator_name, stabled_by_uid,
+                      stabled_by_name, level, mode, chart_length, status, heat,
+                      love_count, recommend_count, comment_count, donate_count,
+                      play_count, last_updated
+               FROM charts WHERE cid = ?""",
+            (cid,),
+        )
+        old_chart = cursor.fetchone()
+        chart_fields = (
+            ("sid", sid),
+            ("版本", chart_data["version"]),
+            ("谱师UID", chart_data["creator_uid"]),
+            ("谱师", chart_data["creator_name"]),
+            ("稳定者UID", chart_data["stabled_by_uid"]),
+            ("稳定者", chart_data["stabled_by_name"]),
+            ("等级", chart_data["level"]),
+            ("模式", chart_data["mode"]),
+            ("谱面长度", chart_data["chart_length"]),
+            ("状态", chart_data["status"]),
+            ("热度", chart_data["heat"]),
+            ("爱心数", chart_data["love_count"]),
+            ("推荐数", int(chart_data.get("recommend_count", 0) or 0)),
+            ("评论数", int(chart_data.get("comment_count", 0) or 0)),
+            ("打赏数", chart_data["donate_count"]),
+            ("游玩数", chart_data["play_count"]),
+            ("最后编辑", chart_data["last_updated"]),
+        )
+        if old_chart is not None:
+            for index, (label, new_value) in enumerate(chart_fields):
+                old_value = old_chart[index]
+                if self._comparable_value(old_value) != self._comparable_value(new_value):
+                    changes.append(f"{label}: {old_value} -> {new_value}")
+
+        cursor.execute(
+            "SELECT title, artist, bpm, length, cover_url, last_updated FROM songs WHERE sid = ?",
+            (sid,),
+        )
+        old_song = cursor.fetchone()
+        if old_song is not None:
+            song_fields = (
+                ("歌曲标题", song_data["title"]),
+                ("艺术家", song_data["artist"]),
+                ("BPM", song_data["bpm"]),
+                ("歌曲长度", song_data["length"]),
+                ("封面", final_cover_url),
+                ("歌曲最后编辑", chart_data["last_updated"]),
+            )
+            for index, (label, new_value) in enumerate(song_fields):
+                old_value = old_song[index]
+                if self._comparable_value(old_value) != self._comparable_value(new_value):
+                    changes.append(f"{label}: {old_value} -> {new_value}")
+        return changes
+
+    def mark_chart_deleted(self, cid):
+        """Mark a known chart as deleted without removing its local history."""
+        cursor = self.db_manager.get_connection().cursor()
+        crawl_time = datetime.now()
+        cursor.execute(
+            "SELECT 1 FROM charts WHERE cid = ?",
+            (cid,),
+        )
+        if cursor.fetchone() is None:
+            self.logger.info("[已删除] CID %d 在服务器不存在，但本地未入库", cid)
+            return False
+
+        cursor.execute(
+            "UPDATE charts SET server_exists = 0, deleted_at = ? WHERE cid = ?",
+            (crawl_time, cid),
+        )
+        self.db_manager.get_connection().commit()
+        self.crawl_stats["deleted"] += 1
+        self.logger.info("[已删除] CID %d，保留本地数据库记录", cid)
+        return True
+
+    def log_crawl_summary(self):
+        """输出当前爬虫实例的分类统计。"""
+        stats = self.crawl_stats
+        total = sum(stats.values())
+        self.logger.info("=" * 60)
+        self.logger.info("爬取数据总结")
+        self.logger.info(
+            "%s: %d | %s: %d | %s: %d",
+            colorize("新增", "32"), stats["new"],
+            colorize("更新", "33"), stats["updated"],
+            colorize("未变动", "36"), stats["unchanged"],
+        )
+        self.logger.info(
+            "%s: %d | %s: %d | %s: %d | 总计: %d",
+            colorize("已删除", "31"), stats["deleted"],
+            colorize("空404未删除", "95"), stats["empty_404"],
+            colorize("失败", "31"), stats["failed"], total,
+        )
+        self.logger.info("=" * 60)
+
     def save_chart_data(self, chart_data, song_data, talk_items=None):
         """保存谱面数据到数据库 - 覆盖更新模式，如果封面缺失则保留原来的封面"""
         cursor = self.db_manager.get_connection().cursor()
@@ -1407,6 +1635,18 @@ class STBCrawler:
             # 生成数据哈希
             song_hash = self.generate_data_hash(song_data)
             chart_hash = self.generate_data_hash(chart_data)
+
+            cursor.execute(
+                "SELECT data_hash, server_exists FROM charts WHERE cid = ?",
+                (chart_data["cid"],),
+            )
+            existing_chart = cursor.fetchone()
+            if existing_chart is None:
+                save_kind = "新增"
+            elif existing_chart[0] == chart_hash and existing_chart[1] == 1:
+                save_kind = "未变化"
+            else:
+                save_kind = "更新"
 
             # 记录保存的数据详情
             self.logger.info("保存数据详情 - 谱面: %s, 歌曲: %s, 标题: %s, 艺术家: %s, 模式: %s, 状态: %s",
@@ -1424,6 +1664,14 @@ class STBCrawler:
 
             # 保存歌曲信息 - 使用 REPLACE 覆盖更新
             final_cover_url = song_data["cover_url"] if song_data["cover_url"] else existing_cover_url
+            changed_fields = self._get_chart_changes(
+                cursor,
+                chart_data["cid"],
+                song_data["sid"],
+                chart_data,
+                song_data,
+                final_cover_url,
+            )
 
             cursor.execute('''
             INSERT OR REPLACE INTO songs
@@ -1440,8 +1688,8 @@ class STBCrawler:
             INSERT OR REPLACE INTO charts
             (cid, sid, version, creator_uid, creator_name, stabled_by_uid, stabled_by_name,
              level, mode, chart_length, status, heat, love_count, recommend_count, comment_count, donate_count, play_count,
-             last_updated, crawl_time, data_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             last_updated, crawl_time, data_hash, server_exists, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 chart_data["cid"], song_data["sid"], chart_data["version"],
                 chart_data["creator_uid"], chart_data["creator_name"],
@@ -1451,7 +1699,7 @@ class STBCrawler:
                 int(chart_data.get("recommend_count", 0) or 0),
                 int(chart_data.get("comment_count", 0) or 0),
                 chart_data["donate_count"], chart_data["play_count"],
-                chart_data["last_updated"], crawl_time, chart_hash
+                chart_data["last_updated"], crawl_time, chart_hash, 1, None
             ))
 
             self._save_chart_comments(
@@ -1461,13 +1709,27 @@ class STBCrawler:
                 crawl_time=crawl_time,
             )
 
-            self.logger.info("[OK] 保存/更新谱面: %s - %s", chart_data["cid"], song_data["title"])
             self.db_manager.get_connection().commit()
+            stat_key = {"新增": "new", "更新": "updated", "未变化": "unchanged"}[save_kind]
+            self.crawl_stats[stat_key] += 1
+            color_code = {"新增": "32", "更新": "33", "未变化": "36"}[save_kind]
+            self.logger.info(
+                "[OK] %s谱面: %s - %s",
+                colorize(save_kind, color_code), chart_data["cid"], song_data["title"],
+            )
+            if save_kind == "更新":
+                if changed_fields:
+                    self.logger.info("  变更字段（不含最后爬取时间）: %s", "; ".join(changed_fields))
+                else:
+                    self.logger.info("  变更: 服务器存在状态恢复（业务字段未变化）")
+            elif save_kind == "未变化":
+                self.logger.info("  业务数据未变化（最后爬取时间不纳入判断）")
             return True
 
         except Exception as e:
             self.logger.error("保存谱面数据失败 (cid=%s): %s", chart_data["cid"], e)
             self.db_manager.get_connection().rollback()
+            self.crawl_stats["failed"] += 1
             return False
 
     def get_last_crawl_state(self):
@@ -1947,7 +2209,8 @@ class STBCrawler:
     def crawl_cid_with_persistence(self, start_cid=1, end_cid=None,
                                  requests_per_minute=10, max_errors=50,
                                  progress_file="cid_progress.json", resume=True,
-                                 retry_delay=30, process_retry_every=50):
+                                 retry_delay=30, process_retry_every=50,
+                                 skip_retry=False):
         """
         持久的CID爬取，支持失败重试和进度恢复
 
@@ -2001,7 +2264,7 @@ class STBCrawler:
                     current_cid += 1
                     continue
                 # 定期处理重试队列
-                if request_count % process_retry_every == 0 and self.retry_queue:
+                if not skip_retry and request_count % process_retry_every == 0 and self.retry_queue:
                     self.logger.info("定期处理重试队列 (%d 个待重试)", len(self.retry_queue))
                     retry_success = self.process_retry_queue(retry_delay)
                     total_success += retry_success
@@ -2078,7 +2341,7 @@ class STBCrawler:
                            current_cid, total_success, total_errors, len(self.retry_queue))
 
         # 最后处理剩余的重试队列
-        if self.retry_queue and not self._should_stop():
+        if not skip_retry and self.retry_queue and not self._should_stop():
             self.logger.info("处理剩余的重试队列 (%d 个项目)", len(self.retry_queue))
             retry_success = self.process_retry_queue(retry_delay)
             total_success += retry_success
@@ -2801,6 +3064,7 @@ def main():
 
     # 新增的重试失败项目参数
     parser.add_argument('--retry-failed', action='store_true', help='重新爬取所有失败的项目')
+    parser.add_argument('--skip-retry', action='store_true', help='CID/SID爬取时跳过失败项目重试')
     parser.add_argument('--retry-rpm', type=int, default=5, help='重试时的每分钟请求数（默认5）')
     parser.add_argument('--retry-max-retries', type=int, default=3, help='重试时的最大重试次数（默认3）')
     parser.add_argument('--no-remove-successful', action='store_true',
@@ -2917,7 +3181,8 @@ def main():
             end_cid=args.end_cid,
             requests_per_minute=args.rpm,
             progress_file=args.progress_file,
-            resume=not args.no_resume
+            resume=not args.no_resume,
+            skip_retry=args.skip_retry
         )
         logger.info("CID爬取完成: 成功 %d 个谱面", success)
         return
@@ -2969,6 +3234,7 @@ def main():
             crawler.crawl_from_new_api(max_charts=args.max_charts)
 
     # 更新爬取状态
+    crawler.log_crawl_summary()
     crawler.update_crawl_state()
     logger.info("爬虫运行完成")
 
